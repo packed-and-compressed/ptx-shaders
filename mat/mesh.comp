@@ -1,0 +1,298 @@
+#ifndef MSET_V2_MESH_COMP
+#define MSET_V2_MESH_COMP
+
+#include <data/shader/common/meshBuffer.comp>
+#include <data/shader/common/tangentbasis.sh>
+#include "data/shader/common/globalBuffers.sh"
+
+#include "meshBinding.frag"
+#define bMeshBuffers bGlobalBuffers
+
+#define MESH_FLAG_INDICES16BIT  0x80000000
+#define MESH_FLAG_SECONDARYUVS  0x40000000
+#define MESH_FLAG_VERTEXCOLORS  0x20000000
+#define MESH_FLAG_FROMCURVES    0x10000000
+#define MESH_FLAG_MASK          0xF0000000
+#define MESH_HAS_UNPACKED_UVS	0x7FC00000 //half-float NaN in high bits
+
+struct	Vertex
+{
+	precise vec3	position;
+	vec3			tangent;
+	vec3			bitangent;
+	vec3			normal;
+	vec2			texcoord;
+	vec2			texcoord2;
+	vec4			color;
+	uint			hairStrandID;
+};
+
+uint	meshBufferLoad( uint index, uint addr )
+{
+#ifdef MATERIAL_MESH_UNIFORM
+	return rawLoad( resourceByUniformIndex(bMeshBuffers,index), addr );
+#else
+	return rawLoad( resourceByIndex(bMeshBuffers,index), addr );
+#endif
+}
+
+uint2	meshBufferLoad2( uint index, uint addr )
+{
+#ifdef MATERIAL_MESH_UNIFORM
+	return rawLoad2( resourceByUniformIndex(bMeshBuffers,index), addr );
+#else
+	return rawLoad2( resourceByIndex(bMeshBuffers,index), addr );
+#endif
+}
+
+uint3	meshBufferLoad3( uint index, uint addr )
+{
+#ifdef MATERIAL_MESH_UNIFORM
+	return rawLoad3( resourceByUniformIndex(bMeshBuffers,index), addr );
+#else
+	return rawLoad3( resourceByIndex(bMeshBuffers,index), addr );
+#endif
+}
+
+uint4	meshBufferLoad4( uint index, uint addr )
+{
+#ifdef MATERIAL_MESH_UNIFORM
+	return rawLoad4( resourceByUniformIndex(bMeshBuffers,index), addr );
+#else
+	return rawLoad4( resourceByIndex(bMeshBuffers,index), addr );
+#endif
+}
+
+uint	meshGetVertexOffset( MeshBinding mesh, uint index, out bool hasPackedUVs )
+{
+	hasPackedUVs = asuint( mesh.texcoord0Offsets.x ) != MESH_HAS_UNPACKED_UVS;
+	return vertexIndexToMeshBufferOffset( index, hasPackedUVs );
+}
+
+uint	meshGetVertexOffset( MeshBinding mesh, uint index )
+{
+	bool hasPackedUVs;
+	return meshGetVertexOffset( mesh, index, hasPackedUVs );
+}
+
+uint	meshGetPrimitiveID( MeshBinding mesh, uint triangleIndex )
+{
+	return triangleIndex + ( mesh.triangleOffsetAndFlags & (~uint(MESH_FLAG_MASK)) );
+}
+
+Vertex  loadVertex( MeshBinding mesh, uint index )
+{
+	const bool hasSecondaryUVs = mesh.triangleOffsetAndFlags & MESH_FLAG_SECONDARYUVS;
+	const bool hasVertexColors = mesh.triangleOffsetAndFlags & MESH_FLAG_VERTEXCOLORS;
+	      bool hasPackedUVs;
+
+	uint vertexBuffer = mesh.baseBufferIndex + 1;
+	uint vindex = meshGetVertexOffset( mesh, index, hasPackedUVs );
+
+	uint4 line1 = meshBufferLoad4( vertexBuffer, vindex );
+	uint3 line2;
+	if( hasPackedUVs )
+	{
+		line2.xy = meshBufferLoad2( vertexBuffer, vindex+4 );
+		line2.z  = 0;
+	}
+	else
+	{
+		line2 = meshBufferLoad3( vertexBuffer, vindex+4 );
+	}
+
+	Vertex v;
+	v.position = asfloat(line1.xyz);
+	v.tangent = decodeUint101010NormalizedRaw(line1.w);
+	v.hairStrandID = ~uint(0);
+	
+	float handedness = unpackHandednessRaw(line1.w);
+	v.normal = decodeUint101010NormalizedRaw(line2.x);
+	v.bitangent = reconstructBitangent( v.tangent, v.normal, handedness );
+	if( hasPackedUVs )
+	{
+		v.texcoord = decodeUVsRaw( line2.y, mesh.texcoord0Offsets );
+	}
+	else
+	{
+		v.texcoord = asfloat(line2.yz);
+	}
+
+	v.texcoord2 = v.texcoord;
+	if( hasSecondaryUVs )
+	{
+		uint texCoordBuffer = mesh.baseBufferIndex + 2;
+		if( asuint( mesh.texcoord1Offsets.x ) != MESH_HAS_UNPACKED_UVS )
+		{
+			v.texcoord2 = decodeUVsRaw( meshBufferLoad( texCoordBuffer, index ), mesh.texcoord1Offsets );
+		}
+		else
+		{
+			const uint2 secondaryUVData = meshBufferLoad2( texCoordBuffer, index * 2 );
+			if( mesh.triangleOffsetAndFlags & MESH_FLAG_FROMCURVES )
+			{			
+				// we use the highest bit for the w coordinate and the lower 31 bits for strand id
+				// see hairStrandMeshGeometryFactory.comp for secondary uv 
+				const float t = ( ( secondaryUVData.y & 0x80000000 ) == 0 ) ? 0.0f : 1.0f;
+				v.texcoord2 = vec2( asfloat( secondaryUVData.x ), t );
+				v.hairStrandID = ( secondaryUVData.y & 0x7FFFFFFF );
+			}
+			else
+			{
+				v.texcoord2 = asfloat( secondaryUVData );
+			}
+		}
+	}
+	
+	v.color = vec4(1.0,1.0,1.0,1.0);
+	if( hasVertexColors )
+	{
+		uint vertexColorBuffer = mesh.baseBufferIndex + ( hasSecondaryUVs ? 3 : 2 );
+		uint c = meshBufferLoad( vertexColorBuffer, index );
+		v.color.r = float((c    ) & 0xFF);
+		v.color.g = float((c>> 8) & 0xFF);
+		v.color.b = float((c>>16) & 0xFF);
+		v.color.a = float((c>>24)       );
+		v.color *= 1.0/255.0;
+	}
+
+	return v;
+}
+
+vec3	meshLoadVertexPosition( MeshBinding mesh, uint index )
+{
+	uint vertexBuffer = mesh.baseBufferIndex + 1;
+	uint vindex = meshGetVertexOffset( mesh, index );
+	return asfloat( meshBufferLoad3( vertexBuffer, vindex ) );
+}
+
+vec3	meshLoadVertexNormal( MeshBinding mesh, uint index )
+{
+	uint vertexBuffer = mesh.baseBufferIndex + 1;
+	uint vindex = meshGetVertexOffset( mesh, index );
+	return decodeUint101010NormalizedRaw( meshBufferLoad( vertexBuffer, vindex+4 ) );
+}
+
+vec2	meshLoadVertexTexcoord( MeshBinding mesh, uint index )
+{
+    bool hasPackedUVs;
+    uint vertexBuffer = mesh.baseBufferIndex + 1;
+    uint vindex = meshGetVertexOffset( mesh, index, hasPackedUVs );
+    if( hasPackedUVs )
+    {
+        return decodeUVsRaw( meshBufferLoad( vertexBuffer, vindex + 5 ), mesh.texcoord0Offsets );
+    }
+    else
+    {
+        return asfloat( meshBufferLoad2( vertexBuffer, vindex + 5 ) );
+    }
+}
+
+vec2	meshLoadVertexSecondaryTexcoord( MeshBinding mesh, uint index )
+{
+    const bool hasSecondaryUVs = mesh.triangleOffsetAndFlags & MESH_FLAG_SECONDARYUVS;
+    if( !hasSecondaryUVs )
+    {
+        return meshLoadVertexTexcoord( mesh, index );
+    }
+	
+    uint texCoordBuffer = mesh.baseBufferIndex + 2;
+    if( asuint( mesh.texcoord1Offsets.x ) != MESH_HAS_UNPACKED_UVS )
+    {
+        return decodeUVsRaw( meshBufferLoad( texCoordBuffer, index ), mesh.texcoord1Offsets );
+    }
+    else
+    {
+        return asfloat( meshBufferLoad2( texCoordBuffer, index * 2 ) );
+    }
+}
+
+vec4 meshLoadVertexColor( MeshBinding mesh, uint index )
+{
+    const bool hasSecondaryUVs = mesh.triangleOffsetAndFlags & MESH_FLAG_SECONDARYUVS;
+    const bool hasVertexColors = mesh.triangleOffsetAndFlags & MESH_FLAG_VERTEXCOLORS;
+	
+    vec4 color = vec4( 1.0, 1.0, 1.0, 1.0 );
+    if( hasVertexColors )
+    {
+        uint vertexColorBuffer = mesh.baseBufferIndex + ( hasSecondaryUVs ? 3 : 2 );
+        uint c = meshBufferLoad( vertexColorBuffer, index );
+        color.r = float( ( c ) & 0xFF );
+        color.g = float( ( c >> 8 ) & 0xFF );
+        color.b = float( ( c >> 16 ) & 0xFF );
+        color.a = float( ( c >> 24 ) );
+        color *= 1.0 / 255.0;
+    }
+    return color;
+}
+
+uint3   loadTriangle( MeshBinding mesh, uint index )
+{
+	uint indexBuffer = mesh.baseBufferIndex;
+	index += mesh.triangleOffsetAndFlags & (~uint(MESH_FLAG_MASK));
+	index += index + index;
+	if( mesh.triangleOffsetAndFlags & MESH_FLAG_INDICES16BIT )
+	{
+		//16-bit load
+		uint r = index & 1;
+		index >>= 1;
+		uint2 words = meshBufferLoad2( indexBuffer, index );
+		return	r > 0 ?
+				uint3( words.x >> 16, words.y & 0xFFFF, words.y >> 16 ) :
+				uint3( words.x & 0xFFFF, words.x >> 16, words.y & 0xFFFF );
+	}
+	else
+	{
+		//32-bit load
+		return meshBufferLoad3( indexBuffer, index );
+	}
+}
+
+template<typename AttributeT>
+AttributeT	interpolateVertexAttribute( vec3 b, AttributeT a0, AttributeT a1, AttributeT a2 )
+{
+	return b.x * a0 + b.y * a1 + b.z * a2;
+}
+
+template<typename AttributeT>
+AttributeT	interpolateVertexAttribute( vec2 b, AttributeT a0, AttributeT a1, AttributeT a2 )
+{
+    return saturate( 1.0 - b.x - b.y ) * a0 + b.x * a1 + b.y * a2;
+}
+
+Vertex	interpolateVertex( vec2 coord, Vertex v0, Vertex v1, Vertex v2 )
+{
+	vec3 b = vec3( saturate(1.0 - coord.x - coord.y), coord.x, coord.y );
+	
+	Vertex v;
+	v.position  = interpolateVertexAttribute( b, v0.position, v1.position, v2.position );
+	v.tangent   = interpolateVertexAttribute( b, v0.tangent, v1.tangent, v2.tangent );
+	v.bitangent = interpolateVertexAttribute( b, v0.bitangent, v1.bitangent, v2.bitangent );
+	v.normal    = interpolateVertexAttribute( b, v0.normal, v1.normal, v2.normal );
+	v.texcoord  = interpolateVertexAttribute( b, v0.texcoord, v1.texcoord, v2.texcoord );
+	v.texcoord2 = interpolateVertexAttribute( b, v0.texcoord2, v1.texcoord2, v2.texcoord2 );
+	v.color     = interpolateVertexAttribute( b, v0.color, v1.color, v2.color );
+	v.hairStrandID = v0.hairStrandID;
+	return v;
+}
+
+Vertex	interpolateVertexPrecise(	vec2 coord, Vertex v0, Vertex v1, Vertex v2,
+									out precise vec3 edge01, out precise vec3 edge02 )
+{
+	vec3 b = vec3( saturate(1.0 - coord.x - coord.y), coord.x, coord.y );
+	edge01 = v1.position - v0.position;
+	edge02 = v2.position - v0.position;
+	
+	Vertex v;
+	v.position  = v0.position + mad( b.y, edge01, b.z * edge02 );
+	v.tangent   = interpolateVertexAttribute( b, v0.tangent, v1.tangent, v2.tangent );
+	v.bitangent = interpolateVertexAttribute( b, v0.bitangent, v1.bitangent, v2.bitangent );
+	v.normal    = interpolateVertexAttribute( b, v0.normal, v1.normal, v2.normal );
+	v.texcoord  = interpolateVertexAttribute( b, v0.texcoord, v1.texcoord, v2.texcoord );
+	v.texcoord2 = interpolateVertexAttribute( b, v0.texcoord2, v1.texcoord2, v2.texcoord2 );
+	v.color     = interpolateVertexAttribute( b, v0.color, v1.color, v2.color );
+	v.hairStrandID = v0.hairStrandID;
+	return v;
+}
+
+#endif

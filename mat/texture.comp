@@ -1,0 +1,24 @@
+#ifndef MSET_V2_TEXTURE_COMP
+#define MSET_V2_TEXTURE_COMP
+
+#ifdef texture2D
+	#undef texture2D
+#endif
+#define	texture2D(t,c)		texture2DLod(t,c,0.0)
+
+#ifdef texture3D
+	#undef texture3D
+#endif
+#define	texture3D(t,c)		texture3DLod(t,c,0.0)
+
+#ifdef textureCube
+	#undef textureCube
+#endif
+#define	textureCube(t,c)	textureCubeLod(t,c,0.0)
+
+#ifdef discard
+	#undef discard
+#endif
+#define	discard	0
+
+#endif
