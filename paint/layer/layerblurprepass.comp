@@ -1,0 +1,84 @@
+#ifndef _LAYER_BLUR_PREPASS_COMP
+#define _LAYER_BLUR_PREPASS_COMP
+
+#define LIP_MODE_NONE 0
+#define LIP_MODE_CURVATURE 1
+
+#define MAX_SAMPLE_COUNT 19
+
+uniform vec2	uKernel[MAX_SAMPLE_COUNT];
+uniform int		uSampleCount;
+uniform float	uSampleWeight[MAX_SAMPLE_COUNT];
+
+uniform uvec2	uResolution;
+uniform vec2	uInverseResolution;
+
+#ifdef INPUT_CURVATURE
+uniform float	uEdgeIntensity;
+uniform float	uEdgeThickness;
+uniform float	uCavityIntensity;
+uniform float	uCavityThickness;
+uniform vec2	uCurveClamp;
+
+float curveFunction( float curve )
+{
+	curve = 2.0 * curve - 1.0; 
+	 
+	float edge = curve;
+	edge = max(0.0, edge - uCurveClamp.x) * uCurveClamp.y;	
+	float thick;
+	thick = 1.0 - uEdgeThickness;
+	thick *= 0.5;
+	thick = thick * 0.64 + 0.36;
+	edge = pow(edge, thick);
+	edge *= uEdgeIntensity;
+
+	float cavity = -curve;
+	cavity = max(0.0, cavity - uCurveClamp.x) * uCurveClamp.y;	
+	thick = 1.0 - uCavityThickness;
+	thick *= 0.5;
+	thick = thick * 0.6 + 0.4;
+	cavity = pow(cavity, thick);
+	cavity *= uCavityIntensity;
+	
+	cavity = min( 1.0, edge + cavity );
+	
+	return cavity;	
+}
+#endif // INPUT_CURVATURE
+
+USE_TEXTURE2D( tSrc );
+USE_LOADSTORE_TEXTURE2D( float, tDst, 0 );
+
+COMPUTE( 8, 8, 1 )
+{
+	if ( any( DISPATCH_THREAD_ID.xy >= uResolution.xy ) )
+	{
+		// discard any thread out of texture bounds
+		return;
+	}
+
+	vec2 ctUV = vec2( DISPATCH_THREAD_ID.xy ) / vec2 ( uResolution ) + ( uInverseResolution * 0.5 );
+
+	vec4 color = vec4( 0.0, 0.0, 0.0, 0.0 );
+
+#if !defined( BLUR_MODE )
+	color = texture2DLod( tSrc, ctUV, 0.0 ).rgba; // passthrough, don't need to actually do the prepass, just copy the buffer
+#else
+	for( int i = 0; i < uSampleCount; ++i )
+	{
+#ifdef INPUT_CURVATURE
+		float tap = texture2DLod( tSrc, ctUV + uKernel[i].yx, 0 ).r;
+		tap = curveFunction( tap );
+		tap *= uSampleWeight[i];
+		color.r += tap;
+#else
+		color += uSampleWeight[i] * texture2DLod( tSrc, ctUV + uKernel[i].yx, 0 ).rgba; // we flip the kernel coordinate to do a vertical blur instead
+#endif
+	}
+#endif
+
+	imageStore( tDst, DISPATCH_THREAD_ID.xy, color );
+}
+
+#endif // _LAYER_BLUR_PREPASS_COMP

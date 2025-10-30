@@ -1,0 +1,2255 @@
+#include "../common/colorspacerecolor.sh"
+#include "../paint/layer/layerformat.sh"
+#include "../paint/layer/gbufferutils.sh"
+#include "../common/commonrecolor.sh"
+
+#if defined(CPR_D3D)
+#define LOADSTORE_STRUCUREDBUFFER(type,name)        RWStructuredBuffer<type> name
+#elif defined(CPR_METAL)
+#define LOADSTORE_STRUCUREDBUFFER(type,name)        device cpr_program_t::type* name
+#endif
+
+uint convertToU(int value)
+{
+	return ( value < 0 ? uint(int(value - INT32_MIN)) : ( uint(value) + uint(-INT32_MIN) ) );
+};
+
+// The maximum input texture size is 8K == 2^26 texels, so the maximum texels count can be stored in the first 28 bits of an unsigned
+// the remaining bits are used to flag if a texel in the histogram has already been attached to a main color or not
+#define MASK_TEXELS_COUNT		0x0FFFFFFF
+#define MASK_COLOR_SHIFT		28
+#define SCALE_DISTANCES			10000.0
+
+uniform uint    uScaleColors;
+uniform uint	uHistoDim;
+uniform uint	uHistoDimHue;
+uniform uint	uCurrentColorId;
+uniform uint3	uDispatchCount;
+uniform uint	uFullUpdateIfUTD;
+uniform uint	uAllTilesCount;
+uniform uint	uActiveTilesCount;
+
+// --------------------------------------------------------------------------------------------------------
+void getColors(int i, int j, int k, inout vec3 rgb, inout vec3 hsv, vec3 meanHSV, vec3 meanPartialRGB)
+{
+	#ifdef IS_GRAYSCALE
+	{
+		hsv = vec3(0.f, 0.f, (float(k) + 0.5f) / float(uHistoDim));
+		rgb = hsv.zzz;
+	}
+	#else
+	{
+		hsv = vec3(2.f * ((float(i) + 0.5f) / float(uHistoDimHue)), (float(j) + 0.5f) / float(uHistoDim), (float(k) + 0.5f) / float(uHistoDim));
+		rgb = HSVtoRGB(hsv);
+
+		fixDarkGreyColor(meanHSV, meanPartialRGB, hsv, rgb);
+	}
+	#endif
+}
+
+// --------------------------------------------------------------------------------------------------------
+struct SortedColorsByDestColorIds
+{
+    int mIds[MAIN_COLORS_COUNT];
+};
+
+void sortColorsByDestColorIds(GroupData groupData, inout SortedColorsByDestColorIds sortedColorsByDestColorIds)
+{
+	for( uint i=0; i<MAIN_COLORS_COUNT; ++i )
+    { sortedColorsByDestColorIds.mIds[i] = -1; }
+
+	uint currentColorId=0;
+	for( uint i=0; i<MAIN_COLORS_COUNT; ++i )
+	{
+		int destColorId = groupData.mSetDestColorIds[i];
+		if( destColorId == -1) break;
+
+		for( uint j=0; j<MAIN_COLORS_COUNT; ++j )
+		{
+			if( groupData.mDestColorIds[j] == destColorId )
+			{
+                sortedColorsByDestColorIds.mIds[currentColorId] = j;
+				++currentColorId;
+			}
+		}
+	}
+}
+
+// --------------------------------------------------------------------------------------------------------
+uint getGroupDataId(uint maxGroupsCount, uint userMainColorCount)
+{
+	userMainColorCount = min(userMainColorCount, maxGroupsCount);
+	uint groupDataId = max(userMainColorCount, (uint)sMinimumMainColors) - 1;
+
+	return groupDataId;
+}
+
+// --------------------------------------------------------------------------------------------------------
+struct AverageData
+{
+    vec3  mColors[MAIN_COLORS_COUNT];
+    float mProps[MAIN_COLORS_COUNT];
+    float mMaxProps[MAIN_COLORS_COUNT];
+    float mDistThreshold[MAIN_COLORS_COUNT];
+};
+
+void computeAverageData( LOADSTORE_STRUCUREDBUFFER(MainColor, bSortedMainColors), GroupData groupData,
+                         inout AverageData averageData )
+{
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+        averageData.mColors[i] 			= vec3(0.f, 0.f, 0.f);
+        averageData.mProps[i] 			= 0.f;
+        averageData.mMaxProps[i] 		= 0.f;
+        averageData.mDistThreshold[i] 	= 0.f;
+	}
+
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+		const int id = groupData.mSetDestColorIds[i];
+		if( id==-1 ) break;
+
+		// Compute group colors average / proportion / max distance
+		for( uint j=0; j < MAIN_COLORS_COUNT; ++j )
+		{
+			if( groupData.mDestColorIds[j] == id )
+			{
+                averageData.mColors[i]		+= bSortedMainColors[j].mAroundColorAverageRGB * bSortedMainColors[j].mAroundColorProp;
+                averageData.mProps[i] 		+= bSortedMainColors[j].mAroundColorProp;
+                averageData.mMaxProps[i]	+= bSortedMainColors[j].mMaxColorProp;
+                averageData.mDistThreshold[i] = max(averageData.mDistThreshold[i], bSortedMainColors[j].mMaxThreshold);
+			}
+		}
+
+        if( averageData.mProps[i] > 0.f )
+        { averageData.mColors[i] /= averageData.mProps[i]; }
+	}
+}
+
+// --------------------------------------------------------------------------------------------------------
+// ------------------------------------------ INITIALIZE --------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef INIT_HISTO
+
+uniform uint	uIsFirstTile;
+
+USE_INTERLOCKED_BUFFER(bMeanTileI,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,1);
+#ifdef DO_ANALYSE
+	USE_INTERLOCKED_BUFFER(bHistoTile,2);
+	USE_INTERLOCKED_BUFFER(bHisto,3);
+	#ifdef IS_GRAYSCALE
+		USE_INTERLOCKED_BUFFER(bGray,4);
+	#endif
+#endif
+
+#ifdef IS_GRAYSCALE
+COMPUTE(1, 1, THREADS_COUNT)
+#else
+COMPUTE(THREADS_COUNT, THREADS_COUNT, THREADS_COUNT)
+#endif
+{
+	int groupId = ( GROUP_ID.x * uDispatchCount.y * uDispatchCount.z + GROUP_ID.y*uDispatchCount.z + GROUP_ID.z );
+	int threadId = GROUP_THREAD_ID.x * THREADS_COUNT*THREADS_COUNT + GROUP_THREAD_ID.y*THREADS_COUNT + GROUP_THREAD_ID.z;
+	if( threadId == 0 && groupId == 0 )
+	{
+		interlockedStore( bMeanTileI, 0, 0);
+		interlockedStore( bMeanTileI, 1, INT32_MIN);
+		#ifndef IS_GRAYSCALE
+			interlockedStore( bMeanTileI, 2, INT32_MIN);
+			interlockedStore( bMeanTileI, 3, INT32_MIN);
+		#endif
+
+		if( uIsFirstTile  )
+		{
+			bMeanF[0].mMeanRGB = vec3(0.f,0.f,0.f);
+			bMeanF[0].mMeanPartialRGB = vec3(0.f,0.f,0.f);
+			bMeanF[0].mMeanHSV = vec3(0.f,0.f,0.f);
+			bMeanF[0].mTexelCount = 0;
+			bMeanF[0].mRefMeanHSV = vec3(0.f,0.f,0.f);
+			bMeanF[0].mRefMeanPartialRGB = vec3(0.f,0.f,0.f);
+		}
+	}
+
+#ifdef DO_ANALYSE
+
+	int i = GROUP_ID.x*THREADS_COUNT + GROUP_THREAD_ID.x; // DISPATCH_THREAD_ID.x
+	int j = GROUP_ID.y*THREADS_COUNT + GROUP_THREAD_ID.y; // DISPATCH_THREAD_ID.y
+	int k = GROUP_ID.z*THREADS_COUNT + GROUP_THREAD_ID.z; // DISPATCH_THREAD_ID.z
+	const int histoId = i * uHistoDim * uHistoDim + j * uHistoDim + k;
+
+	#ifdef IS_GRAYSCALE
+	if( histoId < uHistoDim )
+	#else
+	if( histoId < uHistoDim * uHistoDim * uHistoDimHue )
+	#endif
+	{
+		interlockedStore( bHistoTile, histoId, 0 );
+
+		if( uIsFirstTile )
+		{ interlockedStore( bHisto, histoId, 0 ); }
+
+		#ifdef IS_GRAYSCALE
+		for( uint i=0; i<DISPATCH_COUNT; ++i )
+		{ interlockedStore( bGray, histoId * DISPATCH_COUNT + i, 0 ); }
+		#endif
+	}
+#endif
+}
+
+#endif
+
+// --------------------------------------------------------------------------------------------------------
+// ------------------------------------------ INITIALIZE --------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef COMPUTE_INIT_HISTO
+
+USE_TEXTURE2D(tInput);
+
+uniform uint	uWidth;
+uniform uint	uHeight;
+
+USE_INTERLOCKED_BUFFER(bMeanI,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,1);
+#ifdef DO_ANALYSE
+USE_INTERLOCKED_BUFFER(bHistogramColors,2); // bHisto or bGray
+#endif
+
+#define AVERAGE_RANGE 2
+
+COMPUTE(16,16,1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	uint2 startCoords = AVERAGE_RANGE * DISPATCH_THREAD_ID.xy;
+
+	vec3 avColor = 0.f;
+	uint count = 0;
+	for( uint i=0; i<AVERAGE_RANGE; ++i )
+	{
+		for( uint j=0; j<AVERAGE_RANGE; ++j )
+		{
+			uint2 coords = startCoords + uint2(i,j);
+
+			//check bounds
+			if( coords.x >= uWidth || coords.y >= uHeight )
+			{ continue; }
+
+			// Apply Padding Mask
+			if( !isInUVIsland(coords) )
+			{ continue; }
+
+			// load color
+			avColor += imageLoad(tInput, coords).rgb;
+
+			++count;
+		}
+	}
+
+	if( count>0 )
+	{
+		// To know how many pixels are really taken into account (not discarded by padding mask)
+		uint prev;
+		interlockedAdd( bMeanI, 0, count, prev );
+
+		vec3 c = avColor / float(count);
+
+		// convert color to integer bin value
+		int3 bins = int3( floor( avColor * uScaleColors + vec3(0.5,0.5,0.5) ) );
+
+		// increment histogram values
+		interlockedAdd( bMeanI, 1, bins.r, prev );
+
+		#ifndef IS_GRAYSCALE
+			interlockedAdd( bMeanI, 2, bins.g, prev );
+			interlockedAdd( bMeanI, 3, bins.b, prev );
+		#endif
+
+		#ifdef DO_ANALYSE
+		{
+			int finalCoord = 0;
+			#ifdef IS_GRAYSCALE
+			{
+				float value = c.r;
+
+				// If grayscale channel : OPTIMIZATION. 
+				// We cannot use a small sHistoSize buffer as the interlockedAdd() will be a bottleneck and performance on GPU really bad
+				// Even a 256 (sGrayHistoSize) buffer wouldn't be enough to reach a reasonnable GPU performance
+				// To fix that, we dispatch the colors counters in a sGrayHistoSize x DISPATCH_COUNT buffer 
+				// (the same color can be incremented in DISPATCH_COUNT different positions in the buffer, according to the input texel position)
+				// And we apply a second pass to merge the artifically dispatched sGrayHistoSize x DISPATCH_COUNT colors into a final sGrayHistoSize buffer
+
+				finalCoord = DISPATCH_COUNT * int(floor(value * uHistoDim + 0.5));
+				finalCoord += ( startCoords.x % DISPATCH_COUNT );
+
+				int dimMax = uHistoDim*DISPATCH_COUNT-1;
+				finalCoord = min(finalCoord, dimMax);
+			}
+			#else
+			{
+				int dimMax = uHistoDim-1;
+				int dimMaxHue = uHistoDimHue-1;
+
+				// HSV color space
+				vec3 hsv = RGBtoHSV( c.rgb );
+
+				int3 coords;
+				coords.x = min(int(floor((hsv.x/2.0) * uHistoDimHue + 0.5)), dimMaxHue);
+				coords.y = min(int(floor(hsv.y  * uHistoDim + 0.5)), dimMax);
+				coords.z = min(int(floor(hsv.z * uHistoDim + 0.5)), dimMax);
+
+				finalCoord = (coords.x*uHistoDim*uHistoDim + coords.y*uHistoDim + coords.z);
+			}
+			#endif
+
+			interlockedAdd(bHistogramColors, finalCoord, count, prev);
+		}
+		#endif // DO_ANALYSE
+	}
+}
+
+#endif // COMPUTE_INIT_HISTO
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef UNDISPATCH_GRAY
+
+USE_LOADSTORE_BUFFER(uint,bGray,0);
+USE_LOADSTORE_BUFFER(uint,bHisto,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,2);
+
+COMPUTE(32,1,1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	uint totalColorTexels = 0;
+	for( uint i=0; i<uDispatchCount.x; ++i )
+	{
+		totalColorTexels += bGray[uDispatchCount.x*DISPATCH_THREAD_ID.x + i];
+	}
+
+	bHisto[DISPATCH_THREAD_ID.x] = totalColorTexels;
+}
+
+#endif // UNDISPATCH_GRAY
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+
+#ifdef ADD_HISTO_TILES
+
+USE_INTERLOCKED_BUFFER(bHistoTile,0);
+USE_INTERLOCKED_BUFFER(bHisto,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,2 );
+
+#ifdef IS_GRAYSCALE
+COMPUTE(1, 1, THREADS_COUNT)
+#else
+COMPUTE(THREADS_COUNT, THREADS_COUNT, THREADS_COUNT)
+#endif
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	int i = GROUP_ID.x*THREADS_COUNT + GROUP_THREAD_ID.x; // DISPATCH_THREAD_ID.x
+	int j = GROUP_ID.y*THREADS_COUNT + GROUP_THREAD_ID.y; // DISPATCH_THREAD_ID.y
+	int k = GROUP_ID.z*THREADS_COUNT + GROUP_THREAD_ID.z; // DISPATCH_THREAD_ID.z
+	const int currentColorId = i * uHistoDim * uHistoDim + j * uHistoDim + k;
+
+#ifdef IS_GRAYSCALE
+	if( currentColorId < uHistoDim )
+#else
+	if( currentColorId < uHistoDim * uHistoDim * uHistoDimHue )
+#endif
+	{
+		// We cannot store the real texelsCount across all the existing tiles since it could reach the INT32_MAX limit
+		uint prev;
+		interlockedAdd( bHisto, currentColorId, interlockedLoad( bHistoTile, currentColorId ) / uAllTilesCount, prev );
+	}
+}
+
+#endif
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+
+#ifdef MEANF
+
+USE_INTERLOCKED_BUFFER(bMeanTileI,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,2 );
+
+uniform uint	uIsGrayscale;
+uniform uint	uIsLastTile;
+
+COMPUTE(1, 1, 1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	MeanColor meanColor = bMeanF[0];
+
+	int texelsCount = interlockedLoad( bMeanTileI, 0 );
+	
+	vec3 meanHSV = 0.f;
+	if( texelsCount > 0 && uAllTilesCount > 0 ) 
+	{
+		// We cannot store the real texelsCount across all the existing tiles since it could reach the INT32_MAX limit
+		meanColor.mTexelCount = uint(texelsCount / uAllTilesCount);
+
+		meanColor.mMeanRGB.x += float(convertToU( interlockedLoad( bMeanTileI, 1 ))) / float(texelsCount * uScaleColors);
+		if( uIsGrayscale )
+		{
+			meanColor.mMeanRGB.yz += meanColor.mMeanRGB.xx;
+		}
+		else
+		{
+			meanColor.mMeanRGB.y += float(convertToU(interlockedLoad( bMeanTileI, 2 ))) / float(texelsCount * uScaleColors);
+			meanColor.mMeanRGB.z += float(convertToU(interlockedLoad( bMeanTileI, 3 ))) / float(texelsCount * uScaleColors);
+		}
+
+		if( uIsLastTile )
+		{
+			meanColor.mMeanRGB /= uActiveTilesCount;
+			meanHSV = RGBtoHSV(meanColor.mMeanRGB);
+			meanColor.mMeanHSV = meanHSV;
+
+			meanColor.mMeanPartialRGB = computePartialRGBFromH(meanHSV.x);
+		}
+	}
+
+	bMeanF[0] = meanColor;
+}
+
+#endif
+
+// --------------------------------------------------------------------------------------------------------
+// ------------------------------------------ ANALYSE -----------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef COMPUTE_INIT_ANALYSE_HISTO
+
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bMainColors,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,2);
+
+COMPUTE(1, 1, 1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	MainColor meanMainColor = bMainColors[0];
+	vec3 meanHSV = bMeanF[0].mMeanHSV;
+	meanMainColor.mCurrentColorHSV = meanHSV;
+	meanMainColor.mFoundCurrentColor = 1.f;
+	meanMainColor.mIsMean = 1;
+	meanMainColor.mCurrentThreshold = computeColorInfluenceThreshold(meanHSV);
+
+	bMainColors[0] = meanMainColor;
+}
+
+#endif // COMPUTE_INIT_ANALYSE_HISTO
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef COMPUTE_ANALYSE_HISTO
+
+#ifdef IS_GRAYSCALE
+#define GROUP_NEXT_COLORS_SIZE			THREADS_COUNT
+#else
+#define GROUP_NEXT_COLORS_SIZE			THREADS_COUNT*THREADS_COUNT*THREADS_COUNT
+#endif
+
+USE_INTERLOCKED_BUFFER(bMainColorsCS,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bMainColors,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(SearchMainColor,bGroups,2);
+USE_LOADSTORE_BUFFER(uint,bHistogram,3);
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,4);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,5);
+
+groupshared int2	gNextColorCandidates[GROUP_NEXT_COLORS_SIZE];
+groupshared vec3	gNextColorCandidatesSuppl[GROUP_NEXT_COLORS_SIZE];
+
+// --------------------------------------------------------------------------------------------------------
+void computeMaxDistance(vec3 hsv, int colorTexelCount)
+{
+// Only necessary on Local Mode
+#ifndef IS_COLOR_LIST
+	uint threshold = max(1, int((float(bMeanF[0].mTexelCount) / 100.f) * 0.001f));	// 0.001%
+
+	if( colorTexelCount < threshold )
+	{ return; }
+
+	vec3 currentColorHSV = bMainColors[uCurrentColorId].mCurrentColorHSV;
+
+	// ****** maxLinearDistHSVModified ******
+	float linearDistance = computeLinearDistanceHSV(hsv, currentColorHSV);
+
+	int prev;
+	interlockedMax(bMainColorsCS, OUTPUT_COLOR_SIZE*uCurrentColorId + OUTPUT_MAX_LINEAR_DIST_POS, (int)ceil(linearDistance*SCALE_DISTANCES), prev);
+#endif
+}
+
+// --------------------------------------------------------------------------------------------------------
+#ifdef IS_GRAYSCALE
+COMPUTE(1, 1, THREADS_COUNT)
+#else
+COMPUTE(THREADS_COUNT, THREADS_COUNT, THREADS_COUNT)
+#endif
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	if( bMainColors[uCurrentColorId].mFoundCurrentColor <= 0.0 )
+		return;
+
+	// Initialization (necessary as we return when colorTexelCount==0) 
+	int threadId = GROUP_THREAD_ID.x * THREADS_COUNT*THREADS_COUNT + GROUP_THREAD_ID.y*THREADS_COUNT + GROUP_THREAD_ID.z;
+	gNextColorCandidates[threadId] = int2(0,0);
+	gNextColorCandidatesSuppl[threadId] = vec3(0,0,0);
+
+	groupMemoryBarrierWithGroupSync();
+
+	// ************
+	int i = GROUP_ID.x*THREADS_COUNT + GROUP_THREAD_ID.x; 
+	int j = GROUP_ID.y*THREADS_COUNT + GROUP_THREAD_ID.y; 
+	int k = GROUP_ID.z*THREADS_COUNT + GROUP_THREAD_ID.z;
+
+	bool isFirstThreadInGroup = ( threadId==0 );
+	
+	int groupsCount = uDispatchCount.x*uDispatchCount.y*uDispatchCount.z;
+
+	int groupId = ( GROUP_ID.x * uDispatchCount.y * uDispatchCount.z + GROUP_ID.y*uDispatchCount.z + GROUP_ID.z );
+	const int currentColorId = i * uHistoDim * uHistoDim + j * uHistoDim + k;
+
+	int histogramData = bHistogram[currentColorId];
+	int colorTexelCount = histogramData & MASK_TEXELS_COUNT;
+	int alreadyLinkedToMainColor = histogramData >> MASK_COLOR_SHIFT;
+
+	// alreadyLinkedToMainColor == 1 : This color has already been enclosed by the influence sphere of a main color
+	if( (colorTexelCount==0 || alreadyLinkedToMainColor == 1) && !isFirstThreadInGroup )
+	{ return; }
+
+	const bool lookForNextMaxColor = ( uCurrentColorId < MAIN_COLORS_COUNT - 1 );
+
+	// ****** find RGB / HSV colors and fix dark grey ******
+	vec3 rgb, hsv;
+	getColors(i, j, k, rgb, hsv, bMeanF[0].mMeanHSV, bMeanF[0].mMeanPartialRGB);
+
+	computeMaxDistance(hsv, colorTexelCount);
+
+	vec3 currentColorHSV = bMainColors[uCurrentColorId].mCurrentColorHSV;
+	float currentColorThreshold = bMainColors[uCurrentColorId].mCurrentThreshold;	
+
+	float linearDistance = computeLinearDistanceHSV(hsv, currentColorHSV);
+	float currentTexelThreshold = computeColorInfluenceThreshold(hsv);
+
+	int2 nextColorCandidate = int2(0,0);
+	vec3 nextColorCandidateSuppl = vec3(0,0,0);
+	if( linearDistance <= currentColorThreshold )
+	{
+		int prev;
+		interlockedAdd(bMainColorsCS, OUTPUT_COLOR_SIZE*uCurrentColorId + OUTPUT_TEXELS_COUNT_POS, colorTexelCount, prev);
+
+		int3 scaledColor = int3(floor(rgb * uScaleColors + 0.5f)) * colorTexelCount;
+
+		interlockedAdd(bMainColorsCS, OUTPUT_COLOR_SIZE*uCurrentColorId + OUTPUT_AVERAGE_RGB_POS,		scaledColor.r, prev);
+		interlockedAdd(bMainColorsCS, OUTPUT_COLOR_SIZE*uCurrentColorId + OUTPUT_AVERAGE_RGB_POS + 1,	scaledColor.g, prev);
+		interlockedAdd(bMainColorsCS, OUTPUT_COLOR_SIZE*uCurrentColorId + OUTPUT_AVERAGE_RGB_POS + 2,	scaledColor.b, prev);
+
+		bHistogram[currentColorId] = int(colorTexelCount + (1 << MASK_COLOR_SHIFT));
+	}
+	else if( lookForNextMaxColor )
+	{
+		bool possibleCandidate = ( linearDistance > (currentTexelThreshold+currentColorThreshold) );
+		if( possibleCandidate )
+		{ 
+			nextColorCandidate = int2( colorTexelCount, currentColorId );
+
+			// Previous colors
+			for( int ct = 0; ct < uCurrentColorId; ++ct )
+			{
+				vec3 previousColorHSV = bMainColors[ct].mCurrentColorHSV;
+				float prevLinearDistance = computeLinearDistanceHSV(hsv, previousColorHSV);
+
+				float previousColorThreshold = computeColorInfluenceThreshold(previousColorHSV);
+
+				// Not a candidate anymore if INTERSECTION between prev color and texel color spheres
+				if( prevLinearDistance < (previousColorThreshold + currentTexelThreshold) ) 
+				{
+					nextColorCandidate = int2(0,0);
+					possibleCandidate = false;
+					break;
+				}
+			}
+		}
+
+		if( !possibleCandidate )
+		{
+			float maxSupplThreshold = linearDistance - currentColorThreshold;
+			nextColorCandidateSuppl = vec3( float(colorTexelCount) + 0.5f, float(currentColorId) + 0.5f, maxSupplThreshold );
+
+			// Previous colors
+			for( int ct = 0; ct < uCurrentColorId; ++ct )
+			{
+				vec3 previousColorHSV = bMainColors[ct].mCurrentColorHSV;
+				float prevLinearDistance = computeLinearDistanceHSV(hsv, previousColorHSV);
+
+				float previousColorThreshold = computeColorInfluenceThreshold(previousColorHSV);
+
+				// Not a suppl candidate anymore if current texel color is INSIDE prev color's sphere
+				if( prevLinearDistance < previousColorThreshold )
+				{
+					nextColorCandidateSuppl = vec3(0.f,0.f,0.f);
+					maxSupplThreshold = 0.f;
+					break;
+				}
+				else
+				{
+					maxSupplThreshold = min( maxSupplThreshold, prevLinearDistance - previousColorThreshold );
+				}
+			}
+
+			nextColorCandidateSuppl.z = maxSupplThreshold;
+		}	
+	}
+
+	gNextColorCandidates[threadId] = nextColorCandidate;
+	gNextColorCandidatesSuppl[threadId] = nextColorCandidateSuppl;
+
+	// Wait for every thread to catch up
+	groupMemoryBarrierWithGroupSync();
+
+	// Done once for every threads group
+	if( isFirstThreadInGroup && lookForNextMaxColor )
+	{
+		int2 maxGroupColor = 0;
+		vec3 maxGroupColorSuppl = 0;
+		for( int c=0; c<GROUP_NEXT_COLORS_SIZE; ++c )
+		{
+			int2 candidate = gNextColorCandidates[c];
+			if( candidate.x > maxGroupColor.x )
+			{
+				maxGroupColor = candidate;
+			}
+
+			vec3 candidateSuppl = gNextColorCandidatesSuppl[c];
+			if( candidateSuppl.x > maxGroupColorSuppl.x )
+			{
+				maxGroupColorSuppl = candidateSuppl;
+			}
+		}	
+
+		SearchMainColor searchMainColor;
+		searchMainColor.mTexelCount			= maxGroupColor.x;
+		searchMainColor.mColorId			= maxGroupColor.y;
+
+		searchMainColor.mTexelCountSuppl	= uint(floor(maxGroupColorSuppl.x));
+		searchMainColor.mColorIdSuppl		= uint(floor(maxGroupColorSuppl.y));
+		searchMainColor.mMaxThresholdSuppl	= maxGroupColorSuppl.z;
+
+		// We store the "maximum" color for each threads group
+		bGroups[groupsCount*uCurrentColorId + groupId] = searchMainColor;
+	}
+}
+
+#endif // COMPUTE_ANALYSE_HISTO
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef COMPUTE_ANALYSE_HISTO_END
+
+USE_INTERLOCKED_BUFFER(bMainColorsCS,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bMainColors,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(SearchMainColor,bGroups,2);
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,3);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,4);
+
+COMPUTE(1, 1, 1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	if( bMainColors[uCurrentColorId].mFoundCurrentColor <= 0.0 )
+		return;
+
+	int aroundColorPixelCount	= interlockedLoad(	bMainColorsCS,	OUTPUT_COLOR_SIZE*uCurrentColorId + OUTPUT_TEXELS_COUNT_POS);
+    int3 scaledRGB              = (int3)interlockedLoad3(    bMainColorsCS,    int(OUTPUT_COLOR_SIZE*uCurrentColorId + OUTPUT_AVERAGE_RGB_POS));
+
+	// Only necessary in Local Mode
+	#ifndef IS_COLOR_LIST
+		int scaledMaxDist		= interlockedLoad(	bMainColorsCS,	OUTPUT_COLOR_SIZE*uCurrentColorId + OUTPUT_MAX_LINEAR_DIST_POS);
+		bMainColors[uCurrentColorId].mMaxLinearDist = float(scaledMaxDist) / SCALE_DISTANCES;
+	#endif
+	
+	if( aroundColorPixelCount > 0 )
+	{
+		vec3 colU;
+		colU.x = float(convertToU(scaledRGB.x));
+		colU.y = float(convertToU(scaledRGB.y));
+		colU.z = float(convertToU(scaledRGB.z));
+        
+		bMainColors[uCurrentColorId].mAroundColorAverageRGB = colU / float(aroundColorPixelCount * uScaleColors);
+		bMainColors[uCurrentColorId].mAroundColorProp = 100.f * float(aroundColorPixelCount) / float(bMeanF[0].mTexelCount);
+	}
+	
+	const bool lookForNextMaxColor = ( uCurrentColorId < MAIN_COLORS_COUNT - 1 );
+	if( lookForNextMaxColor )
+	{
+		int groupsCount = uDispatchCount.x*uDispatchCount.y*uDispatchCount.z;
+
+		int2 maxGroupColor = 0;
+		float maxThresholdSuppl = 0.f;
+		int2 maxGroupColorSuppl = 0;
+		for( int gId=0; gId<groupsCount; ++gId )
+		{
+			SearchMainColor searchMainColor = bGroups[groupsCount*uCurrentColorId + gId];
+			if( searchMainColor.mTexelCount > maxGroupColor.x )
+			{
+				maxGroupColor.x = searchMainColor.mTexelCount;
+				maxGroupColor.y = searchMainColor.mColorId;
+			}
+
+			if( searchMainColor.mTexelCountSuppl > maxGroupColorSuppl.x )
+			{
+				maxGroupColorSuppl.x = searchMainColor.mTexelCountSuppl;
+				maxGroupColorSuppl.y = searchMainColor.mColorIdSuppl;
+				maxThresholdSuppl = searchMainColor.mMaxThresholdSuppl;
+			}
+		}
+
+		// We compare the LAST found main color proportion (total sphere inlfuence) with the proportion of the "supplementary" color (partial proportion, only at the color voxel) 
+		// If the "supplementary" color has the largest proportion, it is selected as the "next best main color" 
+		bool isSuppl = false;
+		if( maxGroupColorSuppl.x > aroundColorPixelCount || (maxGroupColorSuppl.x > 0 && maxGroupColor.x==0) )
+		{
+			maxGroupColor.x = maxGroupColorSuppl.x;
+			maxGroupColor.y = maxGroupColorSuppl.y;
+
+			isSuppl = true;
+		}
+
+		if( maxGroupColor.x > 0 )
+		{
+			int rgbId = maxGroupColor.y;
+
+			int i = rgbId / (uHistoDim * uHistoDim);
+			rgbId = rgbId % (uHistoDim * uHistoDim);
+			int j = rgbId / uHistoDim;
+			int k = rgbId % uHistoDim;
+			vec3 candidateRGB, candidateHSV;
+			getColors(i, j, k, candidateRGB, candidateHSV, bMeanF[0].mMeanHSV, bMeanF[0].mMeanPartialRGB);
+		
+			bMainColors[uCurrentColorId+1].mCurrentColorHSV 	= candidateHSV;
+			bMainColors[uCurrentColorId+1].mCurrentThreshold 	= ( isSuppl ? maxThresholdSuppl : computeColorInfluenceThreshold(candidateHSV) );
+			bMainColors[uCurrentColorId+1].mFoundCurrentColor 	= 1.0;
+		}
+	}
+}
+
+#endif // COMPUTE_ANALYSE_HISTO_END
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef SORT_MAIN_COLORS
+
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bMainColors,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColors,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,2);
+USE_INTERLOCKED_BUFFER(bMainColorsCS,3);
+
+COMPUTE(1, 1, 1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	// **************** Sort main colors by props
+	int sortedMainColorsId[MAIN_COLORS_COUNT];
+	int mainColorsIsSorted[MAIN_COLORS_COUNT];
+	{
+		for( int i=0; i<MAIN_COLORS_COUNT; ++i )
+		{
+			sortedMainColorsId[i] = -1;
+			mainColorsIsSorted[i] = 0;
+		}
+	}
+
+	// If the Mean color is low density, it should be sorted as any other color instead of forcing its position as the first color of the list
+	bool sortMean = ( bMainColors[0].mAroundColorProp <= SORT_MEAN_THRESHOLD );
+	int startColorId = 0;
+	if( !sortMean )
+	{
+		startColorId = 1;
+
+		sortedMainColorsId[0] = 0;
+		mainColorsIsSorted[0] = 1;
+	}
+	for( int i=startColorId; i<MAIN_COLORS_COUNT; ++i )
+	{
+		int maxId = -1;
+		float maxProps = 0.f;
+		for( int j=startColorId; j<MAIN_COLORS_COUNT; ++j )
+		{
+			float prop = bMainColors[j].mAroundColorProp;
+			if( mainColorsIsSorted[j] == 0 && prop > maxProps )
+			{
+				maxProps = prop;
+				maxId = j;
+			}
+		}
+
+		sortedMainColorsId[i] = maxId;
+		mainColorsIsSorted[maxId] = 1;
+	}
+
+	MainColorCS mainColorCS[MAIN_COLORS_COUNT];
+	MainColor mainColors[MAIN_COLORS_COUNT];
+	for( int i=0; i<MAIN_COLORS_COUNT; ++i )
+	{
+        int colorId = sortedMainColorsId[i];
+		if( colorId == -1 ) 
+		{
+            reset(mainColors[i]);
+			reset(mainColorCS[i]);
+			continue;
+		}
+
+		mainColors[i]  = bMainColors[colorId];
+
+		mainColorCS[i].mAroundColorPixelCount = asint(interlockedLoad( bMainColorsCS, colorId * 5 ));
+		mainColorCS[i].mAroundColorAverageRGB[0] = asint(interlockedLoad( bMainColorsCS, colorId * 5 + 1 ));
+		mainColorCS[i].mAroundColorAverageRGB[1] = asint(interlockedLoad( bMainColorsCS, colorId * 5 + 2 ));
+		mainColorCS[i].mAroundColorAverageRGB[2] = asint(interlockedLoad( bMainColorsCS, colorId * 5 + 3 ));
+		mainColorCS[i].mMaxLinearDist = asint(interlockedLoad( bMainColorsCS, colorId * 5 + 4 ));
+	}
+
+	for( int i=0; i<MAIN_COLORS_COUNT; ++i )
+	{
+		interlockedStore( bMainColorsCS, i * 5, asuint(mainColorCS[i].mAroundColorPixelCount) );
+		interlockedStore( bMainColorsCS, i * 5 + 1, asuint(mainColorCS[i].mAroundColorAverageRGB[0]) );
+		interlockedStore( bMainColorsCS, i * 5 + 2, asuint(mainColorCS[i].mAroundColorAverageRGB[1]) );
+		interlockedStore( bMainColorsCS, i * 5 + 3, asuint(mainColorCS[i].mAroundColorAverageRGB[2]) );
+		interlockedStore( bMainColorsCS, i * 5 + 4, asuint(mainColorCS[i].mMaxLinearDist) );
+		bSortedMainColors[i] = mainColors[i];
+	}
+}
+
+#endif // SORT_MAIN_COLORS
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef GROUP_COLORS
+
+uniform uint uIsLocalMode;
+uniform uint uIsGrayscale;
+
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColors,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(GroupData,bGroupsData,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,2);
+
+struct PairMainColorDist
+{
+	int mColorId1;
+	int mColorId2;
+	float mDist;
+};
+
+bool isInitialized(PairMainColorDist pair)
+{
+    return (pair.mColorId1 != -1 && pair.mColorId2 != -1);
+}
+
+void reset(inout PairMainColorDist pair)
+{ 
+    pair.mColorId1 = pair.mColorId2 = -1;
+    pair.mDist = 1.f;
+}
+
+struct ColorInfo
+{
+	int mId;
+	int mGroupId;
+	int mGroupWithColorId;
+	bool mIsGrouped;
+	float mDist;
+	float mProp;
+};
+
+bool isInitialized(ColorInfo info)
+{
+	return (info.mId != -1 && info.mGroupId != -1 && info.mGroupWithColorId != -1);; 
+}
+
+void reset(inout ColorInfo info)
+{
+	info.mId = -1;
+	info.mGroupId = -1;
+	info.mGroupWithColorId = -1;
+	info.mIsGrouped = false;
+	info.mDist = 0.f;
+	info.mProp = 0.f;
+}
+
+struct DistFromMainColors
+{
+	float	mColorDist[MAIN_COLORS_COUNT];
+};
+
+struct RegroupColorsData
+{
+    ColorInfo mColorsInfo[MAIN_COLORS_COUNT];
+    int mCenters[MAIN_COLORS_COUNT];
+    DistFromMainColors mDistances[MAIN_COLORS_COUNT];
+    PairMainColorDist mPairsDist[MAIN_COLORS_COUNT*MAIN_COLORS_COUNT];
+};
+
+struct PairRegroupedColors
+{
+    ColorInfo mColorsInfo[MAIN_COLORS_COUNT];
+};
+
+void initializePairDist(inout RegroupColorsData regroup, uint count, uint colorId1, uint colorId2)
+{
+    regroup.mPairsDist[count].mColorId1 = colorId1;
+    regroup.mPairsDist[count].mColorId2 = colorId2;
+    regroup.mPairsDist[count].mDist = regroup.mDistances[colorId1].mColorDist[colorId2];
+}
+
+//----------------------------------------------------------------------------------
+void searchForCentralColor(inout RegroupColorsData regroup, inout uint centersCount,
+                           float centerColorThreshold, uint i)
+{
+	bool canBeCenter = true;
+	for( uint j=0; j< centersCount; ++j )
+	{
+        const int center = regroup.mCenters[j];
+		if( center == -1 ) break;
+
+        if( regroup.mDistances[i].mColorDist[center] <= centerColorThreshold )
+		{
+			canBeCenter = false;
+			break;
+		}
+	}
+
+	if( canBeCenter )
+	{
+        regroup.mCenters[centersCount] = i;
+		++centersCount;
+
+        regroup.mColorsInfo[i].mId 					= i;
+        regroup.mColorsInfo[i].mGroupId 			= i;
+        regroup.mColorsInfo[i].mGroupWithColorId 	= i;
+        regroup.mColorsInfo[i].mIsGrouped 			= true;
+	}
+};
+
+//----------------------------------------------------------------------------------
+void findGroupCentralColors(inout RegroupColorsData regroup, float centerColorThreshold)
+{
+	uint centersCount = 0;
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+        regroup.mCenters[i] = -1;
+	}
+
+	int firstCenterId = -1;
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+		if( !bSortedMainColors[i].mFoundCurrentColor )
+			continue;
+
+		// First center, must NOT be the Mean color
+		if( !bSortedMainColors[i].mIsMean )
+		{
+            regroup.mCenters[centersCount] = i;
+			++centersCount;
+
+            regroup.mColorsInfo[i].mId 					= i;
+            regroup.mColorsInfo[i].mGroupId 			= i;
+            regroup.mColorsInfo[i].mGroupWithColorId 	= i;
+            regroup.mColorsInfo[i].mIsGrouped 			= true;
+
+			firstCenterId = i;
+			break;
+		}
+	}
+
+	if( firstCenterId == -1 )
+		return;
+
+	for( uint i = firstCenterId+1; i < MAIN_COLORS_COUNT; ++i )
+	{
+		// At first we try to avoid the Mean color as a central color...
+		if( !bSortedMainColors[i].mFoundCurrentColor || bSortedMainColors[i].mIsMean )
+			continue;
+
+        searchForCentralColor(regroup, centersCount, centerColorThreshold, i);
+	}
+
+	// ... but if at the end of the search the Mean color is far enough from all the found central colors, we must select it as a central color
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+		if( bSortedMainColors[i].mIsMean )
+		{
+            searchForCentralColor(regroup, centersCount, centerColorThreshold, i);
+			break;
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------
+#define sMeanPropThreshold	50.f
+#define sMainsPropThreshold	5.f
+#define sAllPropThreshold	49.f
+
+uint selectedMainColor(int centers[MAIN_COLORS_COUNT])
+{
+	// TODO : use the center colors list to select the main color
+
+	uint selectedColorId = 0;
+
+	// If grayscale, we select the firt color with the largest proportion
+	if( uIsGrayscale ) return selectedColorId;
+
+	uint meanId = 0;
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+		if( bSortedMainColors[i].mIsMean )
+		{
+			meanId = i;
+			break;
+		}
+	}
+
+	// Default value...
+	selectedColorId = meanId;
+
+	if( bSortedMainColors[meanId].mAroundColorProp > sMeanPropThreshold )
+	{
+		selectedColorId = meanId;
+	}
+	else
+	{
+		// None of the main colors are in sufficient proportion.
+		bool atLeastOneMain = false;
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+		{
+			if( i != meanId && bSortedMainColors[i].mAroundColorProp >= sMainsPropThreshold )
+			{
+				atLeastOneMain = true;
+				break;
+			}
+		}
+		if( !atLeastOneMain )
+		{
+			return selectedColorId; //Mean
+		}
+
+		// Probably too many "secondary" colors (outside the influence "spheres" of main colors)
+		float totalProp = 0.f;
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+		{
+			totalProp += bSortedMainColors[i].mAroundColorProp;
+		}
+
+		if( totalProp < sAllPropThreshold )
+		{
+			return selectedColorId; //Mean
+		}
+
+
+		// ****** Search for the most saturated color ******
+
+		// ****** TODO ****** : 
+		// Check that the main colors weighted sum is close enough to the mean color, else : GLOBAL
+		// Only check the Saturation is not enough. We must check that the Value is not too low
+
+		float currentMaxSat = 0.f;
+		int maxSatColorId = -1;
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+		{
+			vec3 mainHSV = RGBtoHSV(bSortedMainColors[i].mAroundColorAverageRGB);
+
+			if( i != meanId && mainHSV.y > currentMaxSat && bSortedMainColors[i].mAroundColorProp > sMainsPropThreshold )
+			{
+				maxSatColorId = i;
+				currentMaxSat = mainHSV.y;
+			}
+		}
+
+		if( maxSatColorId != -1 )
+		{
+			selectedColorId = maxSatColorId;
+		}
+	}
+	
+	return selectedColorId;
+}
+
+//----------------------------------------------------------------------------------
+void groupColors(inout RegroupColorsData regroup, float colorThreshold, float centerColorThreshold, float maxProp)
+{
+	bool groupSuccess = true;
+	while( groupSuccess )
+	{
+		float minDist = 100.f;
+		int minColorId = -1;
+		int minGroupId = -1;
+		int minGroupedColorId = -1;
+		for( uint d = 0; d < MAIN_COLORS_COUNT*MAIN_COLORS_COUNT; ++d )
+		{
+            PairMainColorDist colorDist = regroup.mPairsDist[d];
+			if( !isInitialized(colorDist) ) break;
+
+            bool hasOneGroupedColor = (regroup.mColorsInfo[colorDist.mColorId1].mIsGrouped || regroup.mColorsInfo[colorDist.mColorId2].mIsGrouped);
+            
+            bool hasOneUngroupedColor = (!regroup.mColorsInfo[colorDist.mColorId1].mIsGrouped || !regroup.mColorsInfo[colorDist.mColorId2].mIsGrouped);
+
+			if( !(hasOneGroupedColor && hasOneUngroupedColor) )
+				continue;
+
+            uint groupedColorId = regroup.mColorsInfo[colorDist.mColorId1].mIsGrouped ? colorDist.mColorId1 : colorDist.mColorId2;
+
+            uint ungroupedColorId =  regroup.mColorsInfo[colorDist.mColorId1].mIsGrouped ? colorDist.mColorId2 : colorDist.mColorId1;
+
+            float dist = regroup.mDistances[groupedColorId].mColorDist[ungroupedColorId];
+            float minProp = min(regroup.mColorsInfo[colorDist.mColorId1].mProp, regroup.mColorsInfo[colorDist.mColorId2].mProp);
+			if( dist > colorThreshold || minProp > maxProp )
+				continue;
+
+            uint groupId = regroup.mColorsInfo[groupedColorId].mGroupId;
+
+			// Distance between color and the central color of the group 
+            if( regroup.mDistances[groupId].mColorDist[ungroupedColorId] > centerColorThreshold )
+            { continue; }
+
+			if( dist < minDist )
+			{
+				minDist = dist;
+				minColorId = ungroupedColorId;
+				minGroupId = groupId;
+				minGroupedColorId = groupedColorId;
+			}
+		}
+
+		if( minColorId != -1 )
+		{
+            regroup.mColorsInfo[minColorId].mId 		= minColorId;
+            regroup.mColorsInfo[minColorId].mGroupId 	= minGroupId;
+            regroup.mColorsInfo[minColorId].mIsGrouped 	= true;
+            regroup.mColorsInfo[minColorId].mGroupWithColorId = minGroupedColorId;
+		}
+		else
+		{
+			groupSuccess = false;
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------
+void dispatchColorsFromSmallGroups(inout RegroupColorsData regroup, float minGroupProp)
+{
+	for( uint i=0; i< MAIN_COLORS_COUNT; ++i )
+	{
+		if( !bSortedMainColors[i].mFoundCurrentColor )
+			continue;
+
+        ColorInfo colorInfo = regroup.mColorsInfo[i];
+			
+		// Is a center
+		if( colorInfo.mId == colorInfo.mGroupId )
+		{
+			float groupProp = 0.f;
+
+			uint colorsIdsCount = 0;
+			int colorsIds[MAIN_COLORS_COUNT];
+			for( uint j = 0; j < MAIN_COLORS_COUNT; ++j )
+			{ colorsIds[j] = -1; }
+
+			for( uint j=0; j< MAIN_COLORS_COUNT; ++j )
+			{
+				if( !bSortedMainColors[j].mFoundCurrentColor )
+					continue;
+
+                ColorInfo colorInfo2 = regroup.mColorsInfo[j];
+				if( colorInfo2.mGroupId == colorInfo.mGroupId )
+				{
+					colorsIds[colorsIdsCount] = j;
+					++colorsIdsCount;
+
+					groupProp += colorInfo.mProp = bSortedMainColors[colorInfo2.mId].mAroundColorProp;
+				}
+			}
+
+			// This group is only built from really low density colors
+			// We force the dispatch of all the colors with other groups
+			if( groupProp <= minGroupProp )
+			{
+				for( uint j=0; j<MAIN_COLORS_COUNT; ++j )
+				{
+					int id = colorsIds[j];
+					if( id == -1 ) break;
+
+					for( uint d = 0; d < MAIN_COLORS_COUNT * MAIN_COLORS_COUNT; ++d )
+					{
+                        PairMainColorDist colorDist = regroup.mPairsDist[d];
+						if( !isInitialized(colorDist) ) break;
+
+                        if( colorDist.mColorId1==regroup.mColorsInfo[id].mId || colorDist.mColorId2 == regroup.mColorsInfo[id].mId )
+						{
+                            const uint otherColorId = ( colorDist.mColorId1 == regroup.mColorsInfo[id].mId ? colorDist.mColorId2 : colorDist.mColorId1 );
+
+							// Closest color which is not from the too small group
+                            if( regroup.mColorsInfo[otherColorId].mGroupId != colorInfo.mGroupId )
+							{
+                                regroup.mColorsInfo[id].mGroupId = regroup.mColorsInfo[otherColorId].mGroupId;
+                                regroup.mColorsInfo[id].mGroupWithColorId = otherColorId;
+
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------
+void bubbleSort(inout PairRegroupedColors pair, uint size)
+{
+	if( size == 0 ) return;
+
+	for( uint i = 0; i < size - 1; ++i )
+	{
+		for( uint j = 0; j < size - i - 1; ++j )
+		{
+            if( pair.mColorsInfo[j].mProp > pair.mColorsInfo[j + 1].mProp )
+			{
+                ColorInfo temp 			= pair.mColorsInfo[j];
+                pair.mColorsInfo[j] 	= pair.mColorsInfo[j + 1];
+                pair.mColorsInfo[j + 1] = temp;
+			}
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------
+void sortGroupingOperations( inout RegroupColorsData regroup, inout PairRegroupedColors pairs, inout uint groupsCount, inout uint maxGroupsCount, float minGroupProp )
+{
+	groupsCount = 0;
+	uint couplesCount = 0;
+	for( uint i=0; i< MAIN_COLORS_COUNT; ++i )
+	{
+		if( !bSortedMainColors[i].mFoundCurrentColor )
+			continue;
+
+		//if( colorInfo.mIsGrouped == false )
+		//	Log::warn("channel %i - ERROR grouping : color %i is not grouped", (int)channel, i);
+
+		// Not a center
+        if( regroup.mColorsInfo[i].mId != regroup.mColorsInfo[i].mGroupWithColorId )
+		{
+            regroup.mColorsInfo[i].mDist = regroup.mDistances[regroup.mColorsInfo[i].mId].mColorDist[regroup.mColorsInfo[i].mGroupWithColorId];
+            float prop = bSortedMainColors[regroup.mColorsInfo[i].mId].mAroundColorProp;
+            regroup.mColorsInfo[i].mProp = prop;
+
+            pairs.mColorsInfo[couplesCount] = regroup.mColorsInfo[i];
+			++couplesCount;
+
+			if( prop >= minGroupProp )
+			{ ++maxGroupsCount; }
+		}
+		else
+		{
+			++groupsCount;
+			++maxGroupsCount;
+		}
+	}
+
+    bubbleSort(pairs, couplesCount);
+}
+
+//----------------------------------------------------------------------------------
+bool findUnique(int groupColorIds[MAIN_COLORS_COUNT], uint size, uint value)
+{
+	for( uint i = 0; i < size; ++i )
+	{
+		if( groupColorIds[i] != -1 && (uint)groupColorIds[i] == value )
+		{
+			return true; 
+		}
+	}
+
+	return false;
+}
+
+//----------------------------------------------------------------------------------
+void insertUniqueAndSort(inout GroupData groupData, inout uint size, uint value)
+{
+    if( findUnique(groupData.mSetDestColorIds, size, value) )
+	{ return; }
+
+	// Trouver la position d'insertion pour maintenir le tri
+	uint insertIndex = size;
+    while( insertIndex > 0 && (uint)groupData.mSetDestColorIds[insertIndex - 1] > value )
+	{
+        groupData.mSetDestColorIds[insertIndex] = groupData.mSetDestColorIds[insertIndex - 1];
+		insertIndex--;
+	}
+
+    groupData.mSetDestColorIds[insertIndex] = value;
+	size++;
+}
+
+//----------------------------------------------------------------------------------
+void initializeColorGroupsData(uint userColorsCount, PairRegroupedColors pairs, inout GroupData groupData, uint foundMainColorsCount, uint groupsCount)
+{
+	reset(groupData);
+
+	if( userColorsCount > foundMainColorsCount || foundMainColorsCount == 0 )
+		return;
+
+	groupData.mSucessRegroup = ( userColorsCount < groupsCount ? false : true );
+
+    const uint movesCount = min(foundMainColorsCount, (uint)MAIN_COLORS_COUNT) - max(groupsCount, userColorsCount);
+
+	for( uint i = 0; i < movesCount; ++i )
+	{
+        ColorInfo colorInfo = pairs.mColorsInfo[i];
+		if( colorInfo.mId != colorInfo.mGroupWithColorId )
+		{
+            int toColor = colorInfo.mGroupWithColorId;
+			while( groupData.mDestColorIds[toColor] != toColor )
+			{
+				toColor = groupData.mDestColorIds[toColor];
+			}
+
+			groupData.mDestColorIds[colorInfo.mId] = toColor;
+
+			for( uint j = 0; j < MAIN_COLORS_COUNT; ++j )
+			{
+				if( groupData.mDestColorIds[j] == colorInfo.mId )
+                { groupData.mDestColorIds[j] = toColor; }
+			}
+		}
+	}
+
+	// To flag colors belonging to groups exceeding the user requested colors count
+	uint groupColorIdsSize = 0;
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+		if( !bSortedMainColors[i].mFoundCurrentColor )
+		{
+			groupData.mMainColorIgnored[i] = 1;
+			continue;
+		}
+
+		const uint groupId = groupData.mDestColorIds[i];
+		if( groupColorIdsSize < userColorsCount )
+		{
+			// Equivalent of std::set::insert()
+            insertUniqueAndSort(groupData, groupColorIdsSize, groupId);
+		}
+
+		groupData.mMainColorIgnored[i] = ( !groupData.mSucessRegroup && !findUnique(groupData.mSetDestColorIds, groupColorIdsSize, groupId) ? 1 : 0 );
+	}
+
+	// It is this information that will be used by EffectRecolor::render() so that each color is correctely linked to the correct
+	// "UI line / ColorData"
+	for( uint UIId=0; UIId<MAIN_COLORS_COUNT; ++UIId )
+	{
+		const int id = groupData.mSetDestColorIds[UIId];
+		if( id == -1 ) break;
+
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+		{
+			if( !bSortedMainColors[i].mFoundCurrentColor )
+				continue;
+
+			if( groupData.mDestColorIds[i] == id )
+			{
+				groupData.mUITargetColorIds[i] = UIId;
+			}
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------
+COMPUTE(1,1,1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	// **** Compute distances between main colors ****
+    RegroupColorsData regroup;
+	for( int k=0; k<MAIN_COLORS_COUNT; ++k )
+	{
+		if( bSortedMainColors[k].mFoundCurrentColor<=0.0 )
+			continue;
+
+		// Here we want to compute a distance between the average color, not the peak / center of the main color sphere
+		vec3 colorRGB = bSortedMainColors[k].mAroundColorAverageRGB;
+		vec3 colorHSV = RGBtoHSV(colorRGB);
+
+		for( int l=0; l<MAIN_COLORS_COUNT; ++l )
+		{
+			if( bSortedMainColors[l].mFoundCurrentColor<=0.0 )
+				continue;
+
+            regroup.mDistances[k].mColorDist[l] = l;
+
+			if( l == k ) 
+			{
+                regroup.mDistances[k].mColorDist[l] = 0.0;
+				continue;
+			}
+
+			// Idem : we want to compute a distance between the average color, not the peak / center of the main color sphere
+            vec3 otherColorRGB = bSortedMainColors[l].mAroundColorAverageRGB;
+            vec3 otherColorHSV = RGBtoHSV(otherColorRGB);
+
+			float linearDistance = computeHistoGroupDistance(colorHSV, otherColorHSV);
+
+            regroup.mDistances[k].mColorDist[l] = linearDistance;
+		}
+	}
+
+	// **** Group colors according to distances ****
+	for( uint i = 0; i < MAIN_COLORS_COUNT*MAIN_COLORS_COUNT; ++i )
+    { reset(regroup.mPairsDist[i]); }
+
+	uint foundMainColorsCount = 0;
+	uint count = 0;
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+		if( !bSortedMainColors[i].mFoundCurrentColor )
+			continue;
+
+		++foundMainColorsCount;
+
+		for( uint j = 0; j < i; ++j )
+		{
+			if (i == j) continue;
+            initializePairDist(regroup, count, i, j);
+			++count;
+		}
+	}
+
+    PairRegroupedColors pairs;
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+    { reset(pairs.mColorsInfo[i]); }
+	uint groupsCount = 0;
+	uint maxGroupsCount = 0;
+
+	uint selectedMainColorId = 0;
+
+	// To get colors groups, we need to have at least one main color
+	if( foundMainColorsCount > 1 )
+	{
+		// 1. Find groups / central colors 
+		const float centerColorThreshold = 0.25f;
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+        { reset(regroup.mColorsInfo[i]); }
+
+		int centers[MAIN_COLORS_COUNT];
+        findGroupCentralColors(regroup, centerColorThreshold);
+
+		if( uIsLocalMode )
+		{
+            selectedMainColorId = selectedMainColor(regroup.mCenters);
+		}
+		else
+		{
+			// 2. Group the closest colors around the central colors (aka : start groups) 
+			float colorThreshold = 0.15f;
+			float maxProp = 100.f; // 100%
+            groupColors(regroup, colorThreshold, centerColorThreshold, maxProp);
+
+			// 3. Now we can group colors a little bit further, but still around the central colors 
+			colorThreshold = 0.2f;
+			maxProp = 10.f; // 10%
+            groupColors(regroup, colorThreshold, centerColorThreshold, maxProp);
+
+			colorThreshold = centerColorThreshold;
+			maxProp = 5.f; // 5%
+            groupColors(regroup, colorThreshold, centerColorThreshold, maxProp);
+	
+			// 4. Redispath colors from "very small" groups (groups with a very small total density)
+			const float minGroupProp = 0.05f;
+            dispatchColorsFromSmallGroups(regroup, minGroupProp);
+
+			// 5. Sort every grouping operation (between two colors), according to density and distance
+            sortGroupingOperations(regroup, pairs, groupsCount, maxGroupsCount, minGroupProp);
+		}
+	}
+	else if( foundMainColorsCount==1 && !uIsLocalMode )
+	{
+		ColorInfo colorInfo;
+		colorInfo.mId = colorInfo.mGroupId = colorInfo.mGroupWithColorId = 0;
+		colorInfo.mIsGrouped = true;
+		colorInfo.mProp = bSortedMainColors[0].mAroundColorProp;
+        pairs.mColorsInfo[0] = colorInfo;
+
+		groupsCount = 1;
+		maxGroupsCount = 1;
+	}
+
+	if( !uIsLocalMode )
+	{
+		// 6. STORE GROUPING DATA 
+		for( uint userMainColorCount = 1; userMainColorCount <= MAIN_COLORS_COUNT; ++userMainColorCount )
+		{
+            GroupData groupData;
+            initializeColorGroupsData(userMainColorCount, pairs, groupData, foundMainColorsCount, groupsCount);
+            bGroupsData[userMainColorCount - 1] = groupData;
+		}
+	}
+
+	bUIData[0].mFoundMainColorsCount = foundMainColorsCount;
+	bUIData[0].mMaxGroupsCount= maxGroupsCount;
+	bUIData[0].mGroupsCount = groupsCount;
+	bUIData[0].mSelectedColorId = selectedMainColorId;
+}
+
+#endif // GROUP_COLORS 
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef COMPUTE_ANALYSE_HISTO_EXPAND_START
+
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColors,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(GroupData,bGroupsData,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(ColorData,bColorsData,2);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,3);
+
+uniform uint	uUserMainColorCount;
+
+COMPUTE(1, 1, 1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	uint groupDataId = getGroupDataId(bUIData[0].mMaxGroupsCount, uUserMainColorCount);
+	GroupData groupData = bGroupsData[groupDataId];
+
+	int discardColors[MAIN_COLORS_COUNT];
+	for( uint colorId = 0; colorId < MAIN_COLORS_COUNT; ++colorId )
+	{
+		discardColors[colorId] = 1;
+		const bool mainColorFound = ( bSortedMainColors[colorId].mFoundCurrentColor > 0.f && groupData.mMainColorIgnored[colorId]==0 );
+
+		const int UIId = groupData.mUITargetColorIds[colorId];
+		if( UIId != -1 )
+		{
+			discardColors[colorId] = discardColor(bColorsData[UIId], mainColorFound) ? 1 : 0;
+		}
+	}
+	
+	// The main colors linked to the same target color (/grouped to the same destination color) must be adjacent in the final colors list 
+	// when we apply the PS recolorization. See GroupData explanation.
+    SortedColorsByDestColorIds sortedColorsByDestColorIds;
+	sortColorsByDestColorIds(groupData, sortedColorsByDestColorIds);
+
+	// **************** Compute the maximum threshold, without intersecting other main colors sphere
+	// Important : We sorted colors because we want to extend in priority the main colors with largest proportions
+	float maxPossibleThreshold[MAIN_COLORS_COUNT];
+	float allLimitThreshold[MAIN_COLORS_COUNT];
+	{
+		for( int i=0; i<MAIN_COLORS_COUNT; ++i )
+		{	
+            int colorId = sortedColorsByDestColorIds.mIds[i];
+
+			maxPossibleThreshold[colorId] = 1.0;
+			allLimitThreshold[colorId] = 1.0;
+
+			if( colorId == -1 || bSortedMainColors[colorId].mFoundCurrentColor<=0.0 )
+			{ continue; }
+
+			vec3 colorHSV = bSortedMainColors[colorId].mCurrentColorHSV;
+
+			// We cannot expand the sphere radius over spheres of larger proportions (and thus earlier in the sorted color list), 
+			// but we can overlap the following spheres of smaller proportions. 
+			// Yes, this will create intersections, but they will be covered by the subsequent spheres/main colors. 
+			// Thanks to this process of extending the sphere radius, we cover many pixels that were previously left out (aka, outside of the initial color spheres influence).
+			for( int j=0; j<MAIN_COLORS_COUNT; ++j )
+			{
+				if( colorId==j ) continue;
+
+				int otherColorId = j;
+
+				if( bSortedMainColors[otherColorId].mFoundCurrentColor<=0.0 )
+				{ continue; }
+
+				vec3 otherColorHSV = bSortedMainColors[otherColorId].mCurrentColorHSV;
+
+				float linearDistance = computeLinearDistanceHSV(colorHSV, otherColorHSV);
+
+				bool otherColorIsUnder = ( groupData.mDestColorIds[otherColorId] < groupData.mDestColorIds[colorId] );
+		
+				if( otherColorIsUnder || discardColors[otherColorId]>0 )
+				{
+					maxPossibleThreshold[colorId] = min(maxPossibleThreshold[colorId], saturate(linearDistance - bSortedMainColors[otherColorId].mCurrentThreshold));
+				}
+
+				allLimitThreshold[colorId] = min(allLimitThreshold[colorId], saturate(linearDistance - bSortedMainColors[otherColorId].mCurrentThreshold));
+			}
+		}
+	}
+
+	for( int i=0; i<MAIN_COLORS_COUNT; ++i )
+	{
+		bSortedMainColors[i].mMaxThreshold = clamp(maxPossibleThreshold[i], bSortedMainColors[i].mCurrentThreshold, MAX_DIFF_DIST*bSortedMainColors[i].mCurrentThreshold);
+		bSortedMainColors[i].mAllLimitThreshold = clamp(allLimitThreshold[i], bSortedMainColors[i].mCurrentThreshold, MAX_DIFF_DIST*bSortedMainColors[i].mCurrentThreshold);
+	}
+}
+
+#endif // COMPUTE_ANALYSE_HISTO_EXPAND_START
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef COMPUTE_ANALYSE_HISTO_EXPAND
+
+USE_INTERLOCKED_BUFFER(bMainColorsCS,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColors,1);
+USE_LOADSTORE_BUFFER(uint,bHistogram,2);
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,3);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,4);
+
+#ifdef IS_GRAYSCALE
+COMPUTE(1, 1, THREADS_COUNT)
+#else
+COMPUTE(THREADS_COUNT, THREADS_COUNT, THREADS_COUNT)
+#endif
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	// ************
+	int i = GROUP_ID.x*THREADS_COUNT + GROUP_THREAD_ID.x; 
+	int j = GROUP_ID.y*THREADS_COUNT + GROUP_THREAD_ID.y; 
+	int k = GROUP_ID.z*THREADS_COUNT + GROUP_THREAD_ID.z;
+
+	const int currentColorId = i * uHistoDim * uHistoDim + j * uHistoDim + k;
+	int histogramData = bHistogram[currentColorId];
+	int colorTexelCount = histogramData & MASK_TEXELS_COUNT	;
+	int alreadyLinkedToMainColor = histogramData >> MASK_COLOR_SHIFT;
+
+	if( colorTexelCount==0 || alreadyLinkedToMainColor==1 )
+		return;
+
+	vec3 rgb, hsv;
+	getColors(i, j, k, rgb, hsv, bMeanF[0].mMeanHSV, bMeanF[0].mMeanPartialRGB);
+
+	float minDist = 100.0;
+	int mainColorId = -1;
+	for( int ct = 0; ct < MAIN_COLORS_COUNT; ++ct )
+	{
+		if( bSortedMainColors[ct].mFoundCurrentColor<=0.0 )
+			continue;
+
+		vec3 colorHSV = bSortedMainColors[ct].mCurrentColorHSV;
+
+		float linearDistance = computeLinearDistanceHSV(hsv, colorHSV);
+
+		if( linearDistance < minDist )
+		{
+			minDist = linearDistance;
+			mainColorId = ct;
+		}
+	}
+
+	if( mainColorId != -1 && minDist <= bSortedMainColors[mainColorId].mMaxThreshold )
+	{
+		bHistogram[currentColorId] = int(colorTexelCount + (1 << MASK_COLOR_SHIFT));
+
+		int prev;
+		interlockedAdd(bMainColorsCS, OUTPUT_COLOR_SIZE*mainColorId + OUTPUT_TEXELS_COUNT_POS, colorTexelCount, prev);
+	}
+}
+
+#endif // COMPUTE_ANALYSE_HISTO_EXPAND
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef COMPUTE_ANALYSE_HISTO_EXPAND_END
+
+USE_INTERLOCKED_BUFFER(bMainColorsCS,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColors,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,2);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,3);
+
+COMPUTE(1, 1, 1)
+{
+	if( uFullUpdateIfUTD>0 && bUIData[0].mCheckUpToDate==0 )
+	{ return; }
+
+	for( int i=0; i<MAIN_COLORS_COUNT; ++i )
+	{
+		int maxColorPixelCount	= interlockedLoad( bMainColorsCS,	OUTPUT_COLOR_SIZE*i + OUTPUT_TEXELS_COUNT_POS);
+		bSortedMainColors[i].mMaxColorProp = 100.f * float(maxColorPixelCount) / float(bMeanF[0].mTexelCount);
+	}
+}
+
+#endif // COMPUTE_ANALYSE_HISTO_EXPAND_END
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef INIT_PS_DATA
+
+uniform uint	uIsLocalMode;
+uniform uint	uIsMainColor;
+uniform uint	uIsCustomColor;
+uniform uint	uIsColorList;
+uniform uint	uUserMainColorCount;
+uniform uint	uCheckUpToDate;
+
+USE_LOADSTORE_STRUCTUREDBUFFER(ColorData,bColorsData,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(GroupData,bGroupsData,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(PixelShaderColorData,bOutputColors,2);
+USE_LOADSTORE_STRUCTUREDBUFFER(PixelShaderGlobalData,bOutputGlobal,3);
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,4);
+#ifdef DONE_ANALYSIS
+    USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,5);
+    USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColors,6);
+#endif
+
+void setContrast(float contrast, vec3 refHSVColor, vec3 goalHSVColor, inout PixelShaderColorData pixelShaderColorData) 
+{
+	if( pixelShaderColorData.mGoalPartialRGBAndDiscard.w <= 0.f )
+	{ return; }
+
+	pixelShaderColorData.mSVParams.x = contrast - 1.f;
+	#ifdef IS_GRAYSCALE
+	{
+		pixelShaderColorData.mSVParams.y = goalHSVColor.z - contrast * refHSVColor.z;
+	}
+	#else
+	{
+		pixelShaderColorData.mSVParams.y = goalHSVColor.y - contrast * refHSVColor.y;
+
+		pixelShaderColorData.mSVParams.z = goalHSVColor.z * (1.f - contrast);
+		pixelShaderColorData.mSVParams.w = contrast * goalHSVColor.z / max(EPSILON, refHSVColor.z);
+	}
+	#endif
+};
+
+COMPUTE(1,1,1)
+{
+    PixelShaderGlobalData psGlobalData;
+    reset(psGlobalData);
+    
+	PixelShaderColorData psColorData[MAIN_COLORS_COUNT];
+
+	vec3 goalHSVColors[MAIN_COLORS_COUNT];
+
+	uint meanId = 0;
+	uint groupDataId = 0;
+	#ifdef DONE_ANALYSIS
+	{
+		for( uint colorId = 0; colorId < MAIN_COLORS_COUNT; ++colorId )
+		{
+			if( bSortedMainColors[colorId].mIsMean )
+			{
+				meanId = colorId;
+				break;
+			}
+		}
+
+		groupDataId = getGroupDataId(bUIData[0].mMaxGroupsCount, uUserMainColorCount);
+	}
+	#endif
+
+	vec3 meanRGB = bMeanF[0].mMeanRGB;
+	vec3 meanHSV = RGBtoHSV(meanRGB);
+
+	if( uIsColorList )
+	{
+		psGlobalData.mAllDiscard = 1.f;
+
+		GroupData groupData = bGroupsData[groupDataId];
+
+		// The main colors linked to the same target color (/grouped to the same destination color) must be adjacent in the final colors list 
+		// when we apply the PS recolorization. See GroupData explanation.
+        SortedColorsByDestColorIds sortedColorsByDestColorIds;
+		
+		if( uIsMainColor )
+		{ sortColorsByDestColorIds(groupData, sortedColorsByDestColorIds); }
+
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+		{
+            reset(psColorData[i]);
+
+            int colorId = ( uIsMainColor ? sortedColorsByDestColorIds.mIds[i] : i );
+
+			// Possible to continue without computing anything since in this case mGoalPartialRGBAndDiscard.w == 0
+			if( colorId== -1 ) continue;
+
+			// **** Data related to main colors / Histogram
+            MainColor mainColor;
+            reset(mainColor);
+			
+			#ifdef DONE_ANALYSIS
+				mainColor = bSortedMainColors[colorId];
+			#endif
+
+			psColorData[i].mInitThreshold	= ( uIsCustomColor ? CUSTOM_INFLUENCE_RADIUS : mainColor.mCurrentThreshold );
+			psColorData[i].mMaxThreshold	= ( uIsCustomColor ? CUSTOM_INFLUENCE_RADIUS : mainColor.mMaxThreshold );
+
+			#ifdef DONE_ANALYSIS
+			if( bUIData[0].mCheckUpToDate==0 )
+			{ 
+				float lerpF = clamp(bUIData[0].mColorsDistance, 0.f, 0.2f) / 0.2f;
+				psColorData[i].mMaxThreshold = lerp(psColorData[i].mMaxThreshold, mainColor.mAllLimitThreshold, lerpF);
+			}
+			#endif
+
+			float found = 1.f;
+			if( uIsMainColor )
+			{
+				psColorData[i].mRefHSVAndCurveParam.xyz = mainColor.mCurrentColorHSV;
+
+				found = ( mainColor.mFoundCurrentColor > 0.f && groupData.mMainColorIgnored[colorId] == 0 );
+			}
+
+			// **** Data related to UI parameters / User
+			goalHSVColors[i] = vec3(0,0,0);
+			psColorData[i].mGoalPartialRGBAndDiscard.rgb = vec3(0.f, 0.f, 0.f);
+			psColorData[i].mSVParams = vec4(0.f, 0.f, 0.f, 0.f);
+			bool doDiscard = true;
+
+			// We must redirect to the related ""UI color line"
+			const int UIId = ( uIsCustomColor ? colorId : groupData.mUITargetColorIds[colorId] );
+			if( UIId != -1 )
+			{
+				ColorData colorData = bColorsData[UIId];
+
+				vec3 goalColor = colorData.mTargetColor;
+				if( uIsCustomColor )
+				{
+					if( !colorData.mHasTargetColor )
+					{ goalColor = meanRGB; }
+
+					vec3 customColor = meanRGB;
+					if( colorData.mHasCustomColor )
+					{ 
+						customColor = colorData.mCustomColor;
+						vec3 hsv = RGBtoHSV(customColor);
+						fixDarkGreyColor(bMeanF[0].mMeanHSV, bMeanF[0].mMeanPartialRGB, hsv, customColor);
+					}
+
+					psColorData[i].mRefHSVAndCurveParam.xyz = RGBtoHSV(customColor);
+				}
+				else
+				{
+					if( !colorData.mHasTargetColor )
+					{
+						goalColor = HSVtoRGB(mainColor.mCurrentColorHSV);
+					}
+				}
+
+				if( colorData.mInvert ) 
+				{ 
+					goalColor = invertColorFormatted(goalColor);
+				}
+				goalHSVColors[i] = RGBtoHSV(goalColor);
+				
+				psColorData[i].mGoalPartialRGBAndDiscard.rgb = computePartialRGBFromH(goalHSVColors[i].x);
+				
+				doDiscard = discardColor(colorData, found > 0.5f);
+				if( !doDiscard )
+				{
+					psGlobalData.mAllDiscard = 0.f;
+				}
+
+				// mainColorsMaxThresholds : [0.06, 0.09]*2
+				// slider value == colorData.mTolerance : [0, 1]
+				float sigma = psColorData[i].mMaxThreshold + TOLERANCE_FACTOR * colorData.mTolerance;
+
+				// For custom colors, the tolerance slider starts with a much smaller value (mMaxThreshold)
+				// so to be able to reach similar large tolerance values than in Multiple Colors mode, we must apply a CUSTOM_FACTOR factor
+				if( uIsCustomColor )
+				{ sigma *= CUSTOM_FACTOR; }
+
+				psColorData[i].mRefHSVAndCurveParam.w = saturate(1.f - 1.6f*sigma); 
+
+				//
+				psColorData[i].mGoalPartialRGBAndDiscard.w = ( doDiscard ? 0.f : 1.f );
+			}
+
+			psColorData[i].mFound = found; 
+		}
+
+		#ifdef DONE_ANALYSIS
+			// groupData.mDestColorIds is used here only to modify Saturation and Value on all the colors inside a same colors group
+			// As we try to avoid the Mean color to be a central color / group, results are not coherent when the central color prop is lower than the Mean color prop
+			// Then here is a little trick to inverse to rewire ids, only in this specific case
+            const int destMeanId = groupData.mDestColorIds[0];
+			if(    bSortedMainColors[0].mIsMean && destMeanId != 0 
+			    && bSortedMainColors[0].mAroundColorProp > bSortedMainColors[destMeanId].mAroundColorProp )
+			{
+				for( uint j = 0; j < MAIN_COLORS_COUNT; ++j )
+				{
+					if( groupData.mDestColorIds[j] == destMeanId )
+					{
+						groupData.mDestColorIds[j] = 0;
+					}
+				}
+			}
+		#endif
+
+		// Must be done after groupData.mDestColorIds is complete
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+		{
+            uint colorId = ( uIsMainColor ? sortedColorsByDestColorIds.mIds[i] : i );
+
+			int UIId = ( uIsCustomColor ? colorId : groupData.mUITargetColorIds[colorId] );
+			if( UIId != -1 )
+			{
+				ColorData colorData = bColorsData[UIId];
+
+				// Here, if isColorList, we must NOT take into account psColorData[i].mRefHSVAndCurveParam
+				// Instead, we need to take into account the average group color
+				// as we want to keep the same S and V reference values for all the colors inside a same colors group
+
+				vec3 refHSVColor = psColorData[i].mRefHSVAndCurveParam.xyz;
+				#ifdef DONE_ANALYSIS
+					if( uIsMainColor ) 
+					{ 
+						refHSVColor = RGBtoHSV(bUIData[0].mAverageGroupColors[UIId].v);
+					}
+				#endif
+
+				setContrast(colorData.mContrast, refHSVColor, goalHSVColors[i], psColorData[i]);
+			}
+		}
+	}
+	else
+	{ 
+        reset(psColorData[0]);
+
+		vec3 refColorRGB = meanRGB;
+		
+		#ifdef DONE_ANALYSIS
+			uint selectedColorId = bUIData[0].mSelectedColorId;
+			if( uIsLocalMode && selectedColorId != meanId )
+            { refColorRGB = bSortedMainColors[selectedColorId].mAroundColorAverageRGB; }
+		#endif
+
+		vec3 refColorHSV = RGBtoHSV(refColorRGB);
+
+		psColorData[0].mRefHSVAndCurveParam.xyz = refColorHSV;
+
+		ColorData colorData = bColorsData[0];
+
+		vec3 goalColor = ( colorData.mHasTargetColor ? colorData.mTargetColor : refColorRGB );
+
+		// It is best to inverse grayscale channels at the end of the recolorization PS when we are in Global or Local modes
+		#ifndef IS_GRAYSCALE
+		if( colorData.mInvert && uIsLocalMode ) 
+		{ 
+			goalColor = invertColorFormatted(goalColor);
+		}
+		#endif
+
+		goalHSVColors[0] = RGBtoHSV(goalColor);
+
+		float currentMaxDist = 1.f;
+		#ifdef DONE_ANALYSIS
+			currentMaxDist = max(0.1f, bSortedMainColors[uIsLocalMode ? selectedColorId : meanId].mMaxLinearDist);
+		#endif
+
+		psColorData[0].mMaxThreshold	= 1.f / currentMaxDist;
+
+		bool doDiscard = discardColor(colorData, true);
+		psColorData[0].mGoalPartialRGBAndDiscard.w = ( doDiscard ? 0.f : 1.f );
+
+		const float sigma = exp(7.f * ((0.4f * colorData.mTolerance * colorData.mTolerance + 0.5f) - 0.2f));
+		psColorData[0].mRefHSVAndCurveParam.w = 1.f / (2.f * pow(sigma, 2));
+
+		setContrast(colorData.mContrast, psColorData[0].mRefHSVAndCurveParam.xyz, goalHSVColors[0], psColorData[0]);
+		psColorData[0].mGoalPartialRGBAndDiscard.rgb = computePartialRGBFromH(goalHSVColors[0].x);
+
+		psGlobalData.mInvertGlobalLocal = ( colorData.mInvert && !uIsLocalMode? 1.f : 0.f );
+	}
+	
+	psGlobalData.mRefColorHSV = meanHSV;
+	psGlobalData.mRefColorPartialRGB.rgb = computePartialRGBFromH(psGlobalData.mRefColorHSV.x);
+
+
+	// OUTPUT
+	bOutputGlobal[0] = psGlobalData;
+
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+		if( !uIsColorList && i>0) 
+        { reset(psColorData[i]); }
+
+		bOutputColors[i] = psColorData[i];
+	}
+}
+
+#endif // INIT_PS_DATA
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef TARGET_COLORS_LINK
+
+uniform uint uUserMainColorCount;
+uniform uint uCheckUpToDate;
+
+USE_LOADSTORE_STRUCTUREDBUFFER(ColorData,bColorsData,0);
+
+// NEW data if uCheckUpToDate, REF data otherwise
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColorsNew,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(GroupData,bGroupsDataNew,2);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIDataNew,3);
+
+// REF data
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanFRef,4);
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColorsRef,5);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIDataRef,6);
+USE_LOADSTORE_STRUCTUREDBUFFER(GroupData,bGroupsDataRef,7);
+
+
+void linkColor(uint colorIdRef, GroupData groupDataNew, bool strictTest, AverageData newAverageData,
+            bool selectedColorsData[MAIN_COLORS_COUNT], bool foundTargetColorsData[MAIN_COLORS_COUNT],
+			inout float minDistance, inout int minId, inout float minAllDistance, inout int minAllId)
+{
+	if( foundTargetColorsData[colorIdRef] ) return;
+
+	vec3 refMeanHSV			= bMeanFRef[0].mRefMeanHSV;
+	vec3 refMeanPartialRGB	= bMeanFRef[0].mRefMeanPartialRGB;
+
+	ColorData colorData = bColorsData[colorIdRef];
+
+	vec3 refAverageColorHSV = RGBtoHSV(colorData.mRefAverageColor);
+
+	for( uint colorIdNew = 0; colorIdNew < MAIN_COLORS_COUNT; ++colorIdNew ) 
+	{
+		if( groupDataNew.mSetDestColorIds[colorIdNew] == -1 || selectedColorsData[colorIdNew] ) continue;
+
+        vec3 newAverageColorRGB = newAverageData.mColors[colorIdNew];
+		vec3 newAverageColorHSV = RGBtoHSV(newAverageColorRGB);
+
+		// newAverageColor has been "fixed" by taking into account a different Mean color value that the one used to fix refAverageColor
+		// We must fix these new values again according to the previous Mean color
+
+		vec3 fixedNewAverageColorRGB = newAverageColorRGB;
+		vec3 fixedNewAverageColorHSV = newAverageColorHSV;
+		fixDarkGreyColor(refMeanHSV, refMeanPartialRGB, fixedNewAverageColorHSV, fixedNewAverageColorRGB);
+
+		float distance = computeLinearDistanceHSV(fixedNewAverageColorHSV, refAverageColorHSV);
+
+		// If strictTest : check the props difference
+        float propsDiff = abs(colorData.mRefProps - newAverageData.mProps[colorIdNew]);
+		float propsThreshold = 5.f; 
+		bool compatibleProps = true;	//uCheckUpToDate ? true : ( propsDiff < propsThreshold );
+
+		if( distance < minDistance && (!strictTest || (compatibleProps && distance <= colorData.mRefDistThreshold)) )			
+		{
+			minId = colorIdNew;
+			minDistance = distance;
+		}
+
+		if( distance < minAllDistance )			
+		{
+			minAllId = colorIdNew;
+			minAllDistance = distance;
+		}
+	}
+}
+
+COMPUTE(1,1,1)
+{
+	if( uFullUpdateIfUTD>0 && bUIDataRef[0].mCheckUpToDate==0 )
+	{ return; }
+
+	uint groupDataId = getGroupDataId(bUIDataNew[0].mMaxGroupsCount, uUserMainColorCount);
+	GroupData groupDataNew = bGroupsDataNew[groupDataId];
+
+	uint groupDataIdRef = getGroupDataId(bUIDataRef[0].mMaxGroupsCount, uUserMainColorCount);
+	GroupData groupDataRef = bGroupsDataRef[groupDataIdRef];
+
+    AverageData newAverageData;
+    computeAverageData( bSortedMainColorsNew, groupDataNew, newAverageData );
+
+	vec3 refMeanHSV			= bMeanFRef[0].mRefMeanHSV;
+	vec3 refMeanPartialRGB	= bMeanFRef[0].mRefMeanPartialRGB;
+
+	if( uCheckUpToDate>0 )
+	{
+		float propsEpsilon = 0.1f;
+		float colorsEpsilon = 0.001f;
+
+		bool preciseUpToDate = true;
+		for( int i=0; i<MAIN_COLORS_COUNT; ++i )
+		{
+            vec3 hsv = bSortedMainColorsNew[i].mCurrentColorHSV;
+            vec3 hsvRef = bSortedMainColorsRef[i].mCurrentColorHSV;
+            
+			if( bSortedMainColorsNew[i].mFoundCurrentColor != bSortedMainColorsRef[i].mFoundCurrentColor 
+				|| abs(bSortedMainColorsNew[i].mAroundColorProp - bSortedMainColorsRef[i].mAroundColorProp) > propsEpsilon 
+                || computeLinearDistanceHSV(hsv, hsvRef) > colorsEpsilon )
+			{
+				preciseUpToDate = false;
+				break;
+			}
+		}
+
+		bUIDataRef[0].mCheckUpToDate = ( preciseUpToDate ? 1 : 0 );
+
+		if( preciseUpToDate )
+		{
+			for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+			{
+				bUIDataRef[0].mColorPossibleLink[i] = 1;
+			}
+			bUIDataRef[0].mColorsDistance = 0.f;
+		}
+		else
+		{
+			bool approxUpToDate = true;
+
+			bool selectedColorsData[MAIN_COLORS_COUNT];
+			bool foundTargetColorsData[MAIN_COLORS_COUNT];
+			for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+			{
+				bUIDataRef[0].mColorPossibleLink[i] = 0;
+				selectedColorsData[i] = false;
+				foundTargetColorsData[i] = false;
+			}
+
+			float maxDistance = 0.f;
+			int maxColorId = -1;
+			bool strictTest = true;
+			
+			for( uint colorIdRef = 0; colorIdRef < MAIN_COLORS_COUNT; ++colorIdRef ) 
+			{
+				if( groupDataRef.mSetDestColorIds[colorIdRef] == -1 ) break;
+
+				float minDistance = 100.f;
+				int minId = -1;
+				float minAllDistance = 100.f;
+				int minAllId = -1;
+                linkColor( colorIdRef, groupDataNew, strictTest, newAverageData,
+						   selectedColorsData, foundTargetColorsData, minDistance, minId, minAllDistance, minAllId );
+
+				if( minId != -1 ) 
+				{
+					foundTargetColorsData[colorIdRef] = true;
+					selectedColorsData[minId] = true;
+
+					bUIDataRef[0].mColorPossibleLink[colorIdRef] = 1;
+				}
+				else
+				{
+					approxUpToDate = false;
+				}
+
+				bUIDataRef[0].mColorsDistance = max(bUIDataRef[0].mColorsDistance, minAllDistance); 
+
+				if( maxDistance < minAllDistance )
+				{
+					maxDistance = minAllDistance;
+					maxColorId = minAllId;
+				}
+			}
+
+			// At least one color must be flagged as "obsolet"
+			// or the User will be lost...
+			if( approxUpToDate && maxColorId!=-1 )
+			{
+				bUIDataRef[0].mColorPossibleLink[maxColorId] = 0;
+			}
+		}
+	}
+	else
+	{
+		// Update reference values for next relink
+		bMeanFRef[0].mRefMeanHSV		 = bMeanFRef[0].mMeanHSV;
+		bMeanFRef[0].mRefMeanPartialRGB  = bMeanFRef[0].mMeanPartialRGB;
+
+		// Kind of reduntant with bUIData[0].mAverageGroupColors[i]	and bUIData[0].mAverageGroupProps[i]
+		// But we need these data to be retrieved immediately on CPU after a manual refresh (ready for the next write)
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+		{ 
+            bColorsData[i].mRefAverageColor 	= newAverageData.mColors[i];
+            bColorsData[i].mRefProps            = newAverageData.mProps[i];
+            bColorsData[i].mRefDistThreshold    = newAverageData.mDistThreshold[i];
+
+			bUIDataRef[0].mColorPossibleLink[i] = 1;
+		}
+
+		bUIDataRef[0].mColorsDistance = 0.f;
+
+		bUIDataRef[0].mCheckUpToDate = 1;
+	}
+}
+
+#endif // TARGET_COLORS_LINK
+
+
+// --------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------
+#ifdef FILL_UI_DATA
+
+USE_LOADSTORE_STRUCTUREDBUFFER(MainColor,bSortedMainColors,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(MeanColor,bMeanF,1);
+USE_LOADSTORE_STRUCTUREDBUFFER(GroupData,bGroupsData,2);
+USE_LOADSTORE_STRUCTUREDBUFFER(UIData,bUIData,3);
+
+uniform uint uMultipleColors;
+uniform uint uUserMainColorCount;
+
+COMPUTE(1,1,1)
+{
+	bUIData[0].mMeanRGB = bMeanF[0].mMeanRGB;
+
+    bUIData[0].mPrimaryColor = vec3(0.f,0.f,0.f);
+	for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+	{
+		if( bSortedMainColors[i].mIsMean )
+		{ bUIData[0].mMeanId = i; }
+	
+		if( bUIData[0].mSelectedColorId == i )
+		{ bUIData[0].mPrimaryColor = bSortedMainColors[i].mAroundColorAverageRGB; }
+	}
+
+	if( uMultipleColors )
+	{
+		uint groupDataId = getGroupDataId(bUIData[0].mMaxGroupsCount, uUserMainColorCount);
+		GroupData groupData = bGroupsData[groupDataId];
+
+        AverageData averageData;
+        computeAverageData( bSortedMainColors, groupData, averageData );
+
+		bUIData[0].mTotalProps = 0.f;
+		bUIData[0].mTotalMaxProps = 0.f;
+		for( uint i = 0; i < MAIN_COLORS_COUNT; ++i )
+		{
+            bUIData[0].mAverageGroupColors[i].v = averageData.mColors[i];
+            bUIData[0].mAverageGroupProps[i]    = averageData.mProps[i];
+            bUIData[0].mAverageGroupMaxProps[i] = averageData.mMaxProps[i];
+
+			bUIData[0].mMainColors[i].v			= bSortedMainColors[i].mAroundColorAverageRGB;
+			bUIData[0].mProps[i]				= bSortedMainColors[i].mAroundColorProp;
+
+			bUIData[0].mTotalProps		+= bSortedMainColors[i].mAroundColorProp;
+			bUIData[0].mTotalMaxProps	+= bSortedMainColors[i].mMaxColorProp;
+		}
+	}
+}
+
+#endif // FILL_UI_DATA

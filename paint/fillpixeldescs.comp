@@ -1,0 +1,249 @@
+#include "data/shader/common/util.sh"
+#include "layer/padpixeltypes.sh"
+#include "layer/surfacecrawler.sh"
+#include "layer/gbufferflags.sh"
+#include "../common/octpack.sh"
+
+struct PackedMat3
+{
+	packed_vec3 r0;
+	packed_vec3 r1;
+	packed_vec3 r2;
+};
+
+USE_TEXTURE2D_NOSAMPLER( tIndexMap );
+USE_TEXTURE2D_NOSAMPLER( tSmearUVTriangle );
+USE_TEXTURE2D_NOSAMPLER( tGBufferFlags );
+
+USE_LOADSTORE_BUFFER(uint2,bRasterIslandPixelsBuffer,0);
+USE_LOADSTORE_STRUCTUREDBUFFER(RasterSkirtPixelDesc,bRasterSkirtPixelsBuffer,1);
+USE_LOADSTORE_BUFFER(float,bSkirtSDFBuffer,2);
+USE_LOADSTORE_STRUCTUREDBUFFER(PackedMat3,bRasterSkirtReorientations,3);
+
+USE_BUFFER(unsigned int, bTrislandIDs);
+
+uniform int2	uBufferSize;
+uniform vec2	uHalfPixelSize;
+uniform vec2	uAspectScale;
+uniform vec2	uUDIMTile;
+
+uniform uint	uIslandBufferSize;
+uniform uint	uSkirtBufferSize;
+uniform uint	uTrislandIDsSize;
+
+uniform int		uTotalUVIslands;
+uniform int		uTotalBorderEdges;
+
+USE_BUFFER(vec4, bBorderUVEdges);
+USE_BUFFER(uint, bBorderEdgeOffsets);
+
+
+float distanceFromPlane( vec2 uv, vec2 p, vec2 dir )
+{
+	return ( (uv.x - p.x) * dir.x ) + ( (uv.y - p.y) * dir.y );
+}
+
+float squaredDistance( vec2 a, vec2 b )
+{
+	vec2 d = b-a;
+	return (d.x*d.x) + (d.y*d.y);
+}
+
+float getSquaredDistanceToUVs( vec2 uv, vec2 uvA, vec2 uvB )
+{
+	uv.x *= uAspectScale.x;
+	uvA.x *= uAspectScale.x;
+	uvB.x *= uAspectScale.x;
+	uv.y *= uAspectScale.y;
+	uvA.y *= uAspectScale.y;
+	uvB.y *= uAspectScale.y;
+	vec2 edge = uvB - uvA;
+	if( sign(distanceFromPlane( uv, uvA, edge )) != sign(distanceFromPlane( uv, uvB, edge )) )
+	{
+		float d = abs(distanceFromPlane( uv, uvB, normalize(vec2(-edge.y, edge.x)) ));
+		return min(d*d, min(squaredDistance(uv, uvA), squaredDistance(uv, uvB)));
+	}
+	return min(squaredDistance(uv, uvA), squaredDistance(uv, uvB));
+}
+
+float getSquaredDistanceToEdge( vec2 sampleCoord, vec4 edge )
+{
+	return getSquaredDistanceToUVs( sampleCoord, edge.xy, edge.zw );
+}
+
+float getNearestBorderSDF( vec2 sampleCoord, float defaultValue, uint originGroup )
+{
+	defaultValue *= defaultValue;
+	uint islandEdgesOffset = bBorderEdgeOffsets[originGroup-1];
+	uint numBorderEdges = 0;	
+	if( (int)originGroup == uTotalUVIslands )
+	{ numBorderEdges = uTotalBorderEdges-islandEdgesOffset; }
+	else
+	{ numBorderEdges = bBorderEdgeOffsets[originGroup]-islandEdgesOffset; }
+	for(int i = 0;i<(int)numBorderEdges;i++)
+	{
+		float testValue = getSquaredDistanceToEdge(sampleCoord, bBorderUVEdges[islandEdgesOffset+i]);
+		if( testValue != 0 )
+		{
+			defaultValue = defaultValue == 0 ? testValue : min(defaultValue, testValue);
+		}
+	}
+	return sqrt(defaultValue);
+}
+
+void	setRasterIslandPixelDesc( int mapIndexValue, RasterIslandPixelDesc desc )
+{
+	const int idx = mapIndexValue - 1;
+	if( idx < 0 || idx >= (int)uIslandBufferSize )
+	{
+		return;
+	}
+
+	uint2 result;
+	result.x = desc.triangleIndex;
+	result.y = (uint(desc.sdf * 65535.0) << 16) | (desc.groupIndex & 0xffff);
+	bRasterIslandPixelsBuffer[idx] = result;
+}
+
+void	setRasterSkirtPixelDesc( int mapIndexValue, RasterSkirtPixelDesc desc )
+{
+	const int idx = ( -mapIndexValue ) - 1;
+	if( idx < 0 || idx >= (int)uSkirtBufferSize )
+	{
+		return;
+	}
+
+	bRasterSkirtPixelsBuffer[idx] = desc;
+}
+
+PackedMat3	getSkirtPixelReorientation( vec2 originUV, uint originTriangle, vec2 remoteUV, int remoteTriangle, out float rotationAngle )
+{
+	PackedMat3 result;
+	result.r0 = packed_vec3( 1,0,0 );
+	result.r1 = packed_vec3( 0,1,0 );
+	result.r2 = packed_vec3( 0,0,1 );
+
+	if( remoteTriangle < 0 )
+	{
+		rotationAngle = 0.0;
+		return result;
+	}
+
+	//load triangles
+	ShaderTriangleUVs originTri = getShaderTriangleUVs( originTriangle );
+	ShaderTriangleUVs remoteTri = getShaderTriangleUVs( (uint)remoteTriangle );
+
+	//find barycentric coords
+	vec3 bc0 = barycentricFromUV( originTri, originUV );
+	vec3 bc1 = barycentricFromUV( remoteTri, remoteUV );
+
+	//interpolate tangent frames
+	vec3 t0 = normalize( bc0.x * originTri.tangents[0] + bc0.y * originTri.tangents[1] + bc0.z * originTri.tangents[2] );
+	vec3 b0 = normalize( bc0.x * originTri.bitangents[0] + bc0.y * originTri.bitangents[1] + bc0.z * originTri.bitangents[2] );
+	vec3 n0 = normalize( bc0.x * originTri.normals[0] + bc0.y * originTri.normals[1] + bc0.z * originTri.normals[2] );
+
+	vec3 t1 = normalize( bc1.x * remoteTri.tangents[0] + bc1.y * remoteTri.tangents[1] + bc1.z * remoteTri.tangents[2] );
+	vec3 b1 = normalize( bc1.x * remoteTri.bitangents[0] + bc1.y * remoteTri.bitangents[1] + bc1.z * remoteTri.bitangents[2] );
+	vec3 n1 = normalize( bc1.x * remoteTri.normals[0] + bc1.y * remoteTri.normals[1] + bc1.z * remoteTri.normals[2] );
+
+	//rotation angle from remote to origin
+	{
+		vec3 v = t1;
+		if( abs(dot(n0,n1)) < 1.0 )
+		{
+			//rotates v about an axis perpendicular to both remote and origin normals.
+			//this reorients v to be aligned with the origin normal, without rotating
+			//it about that normal at all. -jdr/ar/rg
+			vec3 localU = normalize( cross( n1,n0 ) );
+			vec3 localV = cross( n0, localU );
+			vec3 localW = n0;
+
+			vec3 remoteU = localU;
+			vec3 remoteV = cross( n1, remoteU );
+			vec3 remoteW = n1;
+
+			v = vec3( dot(v,remoteU), dot(v,remoteV), dot(v,remoteW) );
+			v = v.x*localU + v.y*localV + v.z*localW;
+		}
+		float cosTheta = dot( v, t0 ), sinTheta = dot( v, b0 );
+		rotationAngle = acos( clamp( cosTheta, -1.0, 1.0 ) );
+		if( sinTheta < 0.0 )
+		{ rotationAngle = 2.0 * 3.141592653 - rotationAngle; }
+	}
+
+	//orthogonalize
+	t0 = normalize( t0 - dot(t0,n0)*n0 );
+	b0 = normalize( b0 - dot(b0,t0)*t0 - dot(b0,n0)*n0 );
+	t1 = normalize( t1 - dot(t1,n1)*n1 );
+	b1 = normalize( b1 - dot(b1,t1)*t1 - dot(b1,n1)*n1 );
+
+	//transform matrix from origin to remote
+	result.r0 = packed_vec3( dot(t0,t1), dot(b0,t1), dot(n0,t1) );
+	result.r1 = packed_vec3( dot(t0,b1), dot(b0,b1), dot(n0,b1) );
+	result.r2 = packed_vec3( dot(t0,n1), dot(b0,n1), dot(n0,n1) );
+	return result;
+}
+
+COMPUTE(8, 8, 1)
+{
+	// discard out of bounds threads
+	if( DISPATCH_THREAD_ID.x >= uBufferSize.x || DISPATCH_THREAD_ID.y >= uBufferSize.y )
+	{ return; }
+
+	uint2 imageCoord = uint2(DISPATCH_THREAD_ID.x, DISPATCH_THREAD_ID.y);
+	int mapIndex = asint(imageLoad(tIndexMap, imageCoord).x);
+	if( mapIndex == 0 )
+	{ return; }
+	vec4 smearUVTriangle = imageLoad(tSmearUVTriangle, imageCoord);
+	uint originTriangleIndex = (uint)(abs(smearUVTriangle.z))-1;
+	if( ( originTriangleIndex >= uTrislandIDsSize ) )
+	{ return; }
+	
+	uint originGroup = bTrislandIDs[originTriangleIndex];
+
+	vec2 sampleCoord = vec2((float(imageCoord.x)/uBufferSize.x), (float(imageCoord.y)/uBufferSize.y))+uHalfPixelSize;
+	float sdfValue = getNearestBorderSDF( sampleCoord, 0, originGroup );
+	sampleCoord += uUDIMTile;
+
+	if( mapIndex > 0 )
+	{
+		//island raster pixel
+		RasterIslandPixelDesc desc;
+		desc.triangleIndex = originTriangleIndex;
+		desc.groupIndex = bTrislandIDs[originTriangleIndex] + 1;
+		desc.sdf = sdfValue;
+		setRasterIslandPixelDesc( mapIndex, desc );
+	}
+	else if( mapIndex < 0 )
+	{
+		//skirt pixel
+		RasterSkirtPixelDesc desc;
+		desc.unused = 0;
+		desc.triangleIndex = originTriangleIndex;
+		vec2 remoteUV = smearUVTriangle.xy;
+		vec2 originUV = remoteUV;
+
+		PackedMat3 reorient;
+		reorient.r0 = packed_vec3( 1,0,0 );
+		reorient.r1 = packed_vec3( 0,1,0 );
+		reorient.r2 = packed_vec3( 0,0,1 );
+
+		float rotation = 0;
+		SurfaceCrawlResultV sc = crawlAwayFromEdge( originUV, sampleCoord-originUV, originTriangleIndex );
+		if( sc.finalHit )
+		{
+			remoteUV = sc.uvActual;
+			desc.triangleIndex = sc.triangleIndex;
+			reorient = getSkirtPixelReorientation(	originUV, originTriangleIndex,
+													remoteUV, sc.triangleIndex,
+													rotation );
+		}
+		desc.groupIndex = bTrislandIDs[originTriangleIndex] + 1;
+		desc.tangentRotation = rotation;
+		desc.remoteUV = remoteUV;
+		desc.originUV = originUV;
+		setRasterSkirtPixelDesc( mapIndex, desc );
+		bSkirtSDFBuffer[(-mapIndex)-1] = sdfValue;
+		bRasterSkirtReorientations[(-mapIndex)-1] = reorient;
+	}
+}

@@ -1,0 +1,622 @@
+#include "gbufferutils.sh"
+#include "../../common/colorspace.sh"
+#include "../../common/commoncolormask.sh"
+
+#define FACTOR_R 65536
+#define FACTOR_G 256
+
+//---------------------------------------------------------------------------------------
+#ifdef INIT
+
+USE_INTERLOCKED_BUFFER(bHistogram,0);
+USE_INTERLOCKED_BUFFER(bInputMapColorsCount, 2);
+
+#define THREADS_COUNT 8
+COMPUTE(THREADS_COUNT, THREADS_COUNT, THREADS_COUNT)
+{
+	int i = GROUP_ID.x*THREADS_COUNT + GROUP_THREAD_ID.x; 
+	int j = GROUP_ID.y*THREADS_COUNT + GROUP_THREAD_ID.y; 
+	int k = GROUP_ID.z*THREADS_COUNT + GROUP_THREAD_ID.z;
+
+	int id = i*FACTOR_R + j*FACTOR_G + k;
+
+	interlockedStore( bHistogram, id, 0 );
+
+	if( id == 0 )
+	{
+		interlockedStore2( bInputMapColorsCount, 0, uint2(0, 0) );
+	}
+}
+
+#endif // INIT
+
+//---------------------------------------------------------------------------------------
+#ifdef HISTO
+
+USE_INTERLOCKED_BUFFER(bHistogram,0);
+
+USE_TEXTURE2D(tInputTextureColorIds);
+
+uniform uint		uGBuffer;
+uniform vec2		uGBufferScale;
+uniform uint		uOffset;
+
+COMPUTE(16,16,1)
+{
+	//check bounds
+	uint2 size; uint mipCount;
+	imageSize2D( tInputTextureColorIds, size.x, size.y, mipCount );
+	if( DISPATCH_THREAD_ID.x >= size.x || DISPATCH_THREAD_ID.y >= size.y )
+	{ return; }
+
+	if( uGBuffer )
+	{
+		uint2 gbufferCoords = DISPATCH_THREAD_ID.xy + uint2(0, uOffset);
+		gbufferCoords = uint2( floor( vec2(gbufferCoords) * uGBufferScale ) );
+
+		if( !isInUVIsland(gbufferCoords) )
+		{ return; }
+	}
+
+	//load color
+	vec3 c = imageLoad(tInputTextureColorIds, DISPATCH_THREAD_ID.xy).xyz;
+
+	float epsilon = 0.0001f;
+
+	uint minimumColorCount = 4;
+	uint sameColorCount = 0;
+	// The same color must be found at least 4 times (minimumColorCount) in the 3x3 kernel to take into account this color
+	for( int i = -1; i <= 1; ++i )
+	{
+		for( int j = -1; j<=1; ++j )
+		{
+			if( !(i==0 && j==0) )
+			{
+				int2 coords = int2(DISPATCH_THREAD_ID.xy) + int2(i,j);
+				if( coords.x < 0 || coords.y < 0 || coords.x >= int(size.x) || coords.y >= int(size.y) )
+				{
+					continue;
+				}
+
+				vec3 cNext = imageLoad(tInputTextureColorIds, uint2( coords ) ).xyz;
+
+				vec3 diff = abs(c - cNext);
+				sameColorCount += ( diff.x < epsilon && diff.y < epsilon && diff.z < epsilon ) ? 1 : 0;
+			}
+		}
+	}
+	
+	if( sameColorCount >= minimumColorCount )
+	{
+		//convert color to integer value
+		uint3 colorI = uint3( floor( c * 255.0 + vec3(0.5,0.5,0.5) ) );
+
+		uint coordID = colorI.r * FACTOR_R +  colorI.g * FACTOR_G + colorI.b;
+
+		//increment histogram values
+		uint prev;
+		interlockedAdd( bHistogram, coordID, 1, prev );
+	}
+}
+
+#endif // HISTO
+
+
+//---------------------------------------------------------------------------------------
+#ifdef INPUTMAPS_COLORS
+
+USE_INTERLOCKED_BUFFER(bHistogram,0);
+
+//  !!!!!!!!!!!!!!!!!!!!!!!!! Must match EffectColorMask::InputMapColor !!!!!!!!!!!!!!!!!!!!!!!!!
+USE_LOADSTORE_BUFFER(uint4, bInputMapColors,1);
+USE_INTERLOCKED_BUFFER(bInputMapColorsCount, 2);
+
+uniform uint	uThreshold;
+uniform uint	uMaxInputMapColors;
+
+#define THREADS_COUNT 8
+COMPUTE(THREADS_COUNT, THREADS_COUNT, THREADS_COUNT)
+{
+	int i = GROUP_ID.x*THREADS_COUNT + GROUP_THREAD_ID.x; 
+	int j = GROUP_ID.y*THREADS_COUNT + GROUP_THREAD_ID.y; 
+	int k = GROUP_ID.z*THREADS_COUNT + GROUP_THREAD_ID.z;
+
+	int id = i*FACTOR_R + j*FACTOR_G + k;
+
+	uint texelCount = interlockedLoad( bHistogram, id );
+	if( texelCount >= uThreshold )
+	{
+		const bool isBlack = ( i == 0 && j == 0 && k == 0 );
+		if( !isBlack )
+		{
+			uint currentIndex;
+			interlockedAdd(bInputMapColorsCount, 1, 1, currentIndex);
+
+			if( currentIndex < uMaxInputMapColors )
+			{ 
+				interlockedAdd(bInputMapColorsCount, 0, 1, currentIndex);
+				bInputMapColors[currentIndex] = uint4( i, j, k, texelCount ); 
+			}
+		}
+	}
+}
+
+#endif // INPUTMAPS_COLORS
+
+
+//---------------------------------------------------------------------------------------
+#if defined( GRADIENT_TEXELS ) || defined( GRADIENT_TEXELS_COUNT )
+
+USE_INTERLOCKED_BUFFER( bGradientCount, 0 );
+
+#ifdef GRADIENT_TEXELS
+	USE_INTERLOCKED_BUFFER( bGradientTexels, 1 );
+#endif
+
+USE_TEXTURE2D(tInputTextureColorIds);
+
+uniform uint		uGBuffer;
+uniform vec2		uGBufferScale;
+uniform uint		uScaleFactor;
+uniform uint		uOffset;
+uniform uint3		uInputMapColors[INPUTMAP_COLORS_COUNT];
+
+int3 getColorI(vec3 colorF)
+{
+	return int3( floor( colorF * 255.0 + vec3(0.5,0.5,0.5) ) );
+}
+
+bool areEqualsColorsI(int3 colorI1, int3 colorI2)
+{
+	int3 diff = colorI1 - colorI2;
+	return !any(diff);
+}
+
+bool isDownscaledGradientTexel( uint2 initCoords, uint2 size, inout int inputMapColorId1, inout int inputMapColorId2 )
+{
+	bool isGradientTexel = false;
+	bool onlyMainColors = true;
+
+	for( uint i = 0; i < uScaleFactor; ++i )
+	{
+		for( uint j = 0; j < uScaleFactor; ++j )
+		{
+			uint2 coords = initCoords + uint2(i, j);
+			if( coords.x >= size.x || coords.y >= size.y )
+			{ continue; }
+
+			//load color
+			vec3 inputIdColor = imageLoad( tInputTextureColorIds, coords ).xyz;
+			int3 inputIdColorI = getColorI( inputIdColor );
+
+			bool foundMainColor = false;
+			for( uint c = 0; c < INPUTMAP_COLORS_COUNT; ++c )
+			{
+				int3 maintColorI = int3(uInputMapColors[c].xyz);
+
+				if( areEqualsColorsI( inputIdColorI, maintColorI ) )
+				{
+					foundMainColor = true;
+
+					if( inputMapColorId1 == -1 )
+					{ inputMapColorId1 = c; }
+					else if( int(c) != inputMapColorId1 && inputMapColorId2 == -1 )
+					{ inputMapColorId2 = c; }
+
+					break;
+				}
+			}
+
+			onlyMainColors &= foundMainColor;
+
+			if( !onlyMainColors )
+			{ break; }
+		}
+
+		if( !onlyMainColors )
+		{ break; }
+	}
+
+	if( onlyMainColors && inputMapColorId1 != -1 && inputMapColorId2 != -1 && inputMapColorId1 != inputMapColorId2 )
+	{
+		// For the moment no gradient texels here, only "input map" texels, but since we have two distincts input map colors 
+		// on the group of texels that will be used when downscale, the resulting texel will be a gradient texel
+		isGradientTexel = true;
+	}
+
+	return isGradientTexel;
+}
+
+bool isInputMapColor( uint2 coords)
+{
+	vec3 inputIdColor = imageLoad( tInputTextureColorIds, coords ).xyz;
+	int3 inputIdColorI = getColorI( inputIdColor );
+
+	bool isInputMapColor = false;
+	for( uint c = 0; c < INPUTMAP_COLORS_COUNT; ++c )
+	{
+		int3 maintColorI = int3(uInputMapColors[c].xyz);
+
+		if( areEqualsColorsI( inputIdColorI, maintColorI ) )
+		{
+			isInputMapColor = true;
+			break;
+		}
+	}
+
+	return isInputMapColor;
+}
+
+#endif
+
+//---------------------------------------------------------------------------------------
+#ifdef GRADIENT_TEXELS_COUNT
+
+COMPUTE(16,16,1)
+{
+	//check bounds
+	uint2 size; uint mipCount;
+	imageSize2D( tInputTextureColorIds, size.x, size.y, mipCount );
+	if( DISPATCH_THREAD_ID.x >= size.x || DISPATCH_THREAD_ID.y >= size.y )
+	{ return; }
+
+	if( uGBuffer )
+	{
+		uint2 gbufferCoords = DISPATCH_THREAD_ID.xy + uint2(0, uOffset);
+		gbufferCoords = uint2( floor( vec2(gbufferCoords) * uGBufferScale ) );
+
+		if( !isInUVIsland( gbufferCoords ) )
+		{ return; }
+	}
+
+	bool isGradientTexel = false;
+	
+	// The colors search is only done for one texel of the whole texels group { uScaleFactor x uScaleFactor } 
+	// that will be "downscaled / merged" together
+	if( uScaleFactor > 1 && (DISPATCH_THREAD_ID.x % uScaleFactor) == 0 && (DISPATCH_THREAD_ID.y % uScaleFactor) == 0 )
+	{
+		int inputMapColorId1 = -1;
+		int inputMapColorId2 = -1;
+		isGradientTexel = isDownscaledGradientTexel( DISPATCH_THREAD_ID.xy, size, inputMapColorId1, inputMapColorId2 );
+	}
+	
+	if( !isGradientTexel && !isInputMapColor( DISPATCH_THREAD_ID.xy ) )
+	{
+		isGradientTexel = true;
+	}
+
+	if( isGradientTexel )
+	{
+		uint currentIndex;
+		interlockedAdd( bGradientCount, 0, 1, currentIndex );
+	}
+}
+#endif
+
+//---------------------------------------------------------------------------------------
+#ifdef GRADIENT_TEXELS
+
+uniform uint uGradientTexelsCountMax;
+uniform int2 uOffsets[COLOR_MASK_OFFSETS];
+
+uint getMaxChannelDiff( int3 color1, int3 color2 )
+{
+	int maxChannelDiff = max( abs( color1.x - color2.x ), abs( color1.y - color2.y ) );
+	maxChannelDiff = max( maxChannelDiff, abs( color1.z - color2.z ) );
+	return (uint)maxChannelDiff;
+}
+
+void findClosestInputMapColor( uint colorId, int3 colorI, inout uint minDistance )
+{
+	int3 inputMapColorI = int3(uInputMapColors[colorId].xyz);
+
+	uint maxChannelDiff = getMaxChannelDiff( colorI, inputMapColorI );
+	if( maxChannelDiff < minDistance )
+	{ minDistance = maxChannelDiff; }
+}
+
+void findClosestInputMapColors( uint colorId, int3 colorI, inout uint minDistance1, inout int minColorId1, inout uint minDistance2, inout int minColorId2 )
+{
+	int3 inputMapColorI = int3(uInputMapColors[colorId].xyz);
+
+	uint maxChannelDiff = getMaxChannelDiff( colorI, inputMapColorI );
+	if( maxChannelDiff < minDistance1 )
+	{ 
+		if( colorId == minColorId1 )
+		{ 
+			minDistance1 = maxChannelDiff; 
+		}
+		else if( colorId == minColorId2 )
+		{
+			minDistance2 = maxChannelDiff;
+
+			// swap
+			uint minDistanceTemp = minDistance1;
+			int minColorIdTemp = minColorId1;
+			minDistance1 = minDistance2;
+			minColorId1 = minColorId2;
+			minDistance2 = minDistanceTemp;
+			minColorId2 = minColorIdTemp;
+		}
+		else
+		{
+			minDistance1 = maxChannelDiff; 
+			minColorId1 = colorId;
+		}
+	}
+	else if( maxChannelDiff < minDistance2 && colorId != minColorId1 )
+	{
+		minDistance2 = maxChannelDiff; 
+		minColorId2 = colorId;
+	}
+}
+
+COMPUTE(16,16,1)
+{
+	//check bounds
+	uint2 size; uint mipCount;
+	imageSize2D( tInputTextureColorIds, size.x, size.y, mipCount );
+	if( DISPATCH_THREAD_ID.x >= size.x || DISPATCH_THREAD_ID.y >= size.y )
+	{ return; }
+
+	if( uGBuffer )
+	{
+		uint2 gbufferCoords = DISPATCH_THREAD_ID.xy + uint2(0, uOffset);
+		gbufferCoords = uint2( floor( vec2(gbufferCoords) * uGBufferScale ) );
+
+		if( !isInUVIsland( gbufferCoords ) )
+		{ return; }
+	}
+
+	bool isGradientTexel = false;
+	int inputMapColorId1 = -1;
+	int inputMapColorId2 = -1;
+
+	// The colors search is only done for one texel of the whole texels group { uScaleFactor x uScaleFactor } 
+	// that will be "downscaled / merged" together
+	if( uScaleFactor > 1 && (DISPATCH_THREAD_ID.x % uScaleFactor) == 0 && (DISPATCH_THREAD_ID.y % uScaleFactor) == 0 )
+	{
+		isGradientTexel = isDownscaledGradientTexel( DISPATCH_THREAD_ID.xy, size, inputMapColorId1, inputMapColorId2 );
+	}
+	
+	if( !isGradientTexel )
+	{
+		inputMapColorId1 = -1;
+		inputMapColorId2 = -1;
+
+		// Gradient Texel
+		if( !isInputMapColor( DISPATCH_THREAD_ID.xy ) )
+		{
+			isGradientTexel = true;
+
+			uint minDistance1 = 256;
+			uint minDistance2 = 256;
+			int minColorId1 = -1;
+			int minColorId2 = -1;
+
+			// Search for the closest main colors
+			for( int i = 0; i < COLOR_MASK_OFFSETS; ++i )
+			{
+				int2 coords = int2(DISPATCH_THREAD_ID.xy) + uOffsets[i];
+				if( coords.x < 0 || coords.y < 0 || coords.x >= int(size.x) || coords.y >= int(size.y) )
+				{ continue; }
+
+				vec3 inputIdOffsetColor = imageLoad( tInputTextureColorIds, coords ).xyz;
+				int3 inputIdOffsetColorI = getColorI( inputIdOffsetColor ); 
+
+				for( uint c = 0; c < INPUTMAP_COLORS_COUNT; ++c )
+				{
+					findClosestInputMapColors( c, inputIdOffsetColorI, minDistance1, minColorId1, minDistance2, minColorId2 );
+
+					int3 inputMapColorI = int3(uInputMapColors[c].xyz);
+					if( inputMapColorId1 != -1 && int(c) == inputMapColorId1 )
+					{ continue; }
+
+					if( areEqualsColorsI( inputIdOffsetColorI, inputMapColorI ) )
+					{
+						if( inputMapColorId1 == -1 )
+						{ 
+							inputMapColorId1 = c; 
+						}
+						else 
+						{
+							inputMapColorId2 = c;
+							break;
+						}
+					}
+				}	
+			}
+
+			// No perfect match for the first and/or second input map color
+			// Possibly a slight color variations due to compression... We take the closest colors
+			if( inputMapColorId1 == -1 && minColorId1 != -1 && minDistance1 <= sColorDiffThreshold )
+			{ inputMapColorId1 = minColorId1; }
+
+			if( inputMapColorId1 != -1 && inputMapColorId2 == -1 && minColorId2 != -1 && minDistance2 <= sColorDiffThreshold )
+			{ inputMapColorId2 = minColorId2; }
+
+			// If no second input map color found, we are probably on an UVIsland border
+			if( inputMapColorId1 != -1 && inputMapColorId2 == -1 )
+			{ inputMapColorId2 = inputMapColorId1; }
+		}
+	}
+
+	if( isGradientTexel )
+	{
+		//if( inputMapColorId1 != -1 && inputMapColorId2 != -1 ) // commented since we want to detect/study these texels on CPU
+		{
+			uint currentIndex;
+			interlockedAdd( bGradientCount, 2, 1, currentIndex );
+
+			if( currentIndex < uGradientTexelsCountMax )
+			{
+				interlockedAdd( bGradientCount, 1, 1, currentIndex );
+
+				GradientTexel gradientTexel;
+				compressGradientTexelColorsId( gradientTexel.mColorsId, inputMapColorId1, inputMapColorId2 );
+				compressGradientTexelXY(gradientTexel.mXY, DISPATCH_THREAD_ID.x, DISPATCH_THREAD_ID.y + uOffset);
+
+				uint bufferOffset = currentIndex * GRADIENT_TEXEL_SIZE;
+
+				interlockedStore2( bGradientTexels, bufferOffset, uint2( gradientTexel.mXY, gradientTexel.mColorsId ) );
+			}
+		}
+	}
+}
+
+#endif // GRADIENT_TEXELS
+
+//---------------------------------------------------------------------------------------
+#ifdef MASK_GRADIENT_TEXELS
+
+USE_INTERLOCKED_BUFFER( bGradientTexels, 0 );
+USE_LOADSTORE_TEXTURE2D( float, uOutput, 1 );
+
+uniform uint	uGradientTexelsCount;
+uniform uint2	uPreviewFactors;
+uniform int		uInputMapToUserIds[INPUTMAP_COLORS_COUNT];
+uniform vec3	uInputMapColors[INPUTMAP_COLORS_COUNT];
+uniform vec4	uUserColors[USER_COLORS_COUNT];
+uniform uint2	uInputMapScaleFactors;
+uniform uint2	uOutputShaderScaleFactors;
+
+USE_TEXTURE2D(tInputTextureColorIds);
+
+float distanceRGB( vec3 color1, vec3 color2 )
+{
+	return abs(color1.x - color2.x) + abs(color1.y - color2.y) + abs(color1.z - color2.z);
+}
+
+void computeBlendFactor(vec3 color, vec3 otherColor, vec3 initialColor, inout float value)
+{
+	value = 0.f;
+	float minDistance = 999.f;
+
+	for( int i=0; i<3; ++i )
+    {
+        float color1 = color[i];
+        float color2 = otherColor[i];
+        float gradientColor = initialColor[i];
+
+        if( (color1==0.f && color2==0.f) || ( color1 == color2 ) )
+        {
+            continue;
+        }
+        else 
+        {
+            float blendV = abs((gradientColor - color2) / (color1 - color2));
+
+            vec3 blendedColor = lerp(otherColor, color, blendV);
+			float d = distanceRGB(blendedColor, initialColor);
+			if( d < minDistance )
+			{
+				minDistance = d;
+				value = blendV;
+			}
+        }
+    }
+}
+
+COMPUTE(256,1,1)
+{
+	uint gradientTexelId = DISPATCH_THREAD_ID.x;
+
+	//check bounds
+	if( gradientTexelId >= uGradientTexelsCount )
+	{ return; }
+
+	uint bufferOffset = gradientTexelId * GRADIENT_TEXEL_SIZE;
+	uint2 gtValues = interlockedLoad2( bGradientTexels, bufferOffset );
+	GradientTexel gradientTexel;
+    gradientTexel.mXY = gtValues.x;
+    gradientTexel.mColorsId = gtValues.y;
+	uint coordX = 0;
+	uint coordY = 0;
+	uncompressGradientTexelXY( gradientTexel.mXY, coordX, coordY );
+
+	// Preview mode
+	uint2 coords = uint2( coordX / uPreviewFactors.x, coordY / uPreviewFactors.y );
+
+	int colorId1, colorId2;
+	uncompressGradientTexelColorsId( gradientTexel.mColorsId, colorId1, colorId2 );
+
+	if( colorId1 == -1 || colorId2 == -1 )
+	{ return; }
+
+	const int inputMapToUserId1 = uInputMapToUserIds[colorId1];
+	const int inputMapToUserId2 = uInputMapToUserIds[colorId2];
+	if( inputMapToUserId1 != -1 || inputMapToUserId2 != -1 )
+	{
+#ifdef PREVIEW_UI // Thumbnails and small popup mask : close the gaps due to slight color variations (compression)
+
+		vec4 result = vec4( 1.f, 1.0, 0.f, 0.f );
+		imageStore( uOutput, coords, result );
+#else
+
+		// the first color must always be the user color and the second one must be the "other" input map color
+		if( inputMapToUserId1 == -1 )
+		{ 
+			// Swap colors
+			int colorId2Copy = colorId2;
+			colorId2 = colorId1;
+			colorId1 = colorId2Copy;
+		}
+
+		// Final adjustments
+		colorId1 = uInputMapToUserIds[colorId1];
+
+		// Special case when a Color selection color layer has two color entries from two adjacent material areas
+		{
+			if( colorId2 != -1 && uInputMapToUserIds[colorId2] != -1 )
+			{ colorId1 = colorId2 = -1; }
+		}
+
+		// Compute the blend factor
+		float value = 0.f;
+
+		// Special case when a Color selection color layer has two color entries from two adjacent material areas
+		// Or UVIsland border if colorId1 == colorId2
+		if( colorId1 == -1 && colorId2 == -1 )
+		{
+			value = 1.f;
+		}
+		else if( colorId1 != -1 && colorId2 != -1 )
+		{
+			vec4 userColor = uUserColors[colorId1];
+			vec3 inputMapColor = uInputMapColors[colorId2];
+
+			vec3 averageInputMapColor = vec3(0.f,0.f,0.f);
+
+			// Necessary to compute an average color from input map
+			// when loaded input map resolution > downscaled gradient texels resolution (downscaled to match the output resolution)
+			for( uint i = 0; i < uInputMapScaleFactors.x; ++i )
+			{
+				for( uint j = 0; j < uInputMapScaleFactors.y; ++j )
+				{
+					averageInputMapColor += imageLoad( tInputTextureColorIds, coords * uInputMapScaleFactors + uint2(i,j) ).xyz;
+				}
+			}
+			averageInputMapColor /= float( uInputMapScaleFactors.x * uInputMapScaleFactors.y );
+
+			computeBlendFactor( userColor.rgb, inputMapColor, averageInputMapColor, value );
+		
+			value = 1.f - pow(abs(value - 1.f), userColor.w);
+		}
+
+		vec4 result = vec4( value, 1.0, 0.f, 0.f );
+
+		// When output resolution > input map mip 0 resolution (aka initial gradient texels)
+		uint2 outputCoords = coords * uOutputShaderScaleFactors;
+		for( uint i = 0; i < uOutputShaderScaleFactors.x; ++i )
+		{
+			for( uint j = 0; j < uOutputShaderScaleFactors.y; ++j )
+			{
+				imageStore( uOutput, outputCoords + uint2(i,j), result );
+			}
+		}
+
+#endif // PREVIEW_UI
+	}
+}
+
+#endif 

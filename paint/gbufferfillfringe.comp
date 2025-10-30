@@ -1,0 +1,130 @@
+#include "layer/layernoise.sh"
+#include "layer/skirtPadding.sh"
+
+USE_LOADSTORE_TEXTURE2D(float, tFlags, 0);
+
+USE_BUFFER(float, bSkirtSDFBuffer);
+
+uniform int2	uBufferSize;
+uniform float	uFinalSkirtSizeUV;
+uniform float	uMaxPaddingSDF;
+uniform int		uFlagsOnly;
+
+void updateSkirtFlags( int2 threadCoord )
+{
+	int2 flippedCoord = int2(threadCoord.x, (uBufferSize.y-1)-threadCoord.y);
+	int pixelMapIndex = asint(imageLoad(tRasterSkirtIndexMap, (ushort2)flippedCoord).x);
+	int flags = int(ceil(imageLoadRW(tFlags, (ushort2)threadCoord).x * 255.0));
+	if( pixelMapIndex < 0 )
+	{
+		float sdf = bSkirtSDFBuffer[(-pixelMapIndex)-1];
+		if( abs(sdf) > uMaxPaddingSDF )
+		{
+			//this skirt pixel lives in the dead zone
+			flags = flags | GBUFFER_FLAGS_DEAD_PIXEL;
+		}
+		else
+		{
+			//this one is active in the padding region
+			flags = flags & ~GBUFFER_FLAGS_DEAD_PIXEL;
+		}
+		imageStore(tFlags, (ushort2)threadCoord, float(flags) / 255.0);
+	}
+}
+
+bool sampleWithinLocalRegion( int2 pixel, int offX, int offY, uint originGroup )
+{
+	int2 offset = int2(offX, offY);
+	//check if the pixel is valid and has data on it.
+	int w = uBufferSize.x;
+	int h = uBufferSize.y;
+	int2 ip = pixel + offset;
+	if(ip.x < 0 )
+	{ ip.x += w; }
+	if(ip.x >= w )
+	{ ip.x -= w; }
+	if(ip.y < 0 )
+	{ ip.y += h; }
+	if(ip.y >= h )
+	{ ip.y -= h; }
+	uint2 p = uint2(ip);
+	int pixelMapIndex = asint(imageLoad(tRasterSkirtIndexMap, (ushort2)p).x);
+	if( pixelMapIndex > 0 )
+	{ return true; }
+	if( pixelMapIndex == 0 )
+	{ return false; }
+	
+	RasterSkirtPixelDesc pixelDesc = getRasterSkirtPixelDesc( pixelMapIndex );
+	return originGroup == pixelDesc.groupIndex;
+}
+
+bool onRegionBorder( int2 here, uint originGroup )
+{
+	return	!sampleWithinLocalRegion( here, -1, -1, originGroup ) ||
+			!sampleWithinLocalRegion( here, 0, -1, originGroup ) ||
+			!sampleWithinLocalRegion( here, 1, -1, originGroup ) ||
+			!sampleWithinLocalRegion( here, -1, 0, originGroup ) ||
+			!sampleWithinLocalRegion( here, 1, 0, originGroup ) ||
+			!sampleWithinLocalRegion( here, -1, 1, originGroup ) ||
+			!sampleWithinLocalRegion( here, 0, 1, originGroup ) ||
+			!sampleWithinLocalRegion( here, 1, 1, originGroup );
+}
+
+
+void updateAllSamples( int2 threadCoord )
+{
+	int2 flippedCoord = int2(threadCoord.x, (uBufferSize.y-1)-threadCoord.y);
+	int pixelMapIndex = asint(imageLoad(tRasterSkirtIndexMap, (ushort2)flippedCoord).x);
+	int flags = int(ceil(imageLoadRW(tFlags, (ushort2)threadCoord).x * 255.0));
+
+	const bool SHOW_FULL_SKIRTS = false;//dev purposes only
+
+	if( pixelMapIndex == 0 )//dead pixel
+	{
+		flags = GBUFFER_FLAGS_DEAD_PIXEL;
+	}
+	else if( pixelMapIndex > 0 )//island pixel
+	{
+		flags |= GBUFFER_FLAGS_ISLAND_PIXEL | GBUFFER_FLAGS_RASTER_PIXEL;
+	}
+	else if( pixelMapIndex < 0 )//skirt and/or fringe pixel
+	{
+		flags |= GBUFFER_FLAGS_SKIRT_PIXEL;
+
+		float sdf = bSkirtSDFBuffer[(-pixelMapIndex)-1];
+		bool includeSkirtSample = abs(sdf) <= uFinalSkirtSizeUV || SHOW_FULL_SKIRTS;
+
+		RasterSkirtPixelDesc pixelDesc = getRasterSkirtPixelDesc( pixelMapIndex );
+		uint groupIndex = pixelDesc.groupIndex;
+
+		if( onRegionBorder( flippedCoord, groupIndex ) )
+		{
+			flags |= GBUFFER_FLAGS_HEM_PIXEL;
+		}
+
+		if( abs(sdf) > uMaxPaddingSDF )
+		{
+			flags |= GBUFFER_FLAGS_DEAD_PIXEL;
+		}
+		if( includeSkirtSample )
+		{
+			flags |= GBUFFER_FLAGS_RASTER_PIXEL;
+		}
+	}
+	imageStore(tFlags, (ushort2)threadCoord, float(flags) / 255.0);
+}
+
+COMPUTE(8, 8, 1)
+{ 
+	// discard out of bounds threads
+	if( DISPATCH_THREAD_ID.x >= uBufferSize.x || DISPATCH_THREAD_ID.y >= uBufferSize.y )
+	{ return; }
+
+	int2 threadCoord = int2(DISPATCH_THREAD_ID.xy);
+
+	if( uFlagsOnly != 0 )
+	{ updateSkirtFlags( threadCoord ); }
+	else
+	{ updateAllSamples( threadCoord ); }
+
+}

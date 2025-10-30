@@ -1,0 +1,60 @@
+USE_LOADSTORE_TEXTURE2D(float, tFlags, 0);
+USE_INTERLOCKED_BUFFER(bCounter,1);		//counter so we don't use just-padded data for further padding in the same pass
+uniform int uPadPass;					//only use a pixel if its pad count is == to this
+uniform int2 uBufferSize;
+
+bool	tryPad( int2 pixel, int offX, int offY )
+{
+	int2 offset = int2(offX, offY);
+	//check if the pixel is valid and has data on it.  If so, extrapolate to get padded pixel
+	int w = uBufferSize.x;
+	int h = uBufferSize.y;
+	int2 ip1 = pixel + offset;
+	if(ip1.x < 0 || ip1.x >= int(w) || ip1.y < 0 || ip1.y >= int(h))
+	{ return false; }
+	uint2 p1 = uint2(ip1);
+	float flags = imageLoadRW(tFlags, p1).x;
+	if(flags > 0)
+	{
+		//check the pad count of our source pixels to make sure they haven't yet been written to
+		uint padCount1 = interlockedLoad(bCounter, p1.x + p1.y * w);
+		uint padCount2 = interlockedLoad(bCounter, p1.x + p1.y * w);
+		if(padCount1 != uint(uPadPass) || padCount2 != uint(uPadPass))		//this pixel was padded this pass and its data should not be used
+		{ return false; }
+		
+		interlockedStore(bCounter, pixel.x + pixel.y * w, uPadPass+1);
+		imageStore(tFlags, uint2(pixel), flags);
+		return true;
+	}
+
+	return false;
+}
+
+COMPUTE(8, 8, 1)
+{ 
+	// discard out of bounds threads
+	if( DISPATCH_THREAD_ID.x >= uBufferSize.x || DISPATCH_THREAD_ID.y >= uBufferSize.y )
+	{ return; }
+
+	//look for zeros in tPosX and then try to pad from neighboring pixels
+	if( imageLoadRW( tFlags, DISPATCH_THREAD_ID.xy ).x > 0.0 )
+	{ return; }
+	
+	int2 here = int2(DISPATCH_THREAD_ID.xy);
+	if(tryPad(here, 1, 0))
+	{ return; }
+	if(tryPad(here, -1, 0))
+	{ return; }
+	if(tryPad(here, 0, 1))
+	{ return; }
+	if(tryPad(here, 0, -1))
+	{ return; }
+	if(tryPad(here, 1, 1))
+	{ return; }
+	if(tryPad(here, 1, -1))
+	{ return; }
+	if(tryPad(here, -1, 1))
+	{ return; }
+	if(tryPad(here, -1, -1))
+	{ return; }
+}

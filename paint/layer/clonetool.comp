@@ -1,0 +1,124 @@
+#ifdef BUILD_MASK
+
+uniform vec4	uStickerUVEdges[EDGES_COUNT];
+uniform uint	uFoldsAlphaTextureSize;
+
+USE_LOADSTORE_TEXTURE2D( float, uFoldsAlphaOutput, 0 );
+
+COMPUTE(1, 1, 1)
+{
+	uint edgeId = GROUP_ID.x;
+	vec4 stickerUVEdge = uStickerUVEdges[edgeId];
+
+	int2 coordsTexel1 = int2( stickerUVEdge.xy * uFoldsAlphaTextureSize );
+	int2 coordsTexel2 = int2( stickerUVEdge.zw * uFoldsAlphaTextureSize );
+
+	bool doXSteps = ( abs(coordsTexel1.x - coordsTexel2.x) > abs(coordsTexel1.y - coordsTexel2.y) );
+
+	uint stepCount = max(abs(coordsTexel1.x - coordsTexel2.x), abs(coordsTexel1.y - coordsTexel2.y));
+
+	int2 coordsTexel1Final, coordsTexel2Final;
+	vec2 stickerUV1Final, stickerUV2Final;
+	bool oneBeforeTwo = ( doXSteps ? coordsTexel1.x < coordsTexel2.x : coordsTexel1.y < coordsTexel2.y );
+
+	coordsTexel1Final = ( oneBeforeTwo ? coordsTexel1 : coordsTexel2 ); 
+	coordsTexel2Final = ( oneBeforeTwo ? coordsTexel2 : coordsTexel1 ); 
+
+	stickerUV1Final = ( oneBeforeTwo ? stickerUVEdge.xy : stickerUVEdge.zw );
+	stickerUV2Final = ( oneBeforeTwo ? stickerUVEdge.zw : stickerUVEdge.xy );
+	
+	for( uint stepId = 0; stepId < stepCount; ++stepId )
+	{
+		int2 coordTexel = coordsTexel1Final;
+
+		if( doXSteps )
+		{ 
+			coordTexel.x += stepId; 
+
+			float stickerUVCoordX = stickerUV1Final.x + (float(stepId) / float(stepCount)) * (stickerUV2Final.x - stickerUV1Final.x);
+			float stickerUVCoordY = stickerUV1Final.y + ((stickerUVCoordX - stickerUV1Final.x) / (stickerUV2Final.x - stickerUV1Final.x)) * (stickerUV2Final.y - stickerUV1Final.y);
+
+			coordTexel.y = int( stickerUVCoordY * uFoldsAlphaTextureSize ); 
+		}
+		else
+		{ 
+			coordTexel.y += stepId; 
+
+			float stickerUVCoordY = stickerUV1Final.y + (float(stepId) / float(stepCount)) * (stickerUV2Final.y - stickerUV1Final.y);
+			float stickerUVCoordX = stickerUV1Final.x + ((stickerUVCoordY - stickerUV1Final.y) / (stickerUV2Final.y - stickerUV1Final.y)) * (stickerUV2Final.x - stickerUV1Final.x);
+
+			coordTexel.x = int( stickerUVCoordX * uFoldsAlphaTextureSize ); 
+		}
+
+		if( coordTexel.x >= 0 && coordTexel.x < uFoldsAlphaTextureSize && coordTexel.y >= 0 && coordTexel.y < uFoldsAlphaTextureSize )
+		{ 
+			imageStore( uFoldsAlphaOutput, uint2(coordTexel), 0.f );
+
+			// texels square to 0
+			uint2 rangeX;
+			if( coordTexel.x < uFoldsAlphaTextureSize - coordTexel.x )
+			{ rangeX = uint2(0, coordTexel.x); }
+			else
+			{ rangeX = uint2(coordTexel.x, uFoldsAlphaTextureSize-1); }
+
+			uint2 rangeY;
+			if( coordTexel.y < uFoldsAlphaTextureSize - coordTexel.y )
+			{ rangeY = uint2(0, coordTexel.y); }
+			else
+			{ rangeY = uint2(coordTexel.y, uFoldsAlphaTextureSize-1); }
+
+			for( uint x = rangeX.x; x <= rangeX.y; ++x )
+			{
+				for( uint y = rangeY.x; y <= rangeY.y; ++y )
+				{
+					imageStore( uFoldsAlphaOutput, uint2(x, y), 0.f );
+				}
+			}
+		}
+	}
+}
+
+#endif
+
+
+#ifdef EROSION_MASK
+
+uniform uint	uFoldsAlphaTextureSize;
+
+USE_TEXTURE2D( tFoldsTempAlphaTexture );
+USE_LOADSTORE_TEXTURE2D( float, uFoldsAlphaOutput, 0 );
+
+COMPUTE(32, 32, 1)
+{
+	if( DISPATCH_THREAD_ID.x >= uFoldsAlphaTextureSize || DISPATCH_THREAD_ID.y >= uFoldsAlphaTextureSize )
+	{ return; }
+
+	float alpha = imageLoad( tFoldsTempAlphaTexture, uint2(DISPATCH_THREAD_ID.xy) ).x;
+	
+	if( alpha > 0.f )
+	{
+		for( int x = -1; x <= 1; ++x )
+		{
+			for( int y = -1; y <= 1; ++y )
+			{
+				if( x == 0 && y == 0 )
+				{ continue; }
+
+				int2 coords = int2(DISPATCH_THREAD_ID.xy) + int2(x,y);
+				if( coords.x < 0 || coords.y < 0 || coords.x >= uFoldsAlphaTextureSize || coords.y >= uFoldsAlphaTextureSize )
+				{ continue; }
+
+				float adjAlpha = imageLoad( tFoldsTempAlphaTexture, uint2(coords) ).x;
+				if( adjAlpha <= 0.f )
+				{ 
+					imageStore( uFoldsAlphaOutput, uint2(DISPATCH_THREAD_ID.xy), 0.f );
+					return;
+				}
+			}
+		}
+	}
+	
+	imageStore( uFoldsAlphaOutput, uint2(DISPATCH_THREAD_ID.xy), alpha );
+}
+
+#endif
