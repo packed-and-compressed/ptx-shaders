@@ -1,0 +1,68 @@
+#ifndef MSET_BSDF_BECKMANN_COMP
+#define MSET_BSDF_BECKMANN_COMP
+
+#include "data/shader/common/const.sh"
+#include "data/shader/common/erf.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/tangentspace.sh"
+
+
+//////////////////////////////////////////////////////////////////////////
+// Beckmann BSDF
+
+float beckmannP22( const half2 slope, const float alpha )
+{
+	// beckmann distribution
+	const vec2 slopeSqr = vec2( slope ) * vec2( slope );
+	const float sigma = alpha * INV_SQRT_2;
+	const float sigmaSqr = sigma * sigma;
+	return exp( -0.5 * ( ( slopeSqr.x / sigmaSqr ) + ( slopeSqr.y / sigmaSqr ) ) ) / ( TWOPI * sigmaSqr );
+}
+
+float beckmannG1VCavity( const vec3 H_t, const vec3 v )
+{
+	const float VdotH = dot( v, H_t );
+	if( VdotH <= 0.0 )
+	{
+		return 0.0;
+	}
+	return min( 1.0, 2.0 * H_t.z * v.z / VdotH );
+}
+
+float evaluateBeckmann(
+	const vec3			   V_t,		  // outgoing ray direction
+	const vec3			   L_t,		  // incident ray dirction
+	const vec3			   H_t,		  // microfacet normal
+	const float			   alpha,	  // roughness^2
+	inout float			   pdf )	  // probability density (result)
+{
+	const half2 slope = half2( normalToSlope( H_t ) );
+	const half	cos4Theta = half( H_t.z * H_t.z * H_t.z * H_t.z );
+
+	// evaluate glints distribution
+	const float D = beckmannP22( slope, alpha ) * rcpSafe( cos4Theta );
+
+	pdf = D * abs( H_t.z ) * rcpSafe( 4 * dot( V_t, H_t ) );
+	return D * beckmannG1VCavity( H_t, V_t ) * beckmannG1VCavity( H_t, L_t ) * rcpSafe( 4.0 * V_t.z * L_t.z );
+}
+
+vec3 sampleBeckmannNDF_t( const vec3 V, const vec2 u, float alpha )
+{
+	const float logSample = u.x == 0.0 ? 0.0 : log( 1.0 - u.x );
+	const float tan2Theta = -alpha * alpha * logSample;
+	const float phi = u.y * TWOPI;
+	const float cosTheta = rsqrt( 1.0 + tan2Theta );
+	const float sinTheta = sqrt( saturate( 1.0 - cosTheta * cosTheta ) );
+	return vec3( sinTheta * cos( phi ), sinTheta * sin( phi ), cosTheta );
+}
+
+// Importance sample Beckmann BSDF's microfacet normal in tangent space
+vec3 sampleBeckmann_t( 
+	const vec3  V_t,		// view direction in backwards path tracing in tangent space
+	const vec2  u,		// random numbers
+	const float alpha )	// roughness^2
+{
+	return sampleBeckmannNDF_t( V_t, u, alpha );
+}
+
+#endif

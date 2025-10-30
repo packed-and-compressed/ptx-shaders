@@ -1,0 +1,771 @@
+#ifndef MSET_BSDF_GLINTS_COMP
+#define MSET_BSDF_GLINTS_COMP
+
+#include "data/shader/common/const.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/differential.sh"
+#include "data/shader/common/rng.comp"
+#include "data/shader/common/tangentbasis.sh"
+#include "data/shader/mat/fresnel.frag"
+#include "data/shader/mat/state.comp"
+#include "data/shader/mat/state.frag"
+#include "data/shader/scene/raytracing/bsdf/beckmann.comp"
+#include "data/shader/scene/raytracing/raydifferential.sh"
+
+USE_TEXTURE2DARRAY( tGlintsPDFTex );
+USE_TEXTURE2DARRAY( tGlintsCDFTex );
+
+uniform uint2 uDictionaryInfo;
+
+#define DIFFERENTIAL_DELTA 0.1
+
+#define MAX_GLINTS_SAMPLES 100
+#define MAX_GLINTS_ANISOTROPY 8.0
+#define MIN_GLINTS_ALPHASQR 1e-6
+#define EXP_NEG_2 0.1353352832
+
+// szudzik function for mapping 2 integers to 1
+#define SZUDZIK_FUNCTION(k1, k2) (k1 >= k2 ? k1 * k1 + k1 + k2 : k1 + k2 * k2)
+
+// dictionary info
+#define DICTIONARY_ALPHA		(0.5)
+#define DICTIONARY_COUNT( v )   ( int( v.x ) )
+#define DICTIONARY_NLEVELS( v ) ( int( v.y ) )
+
+#define DICTIONARY_COUNT_16( v )     ( ushort( v.x ) )
+#define DICTIONARY_NLEVELS_16( v )   ( ushort( v.y ) )
+#define N_LEVELS_VIRTUAL_MIPMAP( v ) ( 32 )
+
+#define DICTIONARY_MARGINAL_PDF_WIDTH 64
+
+
+//////////////////////////////////////////////////////////////////////////
+// UV/glints projection
+
+
+vec2 glintStochastic( const float worldExtent, const float r, const vec3 p, const vec3 N, inout half weight )
+{
+	// weights from each projection plane
+	const vec3 weights = normalize( N * N );
+	vec2	   st;
+	// we sample the uv coordinates in one of the planes
+	if( r < weights.x )
+	{
+		st = p.yz;
+		weight = half( weights.x );
+	}
+	else if( r < weights.x + weights.y )
+	{
+		st = p.xz;
+		weight = half( weights.y );
+	}
+	else
+	{
+		st = p.xy;
+		weight = half( weights.z );
+	}
+	
+	// scale by the worldspace extent (bonding box) so it's relative  to it
+	return vec2( st * worldExtent );
+}
+
+#if defined( MATERIAL_PASS_RT_PRIMARYHIT ) || defined( MATERIAL_PASS_RT_SECONDARYHIT ) || \
+	( defined( MATERIAL_PASS_RT_PRIMARYHIT_RASTER ) && defined( SHADER_COMPUTE ) ) || \
+	( defined( MATERIAL_PASS_HYBRID_LIGHT_SAMPLE ) ) || \
+	( defined( MATERIAL_PASS_HYBRID_PRIMARYHIT ) ) || \
+	( defined( MATERIAL_PASS_HYBRID_INDIRECT ) ) || \
+	( defined( MATERIAL_PASS_HYBRID_SPATIALHASHDEBUG ) )
+// stochastic texture coordinate differential, compute version
+diff2 interpolateGlintsDifferentials(
+	const float worldExtent,
+	const float r,
+	const diff3 dP,
+	const float dN,
+	const vec3 worldPos,
+	const vec3 worldN,
+	const vec2 texcoord )
+{
+	// dNdx and dNdy approximation with basis and estimated length of dNdx/dNdy
+	TangentBasis diffBasis = createTangentBasis( worldN );
+	
+	diff2 dUV;
+	half weight;
+	dUV.dx = ( glintStochastic( worldExtent, r, worldPos + DIFFERENTIAL_DELTA * dP.dx, worldN + DIFFERENTIAL_DELTA * diffBasis.T * dN, weight) - texcoord ) / DIFFERENTIAL_DELTA;
+	dUV.dy = ( glintStochastic( worldExtent, r, worldPos + DIFFERENTIAL_DELTA * dP.dy, worldN + DIFFERENTIAL_DELTA * diffBasis.B * dN, weight ) - texcoord ) / DIFFERENTIAL_DELTA;
+	return dUV;
+}
+#else
+// stochastic texture coordinates differential, raster version
+diff2 interpolateGlintsDifferentials(
+	const float worldExtent,
+	const float r,
+	const vec3 worldPos,
+	const vec3 worldN,
+	const vec2 texcoord )
+{
+	diff2 dUV;
+	half weight;
+	dUV.dx = ( glintStochastic( worldExtent, r, worldPos + ddx( worldPos ), worldN + ddx( worldN ), weight ) - texcoord );
+	dUV.dy = ( glintStochastic( worldExtent, r, worldPos + ddy( worldPos ), worldN + ddy( worldN ), weight ) - texcoord );
+	return dUV;
+}
+#endif
+
+//////////////////////////////////////////////////////////////////////////
+// ray footprint for partial derivatives
+
+// we want to clamp ray foot print so that it does not make the iteration
+// across the glints too large, which could slow the evaluation/sampling down
+void clampRayFootprint( inout diff2 dUV )
+{
+	// Compute major/minor axes, swap them so dUV.dy is bigger if necessary
+	if( dot( dUV.dx, dUV.dx ) < dot( dUV.dy, dUV.dy ) )
+	{
+		vec2 tmp = dUV.dx;
+		dUV.dx = dUV.dy;
+		dUV.dy = tmp;
+	}
+
+	// Clamp elliptical eccentricity if one of the axes is too large
+	const float majorLength = length( dUV.dx );
+	const float minorLength = length( dUV.dy );
+	if( minorLength * MAX_GLINTS_ANISOTROPY < majorLength && minorLength > 0.0 )
+	{
+		const float scale = majorLength / ( minorLength * MAX_GLINTS_ANISOTROPY );
+		dUV.dy *= scale;
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////
+// glint BRDF functions
+
+
+// The lod scheme is described as a mip hierarchy similar to a pyramid, and here we are calculating the number of 
+// entries in the pyramid given the level
+int pyramidSize( int level )
+{
+	return int( pow( 2.0, float( N_LEVELS_VIRTUAL_MIPMAP( uDictionaryInfo ) - 1 - level ) ) );
+}
+
+float calcLODDistribution( const float exponentialDist, const int integerLod)
+{
+	// Here we convert the EWA co-ordinates to the appropriate scale for a particular level in pyramid
+	const float sizeOfPyramid = float( pyramidSize( integerLod ) );
+	const float areaOfCell = 1.0 / ( sizeOfPyramid * sizeOfPyramid );
+
+	// Calculate the number of microfacets in the current lod cell and then find its distribution, log(x)/1.38629
+	const float microfacetCountInCell = areaOfCell * exponentialDist;
+	return log( microfacetCountInCell ) * 0.72134979;
+}
+
+// sampling from the normal distribution 
+half sampleNormalDistribution( const float u, const half mu, const half sigma )
+{
+	return half(sigma * 1.414213 * erfinv( 2.0 * u - 1.0 ) + mu);
+}
+
+float evaluateLastLOD( const half2 slope, const float alpha, const float glintAlpha, const float glintDensity )
+{
+	float density = beckmannP22( slope, glintAlpha );
+	if( glintDensity != 1.0 )
+	{
+		density = lerp( beckmannP22( slope, alpha ), density, glintDensity );
+	}
+	return density;
+}
+
+half2 sampleGlintsLastLOD( vec2		   u,			// random numbers
+						   const float alpha,		// roughness^2
+						   const float glintAlpha,	// glintRoughness^2
+						   const float glintDensity,
+						   inout bool  isGlint )
+{
+	vec2 sigma = INV_SQRT_2;
+	if( u.x < glintDensity )
+	{
+		u.x = u.x / glintDensity;
+		sigma *= glintAlpha;
+		isGlint = true;
+	}
+	else
+	{
+		u.x = ( u.x - glintDensity ) / ( 1.0 - glintDensity );
+		sigma *= alpha;
+		isGlint = false;
+	}
+	// sampling and also scaling by lobe size
+	return half2( 
+		sampleNormalDistribution( u.x, 0.0, 1.0 ) * sigma.x, 
+		sampleNormalDistribution( u.y, 0.0, 1.0 ) * sigma.y );
+}
+
+float p22ThetaAlpha( 
+	in const FragmentState	fs,
+	float					alpha,				// roughness^2
+	float					glintAlpha,			// glintRoughness^2
+	half2					slope,				// slope
+	const int2				st0)				// sampled cell
+{
+	// lod and lod distribution
+	const ushort l = fs.glintLOD;
+	half lodDistribution = fs.glintPackedData.x;
+
+	// initializing new RNG here to account for coherency within a cell (st0) for a given level,
+	// it is imperative for the "pattern" for glints, with reflectance on those patterns, 
+	// this has to be consistent with the actual sampling in sampleGlintsSlope, i.e. it is not totally random
+	// we are using Szudzik's function instead of Cantor's pairing to stay within 32bit
+	RNG rng = rngInit( uint( l ), SZUDZIK_FUNCTION( uint( st0.x ), uint( st0.y ) ) );
+	if( rngNextFloat(rng) > fs.glintSettings.x )
+	{
+		return evaluateLastLOD( slope, alpha, glintAlpha, 0.0 );
+	}
+
+	// sample gaussian to randomize the distribution lod
+	lodDistribution = sampleNormalDistribution( rngNextFloat( rng ), lodDistribution, 2.0 );
+
+	// convert to integer for lod level we have sampled
+	const ushort integerLodDistribution = clamp( ushort( round( float(lodDistribution) ) ), ushort( 0 ), DICTIONARY_NLEVELS_16( uDictionaryInfo ) );
+
+	// if we are at the higher level, then evaluate the highest lod level (beckmann)
+	if( integerLodDistribution >= DICTIONARY_NLEVELS_16( uDictionaryInfo ) )
+	{
+		// we are at the lowest level so revert to beckmann distribution
+		return evaluateLastLOD( slope, alpha, glintAlpha, fs.glintSettings.x );
+	}
+
+	// calculate the random variation in rotation of the glints
+	half sinTheta, cosTheta;
+	sincos( TWOPI * rngNextFloat( rng ), sinTheta, cosTheta );
+	
+	// apply rotation and then scale to slope
+	const float sigma = glintAlpha * INV_SQRT_2;
+	const float sigmaDict = DICTIONARY_ALPHA * INV_SQRT_2;
+	const float	invScale = sigmaDict / sigma;
+	vec2 transformedSlope = vec2( 
+		slope.x * cosTheta + slope.y * sinTheta, 
+		slope.x * -sinTheta + slope.y * cosTheta ) * invScale;
+	transformedSlope = abs( transformedSlope );
+
+#define ALPHA_DIST_4_INV_SQRT2 (float( DICTIONARY_ALPHA * INV_SQRT_2 * 4.0 ))
+	if( transformedSlope.x > ALPHA_DIST_4_INV_SQRT2 || transformedSlope.y > ALPHA_DIST_4_INV_SQRT2 )
+	{
+		return 0.0;
+	}
+
+	// sample the marginal distribution for the lod level for slopeX
+	ushort idx = ushort( rngNextFloat( rng ) * DICTIONARY_COUNT_16( uDictionaryInfo ) );
+	vec3   texCoords = vec3( transformedSlope.x / ALPHA_DIST_4_INV_SQRT2, 0.0, integerLodDistribution * DICTIONARY_COUNT_16( uDictionaryInfo ) + idx );
+	half prob = half( texture2DArrayLod( tGlintsPDFTex, texCoords, 0 )[idx % 3] );
+
+	// sample the marginal distribution for the lod level for slopeY
+	idx = ushort( rngNextFloat( rng ) * DICTIONARY_COUNT_16( uDictionaryInfo ) );
+	texCoords = vec3( transformedSlope.y / ALPHA_DIST_4_INV_SQRT2, 0.0, integerLodDistribution * DICTIONARY_COUNT_16( uDictionaryInfo ) + idx );
+	prob *= half( texture2DArrayLod( tGlintsPDFTex, texCoords, 0 )[idx % 3] );
+	return prob * invScale * invScale;
+#undef ALPHA_DIST_4_INV_SQRT2
+}
+
+// The glints multiscale algorithm uses the EWA filtering method from PBRT v3 in section 10.4.5
+float p22P( in const FragmentState	fs, 
+			const float				alpha,		// roughness^2
+			const float				glintAlpha,	// glintRoughness^2
+			const half2				slope)		// slope
+{
+	const short lod = fs.glintLOD;
+	const vec2	st = fs.glintUV;
+	const half3 packedData = fs.glintPackedData;
+	const vec3	ewaCoeff = fs.glintEWACoeff;
+	const int2	s = fs.glintS;
+	const int2	t = fs.glintT;
+
+	// Scan over elliptical bounds and compute the quadratic equation
+	float sum = 0.0;
+	int	  count = 0;
+	for( int it = t.x; it <= t.y; ++it )
+	{
+		const float tt = float( float( it ) - st.y );
+		for( int is = s.x; is <= s.y; ++is )
+		{
+			const float ss = float( float( is ) - st.x );
+	
+			// Compute squared distance to check if the pixel falls within the elliptical region
+			const float r2 = float( ewaCoeff.x * ss * ss + ewaCoeff.y * ss * tt + ewaCoeff.z * tt * tt );
+			if( r2 < 1.0 )
+			{
+				sum += p22ThetaAlpha( fs, alpha, glintAlpha, slope, int2( is, it ) ) * ( exp( -2.0 * r2 ) - EXP_NEG_2 );
+			}
+			++count;
+			if( count > MAX_GLINTS_SAMPLES )
+			{
+				break;
+			}
+		}
+		if( count > MAX_GLINTS_SAMPLES )
+		{
+			break;
+		}
+	}
+	// divide by total cdf
+	return sum * rcpSafe( float( packedData.y ) );
+}
+
+half sampleGlintsCDF( const vec2 u, const ushort i, const ushort l )
+{
+	// so we are sampling from the i-th marginal distribution function for the l-th lod level
+	
+	// the start = bGlintsMarginalProbDist[];
+#define START_IDX 0 
+#define END_IDX (DICTIONARY_MARGINAL_PDF_WIDTH - 1)
+	const ushort subDistIdx = ushort( u.y * ( 3 - FLT_EPSILON ) );
+
+	// binary search for CDF index, the global memory access pattern here hardly matters because the glints's 
+	// CDF accessing pattern is very randomized, binary search is about 23% faster than linear search in the worst case scenario
+	// of zooming into the material
+	ushort foundIdx = END_IDX;
+	ushort left = START_IDX, right = END_IDX;
+	float  cdf = 0.0;
+	while( left <= right )
+	{
+		const ushort middle = ( left + right ) / 2;
+		const float  middleCDF = imageLoadArray( tGlintsCDFTex, ushort2( middle, 0 ), i * DICTIONARY_NLEVELS_16( uDictionaryInfo ) + l )[subDistIdx];
+		bool		 finished = ( middle == left ) || ( middle == right );
+		if( u.x < middleCDF )
+		{
+			right = middle;
+		}
+		else if( u.x > middleCDF )
+		{
+			left = middle;
+		}
+		else
+		{
+			finished = true;
+		}
+
+		if( finished )
+		{
+			foundIdx = middle;
+			cdf = middleCDF;
+			break;
+		}
+	}
+
+	// calculate the pdf from the cdf, and this is the resulting distribution sampled we have sampled from
+	const float lowerCdf = imageLoadArray( tGlintsCDFTex, ushort2( max( foundIdx - 1, START_IDX ), 0 ), i * DICTIONARY_NLEVELS_16( uDictionaryInfo ) + l )[subDistIdx];
+	float		du = ( u.x - lowerCdf );
+	if( ( cdf - lowerCdf ) > 0 )
+	{
+		du /= ( cdf - lowerCdf );
+	}
+	return half(( foundIdx + du ) / float( DICTIONARY_MARGINAL_PDF_WIDTH ));
+#undef START_IDX
+#undef END_IDX
+}
+
+half sampleGlintsSlope( inout RNG rng, const ushort i, const ushort l )
+{
+	// Samples the positive part of the 1D distribution of the uDictionaryInfo
+	// Sampled value is in [0, 1)
+	const half	sample = sampleGlintsCDF( rngNextVec2( rng ), i, l );
+
+	// The 1D distribution is an even function (flipping for negative values)
+	// [-1, 1], then we scale it to
+	// [-alpha_dist_isqrt2_4, alpha_dist_isqrt2_4]
+	//
+	// The distribution equals 0 after 4 standard deviations.
+	// Slope standard deviation = alpha / sqrt(2)
+	// 0.707106 = 1 / sqrt(2)
+	// multiply this by 4 to get 2.82842
+	return ( ( rngNextFloat( rng ) < 0.5 ) ? -sample : sample ) * half( DICTIONARY_ALPHA * 2.82842 );
+}
+
+void sampleGlintsCellSlope( 
+	in const FragmentState	fs, 
+	inout RNG				rngPathSample,	// path sample rng
+	const float				alpha,			// roughness^2
+	const float				glintAlpha,		// glintRoughness^2
+	const int2				sampledCell,	// sampled cell coordinates
+	inout half2				slope,			// slope
+	inout bool				isGlint )
+{
+	const ushort l = fs.glintLOD;
+	half lodDistribution = fs.glintPackedData.x;
+
+	// initializing new RNG here to account for coherency within a cell (st0) for a given level,
+	// we are using Szudzik's function instead of Cantor's pairing to stay within 32bit
+	RNG rng = rngInit( uint( l ), SZUDZIK_FUNCTION( uint( sampledCell.x ), uint( sampledCell.y ) ) );
+
+	// If the current cell has no microfacets, a default material is sampled
+	if( rngNextFloat( rng ) > fs.glintSettings.x )
+	{
+		slope = sampleGlintsLastLOD( rngNextVec2( rngPathSample ), alpha, glintAlpha, 0.0, isGlint );
+		return;
+	}
+
+	// Sample a Gaussian to randomise the distribution LOD around the
+	// distribution level lDist
+	lodDistribution = sampleNormalDistribution( rngNextFloat( rng ), lodDistribution, 2.0 );
+	const ushort integerLod = clamp( ushort( round( float(lodDistribution) ) ), ushort(0), DICTIONARY_NLEVELS_16( uDictionaryInfo ) );
+	// If the current distribution level is greater than or equal to nLevels,
+	// then the SDF of the last LOD is sampled
+	if( integerLod >= DICTIONARY_NLEVELS_16( uDictionaryInfo ) )
+	{
+		slope = sampleGlintsLastLOD( rngNextVec2( rng ), alpha, glintAlpha, fs.glintSettings.x, isGlint );
+		return;
+	}
+	
+	// calculate the random variation in rotation of the glints
+	half sinTheta, cosTheta;
+	sincos( TWOPI * rngNextFloat( rng ), sinTheta, cosTheta );
+
+	// Compute the indices of the two marginal distributions
+	const ushort2 idx = ushort2( rngNextVec2( rng ) * half( DICTIONARY_COUNT( uDictionaryInfo ) ) );
+
+	// Sample original (uDictionaryInfo) slope space
+	slope = half2( sampleGlintsSlope( rngPathSample, idx.x, integerLod ),
+				   sampleGlintsSlope( rngPathSample, idx.y, integerLod ) );
+
+	// linear transform the sample with rotation and scaling
+	const half scale = half( glintAlpha / DICTIONARY_ALPHA );
+	slope = half2( 
+		( slope.x * cosTheta ) + ( slope.y * -sinTheta ), 
+		( slope.x * sinTheta ) + ( slope.y * cosTheta ) ) * scale;
+	
+	// we have definitely sampled glint here
+	isGlint = true;
+}
+
+bool sampleP22PDiscreteLod( in const FragmentState	fs,
+							inout RNG				rng,		// random number generator
+							const float				alpha,		// roughness^2
+							const float				glintAlpha,	// glintRoughness^2
+							inout half2				slope,		// result: our sampled slope
+							inout bool				isGlint )	// TRUE if we have sampled glint (result)
+{
+	const short lod = fs.glintLOD;
+	const vec2	st = fs.glintUV;
+	const half3 packedData = fs.glintPackedData;
+	const vec3	ewaCoeff = fs.glintEWACoeff;
+	const int2	s = fs.glintS;
+	const int2	t = fs.glintT;
+
+	float cdfValue = 0.0f;
+	bool found = false;
+	int sampledSCell;
+	int sampledTCell;
+	int	  count = 0;
+	for( int it = t.x; it <= t.y; ++it )
+	{
+		const float tt = float( float( it ) - st.y );
+		for( int is = s.x; is <= s.y; ++is )
+		{
+			// Compute squared radius and compute the weight if inside ellipse
+			const float ss = float( float( is ) - st.x );
+			const float r2 = ewaCoeff.x * ss * ss + ewaCoeff.y * ss * tt + ewaCoeff.z * tt * tt;
+			if( r2 < 1 )
+			{
+				float cdf = ( exp( -2.0 * r2 ) - EXP_NEG_2 );
+				// divide by cdf total
+				cdfValue += cdf / float( packedData.y );
+				if( rngNextFloat( rng ) < cdfValue )
+				{
+					found = true;
+					sampledSCell = is;
+					sampledTCell = it;
+				}
+			}
+			++count;
+			if( count > MAX_GLINTS_SAMPLES )
+			{
+				break;
+			}
+			if( found )
+			{
+				break;
+			}
+		}
+		if( count > MAX_GLINTS_SAMPLES )
+		{
+			break;
+		}
+		if( found )
+		{
+			break;
+		}
+	}
+
+	// after we have found the cell we want to sample, we sample the slope inside the cell
+	// for the given LOD
+	if( found )
+	{
+		// sample glint given the sampled cell 
+		sampleGlintsCellSlope( fs, rng, alpha, glintAlpha, int2( sampledSCell, sampledTCell ), slope, isGlint );
+		return true;
+	}
+
+	return false;
+}
+
+// Samples the 2D slope distribution at some discrete LOD, using two 1D distributions at some level
+// Note that this returns a slope, which we can then convert to microfacet normal later
+half2 sampleGlintsSlopeForLOD( 
+	in const FragmentState	fs,
+	inout RNG				rng,		// random number generator
+	float					alpha,		// roughness^2
+	float					glintAlpha, // glintRoughness^2
+	inout bool				isGlint )	// check if we have sampled glint
+{
+	bool sampleLastLOD = false;
+	const half3 packedData = fs.glintPackedData;
+#if defined(MATERIAL_PASS_RT_SECONDARYHIT) || defined(MATERIAL_PASS_HYBRID_INDIRECT)
+	sampleLastLOD = true;
+#else
+	// check minor length, if 0 then sample the last lod level
+	if( packedData.z == 0.0 )
+	{
+		sampleLastLOD = true;
+	}
+	else
+	{
+		if( packedData.x < DICTIONARY_NLEVELS_16( uDictionaryInfo ) )
+		{
+			// convert the slope into microfacet normal in tangent space and then
+			// transform it into object space
+			half2 sampledSlope;
+			if( sampleP22PDiscreteLod( fs, rng, alpha, glintAlpha, sampledSlope, isGlint ) )
+			{
+				return sampledSlope;
+			}
+		}
+		sampleLastLOD = true;
+	}
+#endif
+
+	if( sampleLastLOD )
+	{
+		// get the microfacet normal in tangent space
+		return sampleGlintsLastLOD( rngNextVec2( rng ), alpha, fs.glintUseMicrofacet ? alpha : glintAlpha, fs.glintSettings.x, isGlint );
+	}
+
+	return half2( 0.0, 0.0 );
+}
+
+// Samples glints, returns microfacet normal in tangent space
+vec3 sampleBRDF_Glints_t(
+	in const FragmentState	fs,
+	const vec3				V_t,			// view direction in backwards path tracing in tangent space
+	const vec4				r,				// random numbers (low discrepancy)
+	inout RNG				rng,			// random numbers generator for when more is need during glints slope sampling
+	const float				alpha,			// roughness^2
+	const float				glintAlpha,	// glintAlpha^2
+	out   bool				isGlint )		// TRUE if we have sampled a glint fragment
+{
+	// by default we set to false
+	isGlint = false;
+	vec3 H_t;
+	if(r.z < fs.glintIntensity)
+	{
+		H_t = slopeToNormal( sampleGlintsSlopeForLOD( fs, rng, alpha, glintAlpha, isGlint ) );
+	}
+	else
+	{
+		H_t = sampleBeckmann_t( V_t, r.xy, alpha );
+		isGlint = false;
+	}
+	return dot( V_t, H_t ) < 0 ? -H_t : H_t;
+}
+
+// Computes the glints distribution which we then use to compute bsdf
+float glintsP22( 
+	in const FragmentState fs,
+	const half2		slope,		// slope from microfacet normal
+	const float		alpha,		// roughness^2
+	const float		glintAlpha) // glintRoughness^2
+{
+	const half3 packedData = fs.glintPackedData;
+	float		D = evaluateLastLOD( slope, alpha, glintAlpha, fs.glintSettings.x );
+	// minor length if > 0
+	if( packedData.z != 0.0 )
+	{
+		// base probability density for any lod distribution that is greater or equal to N levels
+		if( packedData.x < DICTIONARY_NLEVELS_16( uDictionaryInfo ) || 
+			( packedData.x+ 1 ) < DICTIONARY_NLEVELS_16( uDictionaryInfo ) )
+		{
+			D = p22P( fs, alpha, glintAlpha, slope );
+		}
+	}
+	return D;
+}
+
+float evaluateGlintsD(
+	in const FragmentState	fs,
+	const vec3				H_t,			// microfacet normal
+	const float				alpha,			// roughness^2
+	const float				glintAlpha)		// glintRoughness^2
+{
+	const half2 slope = half2( normalToSlope( H_t ) );
+	// first bsdf we are evaluating (glints)
+	const half cos4Theta = half( H_t.z * H_t.z * H_t.z * H_t.z );
+	float	   D = 0.0;
+	const half glintIntensity = fs.glintIntensity;
+	if( glintIntensity > 0.0 )
+	{
+		// evaluate glints
+		D = glintsP22( fs, slope, alpha, glintAlpha );
+	}
+	
+	// second bsdf we are evaluating (beckmann)
+	if( glintIntensity < 1.0 )
+	{
+		D = lerp( beckmannP22( slope, alpha ), D, float( glintIntensity ) );
+	}
+
+	return D * rcpSafe(cos4Theta);
+}
+
+float evaluateGlintsBRDF(
+	in const FragmentState	fs,
+	const vec3				V_t,			// outgoing ray direction
+	const vec3				L_t,			// incident ray dirction
+	const vec3				H_t,			// microfacet normal
+	const float				alpha,			// roughness^2
+	const float				glintAlpha,	// glintRoughness^2
+	inout float				pdf)			// probability density (result)
+{
+	// evaluate glints distribution
+	const float D = evaluateGlintsD( fs, H_t, max( alpha, MIN_GLINTS_ALPHASQR ), max( glintAlpha, MIN_GLINTS_ALPHASQR ) );
+
+	pdf = D * abs( H_t.z ) * rcpSafe( 4 * dot( V_t, H_t ) );
+	return D * beckmannG1VCavity( H_t, V_t ) * beckmannG1VCavity( H_t, L_t ) * rcpSafe( 4.0 * V_t.z * L_t.z );
+}
+
+float evaluateGlintsBTDF(
+	in const FragmentState	fs,
+	const vec3				V_t,			// outgoing ray direction
+	const vec3				L_t,			// incident ray direction
+	const vec3				H_t,			// microfacet normal
+	const float				eta,			// relative index of refraction
+	const float				alpha,			// roughness^2
+	const float				glintAlpha,	// glintRoughness^2
+	inout float				pdf )			// probability density result
+{
+	// pdf calculation for BTDF
+	const float d = eta * dot( H_t, V_t ) + dot( H_t, L_t );
+	const float invd2 = rcpSafe( d * d );
+
+	// evaluate glints distribution
+	const float D = evaluateGlintsD( fs, H_t, max( alpha, MIN_GLINTS_ALPHASQR ), max( glintAlpha, MIN_GLINTS_ALPHASQR ) );
+
+	// divide PDF by the Jacobian of H->L transform
+	pdf = D * abs( H_t.z ) * abs( dot( H_t, L_t ) ) * invd2;
+	return D * beckmannG1VCavity( H_t, V_t.z < 0 ? -V_t : V_t ) * beckmannG1VCavity( H_t, L_t.z < 0 ? -L_t : L_t ) *
+		( abs( dot( H_t, L_t ) * abs( dot( H_t, V_t ) ) ) / ( abs( L_t.z ) * abs( V_t.z ) ) * invd2 );
+}
+
+void precomputeGlintData( 
+	const vec4		glintSettings,	// glint settings
+	const float		r,				// random number
+	inout vec2		st,				// texture coordinates
+	diff2			dUV,			// UV differentials w.r.t screen coordinates
+	inout half3		packedData,		// lod distribution, the total CDF over the cells, min( length( dUVdx ), length( dUVdy ) )
+	inout vec3		packedEwaCoeff,	// elliptical weighted average coefficients (3 coefficients)
+	inout ushort	glintLOD,		// lod level of glint
+	inout int2		s,				// horizontal cells across the ray footprint, integer lod level
+	inout int2		t )				// vertical cells across the ray footprint
+{
+	// calculate minor length of the ellipsoidal axes (dstdx should have the minor length as it's swapped)
+	float minorLength = min( length( dUV.dx ), length( dUV.dy ) );
+	if( minorLength != 0.0 )
+	{
+		// otherwise we have to evaluate the glints BRDF
+		const float lod = max( 0.0, float( N_LEVELS_VIRTUAL_MIPMAP( uDictionaryInfo ) ) - 1.0 + log2( minorLength ) );
+		int intLOD = int( floor( lod ) );
+
+		// we lerp between two adjacent lod levels
+		float lodWeighting = lod - float( intLOD );
+		float lodDistribution = calcLODDistribution( glintSettings.y, intLOD );
+
+		// distribution value less than 0 is undefined
+		if( lodDistribution < 0.0 )
+		{
+			intLOD += abs( floor( lodDistribution ) );
+			lodWeighting = 0.0;
+			lodDistribution = 0.0;
+		}
+
+		float cdfTotal = 0.0f;
+		if( lodDistribution < DICTIONARY_NLEVELS( uDictionaryInfo ) ||
+			(lodDistribution + 1 ) < DICTIONARY_NLEVELS( uDictionaryInfo ))
+		{
+			intLOD = r < lodWeighting ? intLOD + 1 : intLOD;
+			lodDistribution = r < lodWeighting ? lodDistribution + 1 : lodDistribution;
+			
+			const float sizeOfPyramid = float( pyramidSize( intLOD ) ) ;
+			st = ( st * sizeOfPyramid * glintSettings.z ) - vec2( 0.5, 0.5 );
+			dUV.dx *= ( sizeOfPyramid );
+			dUV.dy *= ( sizeOfPyramid );
+			// We then find the elliptical coefficients that bounds the filtering region of EWA filtering
+			packedEwaCoeff.x = float( dUV.dx.y * dUV.dx.y + dUV.dy.y * dUV.dy.y + 1.0 );
+			packedEwaCoeff.y = float( -2.0 * ( dUV.dx.x * dUV.dx.y + dUV.dy.x * dUV.dy.y ) );
+			packedEwaCoeff.z = float( dUV.dx.x * dUV.dx.x + dUV.dy.x * dUV.dy.x + 1.0 );
+			const float invF = rcpSafe( packedEwaCoeff.x * packedEwaCoeff.z - packedEwaCoeff.y * packedEwaCoeff.y * 0.25 );
+			packedEwaCoeff.x *= invF;
+			packedEwaCoeff.y *= invF;
+			packedEwaCoeff.z *= invF;
+
+			// Using these coefficients, we compute the ellipse's (s, t) bounding box in texture space
+			const float det = -packedEwaCoeff.y * packedEwaCoeff.y + 4.0 * packedEwaCoeff.x * packedEwaCoeff.z;
+			const float twoInvDet = 2.0 * rcpSafe( det );
+			const float uSqrt = sqrt( max( 0.0, det * packedEwaCoeff.z ) );
+			const float vSqrt = sqrt( max( 0.0, packedEwaCoeff.x * det ) );
+			// we have to make sure we wrap back to 0 if we exceed the range of short
+			s.x = int( ceil( st[0] - twoInvDet * uSqrt ) );
+			s.y = int( floor( st[0] + twoInvDet * uSqrt ) );
+			t.x = int( ceil( st[1] - twoInvDet * vSqrt ) );
+			t.y = int( floor( st[1] + twoInvDet * vSqrt ) );
+			// iterate to calculate the total cdf we can encounter, then we can normalize
+			// our cdf in the next iteration to sample against the normalized cdf
+			int count = 0;
+			for( int tStep = t.x; tStep <= t.y; ++tStep )
+			{
+				const float tt = float( tStep - st.y );
+				for( int sStep = s.x; sStep <= s.y; ++sStep )
+				{
+					// Compute squared radius and compute the weight if inside ellipse
+					const float ss = float( sStep - st.x );
+					const float r2 = packedEwaCoeff.x * ss * ss + packedEwaCoeff.y * ss * tt + packedEwaCoeff.z * tt * tt;
+					if( r2 < 1 )
+					{
+						// weighting function in EWA algorithm
+						cdfTotal += ( exp( -2.0 * r2 ) - EXP_NEG_2 );
+					}
+					++count;
+					if (count > MAX_GLINTS_SAMPLES)
+					{
+						break;
+					}
+				}
+				if( count > MAX_GLINTS_SAMPLES )
+				{
+					break;
+				}
+			}
+		}
+		glintLOD = ushort( intLOD );
+		packedData = half3( lodDistribution, cdfTotal, minorLength );
+	}
+}
+
+#undef MAX_GLINTS_SAMPLES
+#undef MAX_GLINTS_ANISOTROPY
+#undef EXP_NEG_2
+
+#undef DIFFERENTIAL_DELTA
+
+#undef SZUDZIK_FUNCTION
+
+#undef DICTIONARY_ALPHA
+#undef DICTIONARY_COUNT
+#undef DICTIONARY_NLEVELS
+
+#endif

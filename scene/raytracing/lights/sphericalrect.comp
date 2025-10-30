@@ -1,0 +1,95 @@
+#ifndef MSET_SPHERICALRECT_H
+#define MSET_SPHERICALRECT_H
+
+//spherical rectangle sampling routines
+//based on "An Area-Preserving Parametrization for Spherical Rectangles", Carlos Ureña, Marcos Fajardo, Alan King
+
+struct SphericalRect
+{
+	//local reference basis
+	vec3 Rx, Ry, Rz;
+	//local rectangle coords
+	float x0, y0;
+	float x1, y1;
+	float z0;
+	//misc constants
+	float b0, b1, k;
+	//spherical rect solid angle
+	float S;
+};
+
+SphericalRect createSphericalRect( LightParamsRT lp, vec3 origin )
+{
+	SphericalRect rect;
+	
+	vec3 ex = lp.axisX * lp.size.x * 0.5;
+	vec3 ey = lp.axisY * lp.size.y * 0.5;
+	vec3 s  = lp.position.xyz - ex - ey;
+	vec3 d  = s - origin;
+
+	rect.Rx = lp.axisX;
+	rect.Ry = lp.axisY;
+	rect.Rz = lp.axisZ;
+
+	rect.z0 = dot( d, rect.Rz );
+	HINT_FLATTEN if( rect.z0 > 0.0 )
+	{
+		rect.Rz = -rect.Rz;
+		rect.z0 = -rect.z0;
+	}
+	rect.x0 = dot( d, rect.Rx );
+	rect.y0 = dot( d, rect.Ry );
+	rect.x1 = rect.x0 + lp.size.x;
+	rect.y1 = rect.y0 + lp.size.y;
+
+	vec3 v00 = vec3( rect.x0, rect.y0, rect.z0 );
+	vec3 v01 = vec3( rect.x0, rect.y1, rect.z0 );
+	vec3 v10 = vec3( rect.x1, rect.y0, rect.z0 );
+	vec3 v11 = vec3( rect.x1, rect.y1, rect.z0 );
+
+	vec3 n0  = normalize( cross( v00, v10 ) );
+	vec3 n1  = normalize( cross( v10, v11 ) );
+	vec3 n2  = normalize( cross( v11, v01 ) );
+	vec3 n3  = normalize( cross( v01, v00 ) );
+
+	float g0 = acos( -dot( n0, n1 ) );
+	float g1 = acos( -dot( n1, n2 ) );
+	float g2 = acos( -dot( n2, n3 ) );
+	float g3 = acos( -dot( n3, n0 ) );
+
+	rect.b0  = n0.z;
+	rect.b1  = n2.z;
+	rect.k   = TWOPI - g2 - g3;
+
+	rect.S   = g0 + g1 - rect.k;
+
+	return rect;
+}
+
+vec3 sampleSphericalRect( SphericalRect rect, vec3 origin, vec2 r )
+{
+	float phiu = r.x * rect.S + rect.k;
+	float fu   = ( cos(phiu) * rect.b0 - rect.b1 ) * rcp( sin(phiu) );
+	float cu   = clamp( ( fu > 0.0 ? 1.0 : -1.0 ) * rsqrt( fu*fu + rect.b0*rect.b0 ) , -1.0, 1.0 );
+
+	float xu   = clamp( -cu * rect.z0 * rsqrt( 1.0 - cu*cu ), rect.x0, rect.x1 );
+
+	float d    = sqrt( xu*xu + rect.z0*rect.z0 );
+	float d2   = d * d;
+
+	float h0   = rect.y0 * rsqrt( d2 + rect.y0*rect.y0 );
+	float h1   = rect.y1 * rsqrt( d2 + rect.y1*rect.y1 );
+	float hv   = mix( h0, h1, r.y );
+	float hv2  = hv * hv;
+
+	float yv   = ( hv2 < 1.0-1e-6 ) ? hv * d * rsqrt( 1.0 - hv2 ) : rect.y1;
+
+	return origin + xu * rect.Rx + yv * rect.Ry + rect.z0 * rect.Rz;
+}
+
+float pdfSphericalRect( SphericalRect rect )
+{
+	return rect.S > 0.0 ? rcp( rect.S ) : 0.0;
+}
+
+#endif

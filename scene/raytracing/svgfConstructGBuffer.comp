@@ -1,0 +1,69 @@
+#include "data/shader/common/dispatchSwizzle.comp"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/packed.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/sharedconstants.sh"
+
+uniform uint2 uTargetSize;
+uniform uint  uGBufferMipLevel;
+
+USE_SAMPLER( sSampler );
+// general
+USE_TEXTURE2D( tDepth );
+USE_TEXTURE2D( tNormal );
+USE_TYPEDTEXTURE2D( uint, tRefractionFeature );
+USE_TYPEDTEXTURE2D( uint, tReSTIRBSDFData );
+USE_TEXTURE2DARRAY( tAlbedo );
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tObjectID );
+// specular
+USE_TEXTURE2D( tSpecularFeature );
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tSecondaryNormalObjID );
+// outputs
+USE_LOADSTORE_TEXTURE2D( float, tSVGFGBuffer, 0 );
+USE_LOADSTORE_TEXTURE2D( float, tSVGFSpecularGBuffer, 1 );
+
+ushort loadHashObjID( uint2 coord )
+{
+	const uint2 objID = imageLoad( tObjectID, coord ).xy;
+	ushort h  = hashXOR8( objID.x );
+#ifdef HAS_REFRACTION
+	       h |= hashXOR8( objID.y ) << 8;
+#endif
+	return h;
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID_8x8.xy );
+	if( outputCoord.x >= uTargetSize.x || outputCoord.y >= uTargetSize.y )
+	{
+		return;
+	}
+
+	const vec2 uv = ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize );
+	const float depth = textureWithSamplerLod( tDepth, sSampler, uv, uGBufferMipLevel).x;
+	const vec3 normal = textureWithSamplerLod( tNormal, sSampler, uv, uGBufferMipLevel).xyz;
+	const uint packedNormal = packUnitVectorOct24bit( normalize( normal ) ) & 0xFFFFFF;
+	const float glossiness = texture2DArrayLod( tAlbedo, vec3( uv, HybridAlbedoChannel::HYBRID_ALBEDO_SPECULAR_GLOSSINESS ), 0).w;
+	const float roughness = saturate( 1.0 - glossiness );
+	const float metallicness = texture2DArrayLod( tAlbedo, vec3( uv, HybridAlbedoChannel::HYBRID_ALBEDO_DIFFUSE_METALNESS ), 0 ).w;
+	const uint packedRughness = uint( roughness * 255.0 );
+	const uint packedMetallicness = uint( saturate(metallicness) * 255.0 );
+	// Note: we are assuming  SVGF buffer is 1/2 res, whereas refraction feature is full res, so scale it back up
+	const float refractionDepth = asfloat( imageLoad( tRefractionFeature, outputCoord * 2 ).x );
+	const ushort objIDHash = loadHashObjID( outputCoord * 2 );
+	const uint objIDHashRM = objIDHash | ( packedRughness << 16) | (packedMetallicness << 24);
+	// variance is not [0,1], but in this context, specular ASVGF is already blurring quite a lot with
+	// variance = 0.5, so we should only go between (0, 0.5], clamping happens in filtering as we do not have enough
+	// precision to do it here
+	const float specularBSDFVariance = unpackUnitFloat( imageLoad( tReSTIRBSDFData, outputCoord * 2 ).x >> 16 );
+	const uint specularBSDFVariancePacked = uint( 255.0f * clamp( specularBSDFVariance / 0.5f, 0.0f, 1.0f ) );
+	imageStore( tSVGFGBuffer, outputCoord, vec4( depth, asfloat( uint( specularBSDFVariancePacked << 24 )| packedNormal ), asfloat( objIDHashRM ), refractionDepth ) );
+	// x: reflection ray dist (32bit float), y: reflection direction (octahedral projection 32bit)
+	const vec2 specularFeatures = texture2DLod( tSpecularFeature, uv, uGBufferMipLevel).xy;
+	// x: secondary normal (octahedral projection 32bit), y: secondary hit object id (32bit object id)
+	// Note: we are assuming  SVGF buffer is 1/2 res, whereas secondary normal/object id texture is full res, so scale it back up
+	const vec2 secondayObjIDNormal = asfloat( imageLoad( tSecondaryNormalObjID, outputCoord * 2 ).xy );
+	const uint secondaryObjID = asuint( secondayObjIDNormal.y );
+	imageStore( tSVGFSpecularGBuffer, outputCoord, vec4( specularFeatures.x, asfloat( ( uint( hashXOR8( secondaryObjID ) ) << 24 ) | asuint( specularFeatures.y ) ), 0, 0 ) );
+}

@@ -1,0 +1,39 @@
+#ifndef MSET_BSSRDF_CUBIC_COMP
+#define MSET_BSSRDF_CUBIC_COMP
+
+//solve cubic profile CDF(x, r_max) - xi == 0 using Newton-Rhapson method, for r_max=1
+float findRootCubicProfile( float xi )
+{
+    float x = 0.1; //initial guess (found to work reasonably well)
+    for( int i=0; i<9; ++i ) //needs at most 9 iterations for all xi in [0,1) range
+    {
+        float x2 = x  * x;
+        float x3 = x2 * x;
+        float x4 = x2 * x2;
+        float x5 = x2 * x3;
+
+        float fx  = 10.0*x2 - 20.0*x3 + 15.0*x4 - 4.0*x5 - xi;
+        float dfx = 20.0 * ( x - 3.0*x2 + 3.0*x3 - x4 );
+        if( abs(fx) < 1e-6 || dfx == 0.0 )
+        { break; }
+        x = x - fx/dfx;
+    }
+    return x;
+}
+
+//sample radial cubic profile: (r_max - r)^3
+float sampleCubicProfile( float xi, float r_max, out float h )
+{
+    float r = findRootCubicProfile( xi ) * r_max;
+    h = sqrt( r_max*r_max - r*r );
+    return r;
+}
+
+float pdfCubicProfile( float r, float r_max )
+{   
+    float d = r_max - r;
+    float r_max5 = (r_max * r_max) * (r_max * r_max) * r_max;
+    return (10.0 * (d*d*d)) * (rcp(r_max5) * INVPI);
+}
+
+#endif

@@ -1,0 +1,243 @@
+#ifndef MSET_BSDF_MICROFACET_H
+#define MSET_BSDF_MICROFACET_H
+
+#include "../../../common/util.sh"
+#include "data/shader/mat/fresnel.frag"
+#include "data/shader/mat/microfacetDistribution.frag"
+#include "data/shader/mat/state.comp"
+#include "data/shader/scene/raytracing/common.comp"
+
+// Implementation of VNDF sampling according to the following paper.
+// "Sampling the GGX Distribution of Visible Normals", 2018, Eric Heitz
+// https://jcgt.org/published/0007/04/01/paper.pdf
+// Handles back facing normals correctly
+vec3 sampleVNDF_GGX_t( vec2 r, vec3 V_t, float ax, float ay )
+{
+	// stretch by microfacet roughness
+    vec3 V_h = normalize( vec3( ax * V_t.x, ay * V_t.y, V_t.z ) );
+
+	// Build an orthonormal basis
+	float lengthSquared = V_h.x * V_h.x + V_h.y * V_h.y;
+	vec3 T1 = ( lengthSquared > 0 ) ? vec3( -V_h.y, V_h.x, 0 ) * rsqrt( lengthSquared ) : vec3( 1, 0, 0 );
+	vec3 T2 = cross( V_h, T1 );
+
+	// Sample point with polar coords
+	float radius = sqrt( r.x );
+	float phi = TWOPI * r.y;
+	float p1 = radius * cos( phi );
+	float p2 = radius * sin( phi );
+	float s = 0.5 * ( 1.0 + V_h.z );
+
+	p2 = mix( sqrt( 1.0 - p1 * p1 ), p2, s );
+
+	// compute normal
+	vec3 N_h = p1 * T1 + p2 * T2 + sqrt( max( 0.0, 1.0 - p1*p1 - p2*p2 ) ) * V_h;
+
+	// unstrech
+	return normalize( vec3( ax * N_h.x, ay * N_h.y, max( 0.0, N_h.z ) ) );
+}
+
+//evaluate GGX BRDF weight
+void evaluateBRDF_GGX(	inout SampleState s,
+						vec3 reflectivity, vec3 fresnel,
+						float alpha, float HdotV, float eta, 
+						float bsdfWeight, float pdfWeight )
+{
+	vec3  Fout  = fresnelSchlick( reflectivity, fresnel, HdotV, eta );
+	if( isReflection(s) )
+	{
+		float alpha2 = max( alpha * alpha, GGX_MIN_ALPHASQR );
+		float NdotH  = dot( s.basis.N, s.H );
+		float HdotL  = dot( s.H, s.L );
+
+		float D		 = NDF_GGX( NdotH, alpha2 );
+		float G1	 = G1Smith_GGX( s.NdotV, alpha2 );
+		float G2	 = 0.5 * G2Smith_GGX( HdotL, HdotV, alpha2 );
+
+		// PDF divided by the Jacobian of H->L transform - the HdotV simplifies
+		float pdf = G1 * D;
+		pdf *= 0.25 * rcp( abs( s.NdotV ) );
+
+		if( G2 > 0.0 && pdf > 0.0 )
+		{
+			s.bsdf += ( s.Tin * s.Tout ) * ( Fout * D * G2 ) * s.NdotL * bsdfWeight;
+			s.pdf  += pdf * pdfWeight;
+		}
+		s.Tin *= oneminus( fresnelSchlick( reflectivity, fresnel, HdotL, eta ) );
+	}
+	//TODO: Use rough transmittance for throughput instead. ~ms
+	s.Tout *= oneminus( Fout );
+}
+
+//evaluate anisotropic GGX BRDF weight
+void evaluateBRDF_AnisoGGX(	inout SampleState s,
+							vec3 reflectivity, vec3 fresnel, float eta,
+							float alpha, float ax, float ay, float HdotV,
+							vec3 microTangent, vec3 microBitangent,
+							float bsdfWeight, float pdfWeight )
+{
+	vec3  Fout  = fresnelSchlick( reflectivity, fresnel, HdotV, eta );
+	if( isReflection(s) )
+	{
+		float alpha2 = max( alpha * alpha, GGX_MIN_ALPHASQR );
+		float NdotH  = dot( s.basis.N, s.H );
+		float HdotL  = dot( s.H, s.L );
+
+		float G1	 = G1Smith_GGX( s.NdotV, alpha2 );
+		float G2	 = 0.5 * G2Smith_GGX( HdotL, HdotV, alpha2 );
+		float D;
+		{
+			ax = max( ax, GGX_MIN_ALPHAXY );
+			ay = max( ay, GGX_MIN_ALPHAXY );
+			float xfactor = dot( microTangent, s.H ) / ax;
+			float yfactor = dot( microBitangent, s.H ) / ay;
+			float d = xfactor*xfactor + yfactor*yfactor + NdotH*NdotH;
+			D = rcp( PI * ax * ay * d * d );
+		}
+
+		// PDF divided by the Jacobian of H->L transform - the HdotV simplifies
+		float pdf = G1 * D;
+		pdf *= 0.25 * rcp( abs( s.NdotV ) );
+
+		if( G2 > 0.0 && pdf > 0.0 )
+		{
+			s.bsdf += ( s.Tin * s.Tout ) * ( Fout * D * G2 ) * s.NdotL * bsdfWeight;
+			s.pdf  += pdf * pdfWeight;
+		}
+		s.Tin *= oneminus( fresnelSchlick( reflectivity, fresnel, HdotL, eta ) );
+	}
+	//TODO: Use rough transmittance for throughput instead. ~ms
+	s.Tout *= oneminus( Fout );
+}
+
+//evaluate GGX BTDF weight
+void evaluateBTDF_GGX( inout SampleState s,
+					   vec3 transmissivity, float alpha, float eta )
+{
+	if( isTransmission(s) )
+	{
+		float alpha2 = max( alpha * alpha, GGX_MIN_ALPHASQR );
+		float eta2	 = eta * eta;
+
+		float HdotL  = dot( s.H, s.L );
+		float HdotV  = dot( s.H, s.V );
+		float NdotH	 = dot( s.basis.N, s.H );
+
+		vec3  Tout   = s.Tout * transmissivity;
+		float D		 = NDF_GGX( NdotH, alpha2 );
+		float G1	 = G1Smith_GGX( s.NdotV, alpha2 );
+		float G2	 = 2.0 * G2Smith_GGX( s.NdotL, s.NdotV, alpha2 );
+
+		// PDF
+		float pdf = G1 * D * abs( HdotV );
+		pdf *= rcp( abs( s.NdotV ) );
+
+		// divide PDF by the Jacobian of H->L transform
+		float d	 	 = HdotL + eta * HdotV;
+		float invd2  = rcpSafe( d * d );
+		pdf *= eta2 * abs(HdotL) * invd2;
+
+		if( G2 > 0.0 && pdf > 0.0 )
+		{
+			s.bsdf += eta2 * ( Tout * D * G2 ) * ( abs( HdotL * HdotV ) * invd2 ) * abs(s.NdotL);
+			s.pdf  += pdf * s.transmissionWeight;
+		}
+	}
+}
+
+//evaluate anisotropic GGX BTDF weight
+void evaluateBTDF_AnisoGGX( inout SampleState s,
+							vec3 transmissivity, float eta,
+							float alpha, float ax, float ay,
+							vec3 microTangent, vec3 microBitangent )
+{
+	if( isTransmission(s) )
+	{		
+		float alpha2 = max( alpha * alpha, GGX_MIN_ALPHASQR );
+		float eta2	 = eta * eta;
+
+		float HdotL  = dot( s.H, s.L );
+		float HdotV  = dot( s.H, s.V );
+		float NdotH	 = dot( s.basis.N, s.H );
+
+		vec3  Tout   = s.Tout * transmissivity;
+		float G1	 = G1Smith_GGX( s.NdotV, alpha2 );
+		float G2	 = 2.0 * G2Smith_GGX( s.NdotL, s.NdotV, alpha2 );
+		float D;
+		{
+			ax = max( ax, GGX_MIN_ALPHAXY );
+			ay = max( ay, GGX_MIN_ALPHAXY );
+			float xfactor = dot( microTangent, s.H ) / ax;
+			float yfactor = dot( microBitangent, s.H ) / ay;
+			float d = xfactor*xfactor + yfactor*yfactor + NdotH*NdotH;
+			D = NdotH > 0.0 ? rcp( PI * ax * ay * d * d ) : 0.0;
+		}
+
+		// PDF
+		float pdf = G1 * D * abs( HdotV );
+		pdf *= rcp( abs( s.NdotV ) );
+
+		// divide PDF by the Jacobian of H->L transform
+		float d	 	 = HdotL + eta * HdotV;
+		float invd2  = rcpSafe( d * d );
+		pdf *= eta2 * abs(HdotL) * invd2;
+
+		if( G2 > 0.0 && pdf > 0.0 )
+		{
+			s.bsdf += eta2 * ( Tout * D * G2 ) * ( abs( HdotL * HdotV ) * invd2 ) * abs(s.NdotL);
+			s.pdf  += pdf * s.transmissionWeight;
+		}
+	}
+}
+
+//importance sample GGX BRDF direction
+void sampleBRDF_GGX( inout SampleState s, float alpha )
+{
+	vec3 V_t = transformVecTo( s.basis, s.V );
+	vec3 H_t = sampleVNDF_GGX_t( s.r.xy, V_t, alpha, alpha );
+	s.H		= transformVecFrom( s.basis, H_t );
+	s.L		= reflectVec( s.V, s.H );
+	s.NdotL	= dot( s.basis.N, s.L );
+}
+
+//importance sample anisotropic GGX BRDF direction
+void sampleBRDF_AnisoGGX(	inout SampleState s,
+							float ax, float ay,
+							vec3 microTangent, vec3 microBitangent )
+{
+	vec3 V_t = transformVecTo( s.basis, s.V );
+	vec3 H_t = sampleVNDF_GGX_t( s.r.xy, V_t, ax, ay );
+	s.H		 = normalize( H_t.x * microTangent + H_t.y * microBitangent + H_t.z * s.basis.N );;
+	s.L		 = reflectVec( s.V, s.H );
+	s.NdotL	 = dot( s.basis.N, s.L );
+}
+
+//importance sample GGX BTDF direction
+void sampleBTDF_GGX( inout SampleState s, float alpha, float eta )
+{
+	vec3 V_t = transformVecTo( s.basis, s.V );
+	vec3 H_t = sampleVNDF_GGX_t( s.r.xy, V_t, alpha, alpha );
+	vec3 H	 = transformVecFrom( s.basis, H_t );
+	if( refractVec( s.V, H, eta, s.L ) )
+	{
+		s.H		= H;
+		s.NdotL = dot( s.basis.N, s.L );
+	}
+}
+
+//importance sample anisotropic GGX BTDF direction
+void sampleBTDF_AnisoGGX(	inout SampleState s,
+							float ax, float ay, float eta,
+							vec3 microTangent, vec3 microBitangent )
+{
+	vec3 V_t = transformVecTo( s.basis, s.V );
+	vec3 H_t = sampleVNDF_GGX_t( s.r.xy, V_t, ax, ay );
+	vec3 H = normalize( H_t.x * microTangent + H_t.y * microBitangent + H_t.z * s.basis.N );
+	if( refractVec( s.V, H, eta, s.L ) )
+	{
+		s.H		= H;
+		s.NdotL = dot( s.basis.N, s.L );
+	}
+}
+
+#endif

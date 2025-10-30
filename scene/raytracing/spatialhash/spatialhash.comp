@@ -1,0 +1,253 @@
+#ifndef MSET_SPATIAL_HASH_H
+#define MSET_SPATIAL_HASH_H
+
+#include "data/shader/common/rng.comp"
+
+uniform float uRadianceCacheAperture;
+uniform float uRadianceCacheCellScale;
+uniform float uSceneBBoxRadius;
+uniform uint  uSpatialHashDecayThreshold;
+uniform uint  uRadianceCacheEntryCount;
+
+#define LINEAR_PROBE_ENTRY_COUNT 4
+
+uint checkSumHash( 
+	const uint input )
+{
+	const uint state = input * 747796405u + 2891336453u;
+	const uint word = ( ( state >> ( ( state >> 28u ) + 4u ) ) ^ state ) * 277803737u;
+	return ( word >> 22u ) ^ word;
+}
+
+// compute camera based discretization cell size
+float computeDiscretization(
+	const vec3 position,
+	const vec2 resolution,
+	const float distFromCamera)
+{
+	const float cellSizeStep = max( distFromCamera * 16.0f / uRadianceCacheCellScale, 0.1f );
+	const uint	logStepMultiplier = uint( log2( 1e3f * cellSizeStep ) );
+	const float hitCellSize = 1e-3f * exp2( float( logStepMultiplier ) );
+	return hitCellSize;
+}
+
+// compute spatial hashing index
+template<bool discretizationRandom>
+uint2 computeSpatialHashIdx(
+	vec3		position,
+	vec3		normal,
+	const vec3	u,
+	const vec3	u2,
+	const float discretization )
+{
+	// add randomization to position
+	position += ( ( u * 2.0f - 1.0f ) * ( discretizationRandom ? discretization : 0.0f ) );
+
+	const uint x = asuint( int( position.x / discretization ) );
+	const uint y = asuint( int( position.y / discretization ) );
+	const uint z = asuint( int( position.z / discretization ) );
+	uint hash1 = hashWang( hashWang( hashWang( x ) + y ) + z );
+
+	const int normalDiscretization = 3;
+	normal += ( ( u2 * 2.0f - 1.0f ) * 1e-2f );
+	normal = normalize( normal );
+	normal = normal * 0.5f + 0.5f;
+	normal = normalize( normal );
+	normal *= normalDiscretization;
+	normal = floor( normal );
+	hash1 = checkSumHash( uint( normal.x ) + hash1 );
+	hash1 = checkSumHash( uint( normal.y ) + hash1 );
+	hash1 = checkSumHash( uint( normal.z ) + hash1 );
+	
+	uint hash2 = checkSumHash( checkSumHash( checkSumHash( x ) + y ) + z );
+	hash2 = checkSumHash( uint( normal.x ) + hash2 );
+	hash2 = checkSumHash( uint( normal.y ) + hash2 );
+	hash2 = checkSumHash( uint( normal.z ) + hash2 );
+
+	return uint2( hash1 % uRadianceCacheEntryCount, hash2 );
+}
+
+#if( defined( INTERLOCKED_SPATIAL_HASH_CHECKSUM ) || defined( SPATIAL_HASH_CHECKSUM ) )
+
+// find the actual cell index
+uint findCellIdx(
+	const vec3	position,
+	const vec3	normal,
+	const vec3	u,
+	const vec3	u2,
+	const vec2	resolution,
+	const float distFromCamera,
+	out uint	checkSum )
+{
+	const float swd = computeDiscretization( position, resolution, distFromCamera );
+	// compute hash index and check sum
+	const uint2 hashes = computeSpatialHashIdx<true>( position, normal, u, u2, swd );
+	checkSum = hashes.y;
+
+	// linear probe
+	int searchIdx = 0;
+	for( searchIdx = 0; searchIdx < LINEAR_PROBE_ENTRY_COUNT; ++searchIdx )
+	{
+		// each cell has 32 entries
+		const uint idx = searchIdx + hashes.x * LINEAR_PROBE_ENTRY_COUNT;
+		uint	   prevCheckSum;
+	#if defined( INTERLOCKED_SPATIAL_HASH_CHECKSUM )
+		interlockedCompareExchange( INTERLOCKED_SPATIAL_HASH_CHECKSUM, idx, 0, checkSum, prevCheckSum );
+	#elif defined( SPATIAL_HASH_CHECKSUM )
+		prevCheckSum = SPATIAL_HASH_CHECKSUM[idx];
+	#endif
+
+		if( ( prevCheckSum == 0 ) ||
+			( prevCheckSum == checkSum ) )
+		{
+			break;
+		}
+	}
+
+	if( searchIdx == LINEAR_PROBE_ENTRY_COUNT )
+	{
+		return ~uint( 0 );
+	}
+	else
+	{
+		return searchIdx + hashes.x * LINEAR_PROBE_ENTRY_COUNT;
+	}
+}
+	#ifdef SPATIAL_HASH_RADIANCE_CACHE
+		// find the actual cell index
+		vec3 getRadiance(
+			const vec3	position,
+			const vec3	normal,
+			const vec3	u,
+			const vec3	u2,
+			const vec2	resolution,
+			const float distFromCamera,
+			out int     entryAccumulatedCount,
+			out bool    foundCacheEntry)
+		{
+			entryAccumulatedCount = 0;
+			foundCacheEntry = false;
+			const float swd = computeDiscretization( position, resolution, distFromCamera );
+			// compute hash index and check sum
+			const uint2 hashes = computeSpatialHashIdx<true>( position, normal, u, u2, swd );
+			const uint	checkSum = hashes.y;
+			// linear probe
+			int			searchIdx = 0;
+			for( searchIdx = 0; searchIdx < LINEAR_PROBE_ENTRY_COUNT; ++searchIdx )
+			{
+				// each cell has 32 entries
+				const uint idx = searchIdx + hashes.x * LINEAR_PROBE_ENTRY_COUNT;
+			#if defined( INTERLOCKED_SPATIAL_HASH_CHECKSUM )
+				const uint prevCheckSum = interlockedLoad( INTERLOCKED_SPATIAL_HASH_CHECKSUM, idx );
+			#elif defined( SPATIAL_HASH_CHECKSUM )
+				const uint prevCheckSum = SPATIAL_HASH_CHECKSUM[idx];
+			#endif
+				if( prevCheckSum == checkSum && ( idx < uRadianceCacheEntryCount * LINEAR_PROBE_ENTRY_COUNT ) )
+				{
+					uint4 data;
+					data.x = SPATIAL_HASH_RADIANCE_CACHE[idx * 4 + 0];
+					data.y = SPATIAL_HASH_RADIANCE_CACHE[idx * 4 + 1];
+					data.z = SPATIAL_HASH_RADIANCE_CACHE[idx * 4 + 2];
+					data.w = SPATIAL_HASH_RADIANCE_CACHE[idx * 4 + 3];
+					const vec3 radiance = vec3(	float( data.x ) * 1e-3f, float( data.y ) * 1e-3f, float( data.z ) * 1e-3f );
+					const uint count = data.w;
+					foundCacheEntry = count > 0;
+					entryAccumulatedCount = count;
+					return count > 0 ? radiance / count : vec3( 0, 0, 0 );
+				}
+			}
+			return vec3( 0, 0, 0 );
+		}
+
+		uint getPrevCheckSum( 
+			const uint idx, 
+			const uint checkSum )
+		{
+			uint	   prevCheckSum;
+		#if defined( INTERLOCKED_SPATIAL_HASH_CHECKSUM )
+			interlockedCompareExchange( INTERLOCKED_SPATIAL_HASH_CHECKSUM, idx, 0, checkSum, prevCheckSum );
+		#elif defined( SPATIAL_HASH_CHECKSUM )
+			prevCheckSum = SPATIAL_HASH_CHECKSUM[idx];
+		#endif
+			return prevCheckSum;
+		}
+
+		void getRadiance(
+			const uint idx,
+			inout vec3 radiance,
+			inout bool foundCacheEntry )
+		{
+			uint4 data;
+			data.x = SPATIAL_HASH_RADIANCE_CACHE[idx * 4 + 0];
+			data.y = SPATIAL_HASH_RADIANCE_CACHE[idx * 4 + 1];
+			data.z = SPATIAL_HASH_RADIANCE_CACHE[idx * 4 + 2];
+			data.w = SPATIAL_HASH_RADIANCE_CACHE[idx * 4 + 3];
+			radiance = vec3( float( data.x ) * 1e-3f, float( data.y ) * 1e-3f, float( data.z ) * 1e-3f );
+			const uint count = data.w;
+			foundCacheEntry = count > 0;
+			radiance = count > 0 ? radiance / count : vec3( 0, 0, 0 );
+		}
+
+		void searchCache(
+			inout int searchIdx, 
+			const uint checkSum, 
+			const uint2 hashes, 
+			inout vec3 foundRadiance,
+			inout bool foundCacheEntry )
+		{
+			for( searchIdx = 0; searchIdx < LINEAR_PROBE_ENTRY_COUNT; ++searchIdx )
+			{
+				// each cell has 32 entries
+				const uint idx = searchIdx + hashes.x * LINEAR_PROBE_ENTRY_COUNT;
+				const uint prevCheckSum = getPrevCheckSum( idx, checkSum );
+
+				if( !foundCacheEntry && ( prevCheckSum == checkSum ) )
+				{
+					getRadiance( idx, foundRadiance, foundCacheEntry );
+				}
+		
+				if( ( prevCheckSum == 0 ) ||
+					( prevCheckSum == checkSum ) )
+				{
+					break;
+				}
+			}
+		}
+
+		uint findCellIdxAndRadiance(
+			const vec3	position,
+			const vec3	normal,
+			const vec3	u,
+			const vec3	u2,
+			const vec2	resolution,
+			const float	distFromCamera,
+			out bool	foundCacheEntry,
+			out vec3	foundRadiance )
+		{
+			const float swd = computeDiscretization( position, resolution, distFromCamera );
+			// compute hash index and check sum
+			const uint2 hashes = computeSpatialHashIdx<true>( position, normal, u, u2, swd );
+			uint checkSum = hashes.y;
+			// linear probe
+			int searchIdx = 0;
+			// found radiance
+			foundCacheEntry = false;
+			foundRadiance = vec3( 0, 0, 0 );
+			// search for radiance entry in the cache
+			searchCache( searchIdx, checkSum, hashes, foundRadiance, foundCacheEntry );
+			// return search index
+			if( searchIdx == LINEAR_PROBE_ENTRY_COUNT )
+			{
+				return ~uint( 0 );
+			}
+			else
+			{
+				return searchIdx + hashes.x * LINEAR_PROBE_ENTRY_COUNT;
+			}
+		}
+	#endif
+#endif
+
+
+#endif
+#undef LINEAR_PROBE_ENTRY_COUNT

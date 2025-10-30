@@ -1,0 +1,199 @@
+#define RESERVOIR_SPECULAR
+
+#include "data/shader/common/ldsamplerHybrid.comp"
+#include "data/shader/common/rngHybrid.comp"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/resampling.comp"
+
+uniform uint uFrameNumber;
+
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tReSTIRBSDFData );
+// initial samples (sample pos and normal), GI only
+USE_TEXTURE2DARRAY_NOSAMPLER( tInitialSamples );
+USE_TEXTURE2DARRAY_NOSAMPLER( tTemporalSamples );
+USE_TEXTURE2DARRAY_NOSAMPLER( tAlbedo );
+
+// resampled samples
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tScratchReservoir, 0 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tScratchSample, 1 );
+#ifdef HYBRID_DEBUG
+USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 2 );
+#endif
+
+bool isSpecularReprojectionValid(
+	const vec2 currentCoord,
+	const vec2 prevCoord,
+	const float roughness )
+{
+	if( !( prevCoord.x >= 0 &&
+		   prevCoord.x < ( uScreenSize.x ) &&
+		   prevCoord.y >= 0 &&
+		   prevCoord.y < ( uScreenSize.y ) ) )
+	{
+		return false;
+	}
+
+	// note: secondary normal is from tracing so it uses the same resolution as the tracing buffer.
+	// regular GBuffer uses the full screen resolution from the viewport.
+	// current coords and prevcoords are in the resolution of tracing buffer, need to scale up for gbuffer.
+	const vec2 currentGBufferCoord = ( currentCoord + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize );
+	const vec2 prevGBufferCoord = ( prevCoord + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize );
+	
+	bool	   isValid = true;
+	// check normal similarity
+	const vec3 currentNormal = sampleNormal( true, uint2( currentGBufferCoord ) ).xyz;
+	const vec3 prevNormal = sampleNormal( false, uint2( prevGBufferCoord ) ).xyz;
+	isValid = dot( currentNormal, prevNormal ) > 0.9030779018f;
+	// check object id
+	const uint currentObjectID = imageLoad( tObjectID, uint2( currentGBufferCoord ) ).x - 1;
+	const uint prevObjectID = imageLoad( tPrevObjectID, uint2( prevGBufferCoord ) ).x - 1;
+	isValid = isValid && ( currentObjectID == prevObjectID );
+	// check position
+	const float currentDepth = abs( imageLoadLod( tDepth, uint2( currentGBufferCoord / ( uGBufferMipLevel + 1) ), uGBufferMipLevel ).x );
+	const float prevDepth = abs( imageLoadLod( tPrevDepth, uint2( prevGBufferCoord  / ( uGBufferMipLevel + 1) ), uGBufferMipLevel ).x );
+	const bool	depthValid = abs( currentDepth - prevDepth ) < ( max( currentDepth, prevDepth ) * 0.1f );
+	isValid = isValid && depthValid;
+	return isValid;
+}
+
+float loadRoughness(
+	const uint2 coord )
+{
+	return max( 0.0f, 1.0f - imageLoadArrayLod( tAlbedo, coord / ( uGBufferMipLevel + 1), HybridAlbedoChannel::HYBRID_ALBEDO_SPECULAR_GLOSSINESS, uGBufferMipLevel ).w );
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+	const uint2 currentGBufferCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize ) );
+
+	// rng
+	const uint4 rngData = rngLoadHybrid( currentGBufferCoord );
+	RNG			rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, rngData.x );
+	// current data
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	// get current reservoir
+	Reservoir res = loadReservoirData<true>( outputCoord );
+	// initial sample with visible point drawn from matHybrid shader so in full resolution unlike others
+	res.visiblePositionNormal = imageLoadArray( tInitialSamples, outputCoord, 0 );
+	res.samplePositionNormal = imageLoadArray( tInitialSamples, outputCoord, 1 );
+	// convert to total weight from average weight
+	res.W = res.W * res.M * res.pdfTarget;
+	
+	// current pos
+	const vec3	currentVisiblePos = res.visiblePositionNormal.xyz;
+	const vec3	currentVisibleNormal = unpackUnitVectorOct( asuint( res.visiblePositionNormal.w ) );
+	const vec3	currentSampleNormal = unpackUnitVectorOct( asuint( res.samplePositionNormal.w ) );
+	const float currentRoughness = loadRoughness( currentGBufferCoord );
+
+	// random number
+	float r = rngNextFloat( rng );
+
+	// calculate previous uv
+	const vec4 motionVectorData = imageLoad( tMotionVector, uint2( currentGBufferCoord ) );
+	const vec2 motionVector = motionVectorData.xy;
+	vec2	   prevCoord = ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) * uInvScreenSize;
+	prevCoord -= motionVector;
+	prevCoord *= vec2( uScreenSize.xy );
+	
+	bool isValid = false;
+	if( ( res.specularBitFlag > 0 ) && isSpecularReprojectionValid( vec2( outputCoord ), vec2( prevCoord ), currentRoughness ) )
+	{
+		isValid = true;
+	}
+
+	bool  foundValidSample = false;
+	if( isValid && uEnabled )
+	{
+		foundValidSample = true;
+
+		const uint prevPixelIdx = prevCoord.y * uScreenSize.x + prevCoord.x;
+		Reservoir  prevRes = loadReservoirData<false>( uint2( prevCoord ) );
+		prevRes.visiblePositionNormal = imageLoadArray( tTemporalSamples, uint2( prevCoord ), 0 );
+		prevRes.samplePositionNormal = imageLoadArray( tTemporalSamples, uint2( prevCoord ), 1 );
+        
+        const bool isValidRes =
+            ( prevRes.visiblePositionNormal.x +
+              prevRes.visiblePositionNormal.y +
+              prevRes.visiblePositionNormal.z +
+              prevRes.visiblePositionNormal.w ) != 0;
+              
+		// prev sample normal
+		if( prevRes.age <= uReSTIRAgeThreshold && isValidRes )
+		{
+			// neighbor positions
+			const vec3 prevVisiblePos = prevRes.visiblePositionNormal.xyz;
+			const vec3 prevSamplePos = prevRes.samplePositionNormal.xyz;
+			// neighbor normal
+			const vec3 prevVisibleNormal = unpackUnitVectorOct( asuint( prevRes.visiblePositionNormal.w ) );
+			const vec3 prevSampleNormal = unpackUnitVectorOct( asuint( prevRes.samplePositionNormal.w ) );
+
+			bool skip = false;
+			if( currentRoughness < 0.3 && ( dot( prevSampleNormal, currentSampleNormal ) < 0.9030779018f ) )
+			{
+				// the sam
+				skip = true;
+			}
+
+			if(!skip)
+			{
+				// calculate target function.
+				vec3		offsetA = currentVisiblePos - prevSamplePos;
+				vec3		offsetB = prevVisiblePos - prevSamplePos;
+			
+				// calculate Jacobian determinant and weight using all the factors
+				const float jacobian = computeJacobian( offsetA, offsetB, res, prevRes );
+				float		newTargetFunc = clamp( calcReservoirTargetPDF( prevRes ) * jacobian, 0.0f, 1e20f );
+
+				// check for directionality
+				if( dot( currentVisibleNormal, normalize( -offsetA ) ) > 0 &&
+					dot( prevSampleNormal, normalize( offsetA ) ) > 0 &&
+					length( prevSampleNormal ) > 0 )
+				{
+					// trace validation ray for bias correction (in reality not using this can lead to all sorts of
+					// light leaking, depending on how scene geometry is laid out)
+					Ray ray;
+					ray.direction = prevSamplePos - currentVisiblePos;
+					ray.origin = currentVisiblePos + currentVisibleNormal * uRayOriginBias;
+					ray.minT = 0.0f;
+					ray.maxT = length( ray.direction ) * 0.99f;
+					ray.direction = normalize( ray.direction );
+
+					RayHit	   hit;
+					RayPayload payload;
+				#if defined( TraceTransparencyDither )
+					payload.rng = rng;
+				#endif
+
+					// shoot ray
+					bool	   isOccluded = traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+					if( isOccluded )
+					{
+						newTargetFunc = 0;
+					}
+					combineReservoir( res, prevRes, r, newTargetFunc );
+				}
+			}
+		}
+	}
+	
+    // calculate new weight
+	const float newTargetFunc = res.pdfTarget;
+	const float weight = res.W * rcpSafe( res.M * newTargetFunc );
+	res.M = clamp( res.M, ushort( 0 ), ushort( 20 ) );
+	res.age++;
+	const uint4 restirData0 = uint4( res.Lradiance, asuint( res.indirectPDF ) );
+	const uint4 restirData1 = uint4( asuint( res.pdfTarget ), asuint( weight ), ( uint( res.M ) << 16 ) | uint( res.age ), res.specularBitFlag );
+	imageStoreArray( tScratchReservoir, uint2( outputCoord ), 0, restirData0 );
+	imageStoreArray( tScratchReservoir, uint2( outputCoord ), 1, restirData1 );
+
+	imageStoreArray( tScratchSample, uint2( outputCoord ), 0, res.visiblePositionNormal );
+	imageStoreArray( tScratchSample, uint2( outputCoord ), 1, res.samplePositionNormal );
+
+}

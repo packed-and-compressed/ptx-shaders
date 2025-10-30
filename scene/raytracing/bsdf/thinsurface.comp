@@ -1,0 +1,88 @@
+#ifndef MSET_BSDF_THINSURFACE_H
+#define MSET_BSDF_THINSURFACE_H
+
+#include "diffuse.comp"
+#include "microfacet.comp"
+
+//Thin Surface BSDF transmission roughness
+//see, "Extending the Disney BRDF to a BSDF with Integrated Subsurface Scattering", figure 15.
+float thinRoughness( float gloss, float eta )
+{
+	float roughness = 1.0 - gloss;
+	return saturate( roughness * (0.65 * rcp(eta) - 0.35) );
+}
+
+void evaluateBTDF_ThinDiffuse( inout SampleState s, vec3 transmissivity, float weight )
+{
+	if( isTransmission(s) )
+	{
+		vec3 Tout = s.Tout * transmissivity;
+		s.bsdf += Tout * INVPI * abs(s.NdotL) * weight;
+		s.pdf  += INVPI * abs(s.NdotL) * weight;
+	}
+}
+
+void evaluateBTDF_ThinGGX( inout SampleState s,
+						   vec3 transmissivity, float alpha, float weight )
+{
+	if( isTransmission(s) )
+	{
+		float alpha2 = max( alpha * alpha, GGX_MIN_ALPHASQR );
+		float HdotV  = dot( s.H, s.V );
+		float NdotH  = dot( s.basis.N, s.H );
+
+		vec3  Tout	 = s.Tout * transmissivity;
+		float D		 = NDF_GGX( NdotH, alpha2 );
+		float G1	 = G1Smith_GGX( s.NdotV, alpha2 );
+		float G2	 = 0.5 * G2Smith_GGX( s.NdotL, s.NdotV, alpha2 );
+
+		// PDF divided by the Jacobian of H->L transform - the HdotV simplifies
+		float pdf = G1 * D;
+		pdf *= 0.25 * rcp( abs( s.NdotV ) );
+
+		if( G2 > 0.0 && pdf > 0.0 )
+		{
+			s.bsdf += ( Tout * D * G2 ) * abs(s.NdotL) * weight;
+			s.pdf  += pdf * s.transmissionWeight * weight;
+		}
+	}
+}
+
+void evaluateBTDF_ThinAnisoGGX(	inout SampleState s,
+								vec3 transmissivity,
+								float alpha, float ax, float ay,
+								vec3 microTangent, vec3 microBitangent,
+								float weight )
+{
+	if( isTransmission(s) )
+	{
+		float alpha2 = max( alpha * alpha, GGX_MIN_ALPHASQR );
+		float HdotV  = dot( s.H, s.V );
+		float NdotH  = dot( s.basis.N, s.H );
+
+		vec3  Tout	 = s.Tout * transmissivity;
+		float G1	 = G1Smith_GGX( s.NdotV, alpha2 );
+		float G2	 = 0.5 * G2Smith_GGX( s.NdotL, s.NdotV, alpha2 );
+		float D;
+		{
+			ax = max( ax, GGX_MIN_ALPHAXY );
+			ay = max( ay, GGX_MIN_ALPHAXY );
+			float xfactor = dot( microTangent, s.H ) / ax;
+			float yfactor = dot( microBitangent, s.H ) / ay;
+			float d = xfactor*xfactor + yfactor*yfactor + NdotH*NdotH;
+			D = NdotH > 0.0 ? rcp( PI * ax * ay * d * d ) : 0.0;
+		}
+
+		// PDF divided by the Jacobian of H->L transform - the HdotV simplifies
+		float pdf = G1 * D;
+		pdf *= 0.25 * rcp( abs( s.NdotV ) );
+
+		if( G2 > 0.0 && pdf > 0.0 )
+		{
+			s.bsdf += ( Tout * D * G2 ) * abs(s.NdotL) * weight;
+			s.pdf  += pdf * s.transmissionWeight * weight;
+		}
+	}
+}
+
+#endif

@@ -1,0 +1,130 @@
+#ifndef MSET_LIGHTS_SKYLIGHT_H
+#define MSET_LIGHTS_SKYLIGHT_H
+
+#include "data/shader/common/util.sh"
+
+USE_TEXTURECUBE(tSkyTexture);
+uniform mat4	uWorldToSkyTransform;
+uniform mat4    uSkyToWorldTransform;
+uniform float   uSkyBrightness;
+
+#ifdef SkyImportanceSampling
+USE_TEXTURE2D_NOSAMPLER(tSkyImportanceMap);
+uniform vec4			uSkyImportanceMapDimensions;
+uniform int2			uSkyImportanceMapLevelRange;
+uniform float			uSkyImportanceInvIntegral;
+
+//hierarchical sample important skybox regions descending down the MIP chain
+vec2 importanceSampleSkyUV( vec2 r, out float pdf )
+{
+	uint2 p = uint2( 0, 0 );
+	for( int level = uSkyImportanceMapLevelRange.y; level >= uSkyImportanceMapLevelRange.x; --level )
+	{
+		p <<= uint2( 1, 1 );
+
+		vec4 imp = vec4(
+			imageLoadLod( tSkyImportanceMap, p.xy, level ).r,
+			imageLoadLodOffset( tSkyImportanceMap, p.xy, level, int2( 0, 1 ) ).r,
+			imageLoadLodOffset( tSkyImportanceMap, p.xy, level, int2( 1, 0 ) ).r,
+			imageLoadLodOffset( tSkyImportanceMap, p.xy, level, int2( 1, 1 ) ).r );
+
+		float left  = imp.x + imp.y;
+		float right = imp.z + imp.w;
+		
+		float pLeft = left / ( left + right );
+		if( r.x < pLeft )
+		{
+			r.x /= pLeft;
+			float pLower = imp.y / left;
+			if( r.y < pLower )
+			{
+				p.y++;
+				r.y /= pLower;
+			}
+			else
+			{
+				r.y = ( r.y - pLower ) / ( 1.0 - pLower );
+			}
+		}
+		else
+		{
+			p.x++;
+			r.x = ( r.x - pLeft ) / ( 1.0 - pLeft );
+			float pLower = imp.w / right;
+			if( r.y < pLower )
+			{
+				p.y++;
+				r.y /= pLower;
+			}
+			else
+			{
+				r.y = ( r.y - pLower ) / ( 1.0 - pLower );
+			}
+		}
+  
+        r = min(r, 1.0 - FLT_EPSILON);
+	}
+	pdf = imageLoadLod( tSkyImportanceMap, p.xy, uSkyImportanceMapLevelRange.x ).r * uSkyImportanceInvIntegral;
+
+	//return sampled spherical coordinates (+jitter with what's left in r.xy)
+	return vec2( p.x + r.x, p.y + r.y ) * uSkyImportanceMapDimensions.zw;
+}
+#endif
+
+void evaluateLight_Sky( inout LightSampleState ls )
+{
+	vec3 L_sky = mulVec( uWorldToSkyTransform, ls.L );
+
+	//map Cartesian direction vector to importance map UVs
+	float theta = atan2( L_sky.z, L_sky.x );
+	float phi   = asin( L_sky.y );
+
+#ifdef SkyImportanceSampling
+	//calculate direction PDF
+	vec2  uv = vec2( mad(INVTWOPI, theta, 0.5), mad(INVPI, phi, 0.5) );
+	uint2 p = uint2( uv * uSkyImportanceMapDimensions.xy );
+	ls.pdf = imageLoadLod( tSkyImportanceMap, p.xy, uSkyImportanceMapLevelRange.x ).r * uSkyImportanceInvIntegral;
+#else
+	//uniform PDF
+	ls.pdf = 1.0;
+#endif
+	
+	//divide PDF by the Jacobian of Cartesian/spherical coordinate mapping
+	float cos_phi = cos(phi);
+	ls.pdf *= ( cos_phi != 0.0 ) ? rcp( 2.0 * PI * PI * cos_phi ) : 0.0;
+	
+	ls.radiance = textureCubeLod( tSkyTexture, L_sky, 0.0 ).rgb * uSkyBrightness;
+	ls.distance = INFINITY;
+}
+
+void sampleLight_Sky( vec2 r, inout LightSampleState ls )
+{
+#ifdef SkyImportanceSampling
+	//importance sample skybox UVs
+	vec2 uv = importanceSampleSkyUV( r, ls.pdf );
+#else
+	//uniform sample skybox UVs
+	vec2 uv = r;
+	ls.pdf = 1.0;
+#endif
+
+	//map sampled UVs to Cartesian direction vector
+	float theta = TWOPI * ( uv.x - 0.5 );
+	float phi = PI * ( uv.y - 0.5 );
+
+	float sin_theta, cos_theta;
+	sincos( theta, sin_theta, cos_theta );
+	float sin_phi, cos_phi;
+	sincos( phi, sin_phi, cos_phi );
+
+	vec3 L_sky = vec3( cos_theta * cos_phi, sin_phi, sin_theta * cos_phi );
+	ls.L = mulVec( uSkyToWorldTransform, L_sky );
+
+	//divide PDF by the Jacobian of Cartesian/spherical coordinate mapping
+	ls.pdf *= ( cos_phi != 0.0 ) ? rcp( 2.0 * PI * PI * cos_phi ) : 0.0;
+
+	ls.radiance = textureCubeLod( tSkyTexture, L_sky, 0.0 ).rgb * uSkyBrightness;
+	ls.distance = INFINITY;
+}
+
+#endif

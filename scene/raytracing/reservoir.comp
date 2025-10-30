@@ -1,0 +1,125 @@
+#ifndef MSET_RESERVOIR_COMP
+#define MSET_RESERVOIR_COMP
+
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/mat/state.comp"
+#include "buffers.comp"
+
+struct Reservoir
+{
+	uint3  Lradiance;
+	float  distance;
+	float  pdfTarget;
+	float  W;
+	ushort M;
+	ushort age;
+#if defined( RESERVOIR_GI ) || defined( RESERVOIR_SPECULAR )
+	vec4  visiblePositionNormal;
+	vec4  samplePositionNormal;
+	float indirectPDF;
+#else
+	int   lightIdx;
+#endif
+
+#if defined( RESERVOIR_SPECULAR )
+	uint  specularBitFlag;
+#elif defined( RESERVOIR_GI )
+	// first bounce RT_PATHFLAG_DIFFUSE | RT_PATHFLAG_NONSPECULAR | RT_PATHFLAG_TRANSMISSION
+	// and transmission weight in lower 16 bit
+	uint  pathFlagAndTransmissionWeight;
+#endif
+};
+
+Reservoir newReservoir()
+{
+	Reservoir res;
+	res.Lradiance = uint3( 0, 0, 0 );
+	res.distance  = 0.0;
+	res.pdfTarget = 0.0;
+	res.W = 0.0;
+	res.M = 0;
+	res.age = 0;
+#if defined( RESERVOIR_GI ) || defined( RESERVOIR_SPECULAR )
+	res.visiblePositionNormal = vec4( 0, 0, 0, 0 );
+	res.samplePositionNormal = vec4( 0, 0, 0, 0 );
+	res.indirectPDF = 0.0f;
+#else
+	res.lightIdx = -1;
+#endif
+	
+#if defined( RESERVOIR_SPECULAR )
+	res.specularBitFlag = 0;
+#elif defined( RESERVOIR_GI )
+	res.pathFlagAndTransmissionWeight = 0;
+#endif
+	return res;
+}
+
+float calcReservoirTargetPDF( in Reservoir res )
+{
+	LightSampleState ls;
+	unpackVec2x3f( res.Lradiance, ls.L, ls.radiance );
+	return luminance( ls.radiance );
+}
+
+bool updateReservoir( inout Reservoir res, float r, LightSampleState ls, int lightIdx, float pdfTarget, float pdfSource )
+{
+	float weight = pdfTarget * rcpSafe( pdfSource );
+	res.W += weight;
+	res.M = clamp( res.M + 1, 0, 65534 );
+	if( r * res.W < weight )
+	{
+		res.Lradiance = packVec2x3f( ls.L, ls.radiance );
+		res.distance  = ls.distance;
+		res.pdfTarget = pdfTarget;
+#if !defined( RESERVOIR_GI ) && !defined( RESERVOIR_SPECULAR )
+		res.lightIdx = lightIdx;
+#endif
+		return true;
+	}
+	return false;
+}
+
+bool combineReservoir( inout Reservoir res, in Reservoir neighbor, inout float r, float pdfTarget )
+{
+	float weight = pdfTarget * neighbor.W * neighbor.M;
+	res.W += weight;
+	res.M = clamp( res.M + neighbor.M, 0, 65534 );
+	float acceptanceRatio = weight * rcpSafe( res.W );
+	if( r < acceptanceRatio )
+	{
+		res.Lradiance = neighbor.Lradiance;
+		res.distance = neighbor.distance;
+		res.pdfTarget = pdfTarget;
+		res.age = neighbor.age;
+#if defined( RESERVOIR_GI ) || defined( RESERVOIR_SPECULAR )
+		res.samplePositionNormal = neighbor.samplePositionNormal;
+#else
+		res.lightIdx = neighbor.lightIdx;
+#endif
+		r = r * rcpSafe( acceptanceRatio );
+		return true;
+	}
+	else
+	{
+		r = ( r - acceptanceRatio ) * rcpSafe( 1 - acceptanceRatio );
+		return false;
+	}
+}
+
+LightSampleState finalizeReservoir( inout Reservoir res )
+{
+	float W = rcpSafe( res.pdfTarget * res.M ) * res.W;
+	// reweight the radiance based on the reservoir sampled:
+	// convert from total weight across all sampled reservoir to average weight
+	LightSampleState ls;
+	unpackVec2x3f( res.Lradiance, ls.L, ls.radiance );
+	ls.radiance *= W;
+	ls.distance  = res.distance;
+	// update reservoir to the final radiance
+	res.Lradiance = packVec2x3f( ls.L, ls.radiance );
+	return ls;
+}
+
+#endif

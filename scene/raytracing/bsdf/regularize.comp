@@ -1,0 +1,45 @@
+#ifndef MSET_BSDF_REGULARIZE_H
+#define MSET_BSDF_REGULARIZE_H
+
+uniform float uGGXRegularizeThresholdLow;
+
+bool isSpecularGGX( float alpha )
+{
+	return alpha <= 0.25;
+}
+
+void regularizeGGX( inout float alpha )
+{
+	HINT_FLATTEN if( alpha <= 0.3 )
+	{
+		alpha = clamp( 2.0 * alpha, uGGXRegularizeThresholdLow, 0.3 );
+	}
+}
+
+void regularizeAnisoGGX( inout float alpha, inout float ax, inout float ay )
+{
+	HINT_FLATTEN if( alpha <= 0.3 )
+	{
+		alpha = clamp( 2.0 * alpha, uGGXRegularizeThresholdLow, 0.3 );
+	}
+	HINT_FLATTEN if( ax <= 0.3 )
+	{
+		ax = clamp( 2.0 * ax, uGGXRegularizeThresholdLow, 0.3 );
+	}
+	HINT_FLATTEN if( ay <= 0.3 )
+	{
+		ay = clamp( 2.0 * ax, uGGXRegularizeThresholdLow, 0.3 );
+	}
+}
+
+void regularizeAnisoGGX( inout vec3 alpha )
+{
+	//MSL forbids binding inout params to vector elements so we have to do this :< ~ms
+	float ax = alpha.x;
+	float ay = alpha.y;
+	float az = alpha.z;
+	regularizeAnisoGGX( az, ax, ay );
+	alpha = vec3( ax, ay, az );
+}
+
+#endif

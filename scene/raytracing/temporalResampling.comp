@@ -1,0 +1,96 @@
+#include "data/shader/common/ldsamplerHybrid.comp"
+#include "data/shader/common/rngHybrid.comp"
+#include "data/shader/mat/state.comp"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/resampling.comp"
+#include "data/shader/scene/raytracing/lights/distantlight.comp"
+#include "data/shader/scene/raytracing/lights/pointlight.comp"
+#include "data/shader/scene/raytracing/lights/skylight.comp"
+
+uniform uint uFrameNumber;
+
+USE_TEXTURE2DARRAY( tReSTIRSample );// temp texture with position and shadow catcher flag
+
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tTemporalResampled, 0 );
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 1 );
+#endif
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+	// rng
+	const uint4 rngData = rngLoadHybrid( outputCoord );
+	RNG			rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, rngData.x );
+	// current data
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	// get some current pixel data
+	const vec4	restirSampleData = imageLoadArray( tReSTIRSample, outputCoord, 0 );
+	const vec3	currentPos = restirSampleData.xyz;
+	const bool	isShadowCatcher = ( asuint( restirSampleData.w ) & RT_RAYFLAG_SHADOWCATCHER ) > 0;
+	const bool	allowSkySampling = ( asuint( restirSampleData.w ) & HYBRID_PATH_ALLOW_SKY_SAMPLE ) > 0;
+
+	Reservoir res = loadReservoirData<true>( outputCoord );
+	// convert to total weight from average weight
+	res.W = res.W * res.M * res.pdfTarget;
+
+	// random number;
+	float		r = rngNextFloat( rng );
+	const vec3	currentNormal = sampleNormal( true, uint2( outputCoord ) ).xyz;
+
+    // calculate previous uv
+	const vec4	motionVectorData = imageLoad( tMotionVector, outputCoord );
+	const vec2	motionVector = motionVectorData.xy;
+	vec2		prevCoord = ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) * uInvScreenSize;
+	prevCoord -= motionVector;
+	prevCoord *= vec2( uScreenSize.xy );
+	// we do not resampling with shadow catcher
+	const bool isValid = !isShadowCatcher && isReprojectionValid( vec2( outputCoord ), prevCoord );
+	if( isValid && uEnabled && uReSTIRAgeThreshold > 0 )
+	{
+		Reservoir prevRes = loadReservoirData<false>( uint2( prevCoord ) );
+
+		// calculate new target pdf
+		float	  newTargetPdf = calcReservoirTargetPDF( prevRes );
+		if( prevRes.age <= uReSTIRAgeThreshold && prevRes.M > 0 )
+		{
+			// setup validation ray
+			vec3 rayDir, dummy;
+			unpackVec2x3f( prevRes.Lradiance, rayDir, dummy );
+			Ray ray;
+			ray.origin = currentPos + currentNormal * uRayOriginBias;
+			ray.direction = normalize( rayDir );
+			ray.maxT = prevRes.distance;
+			// trace
+			RayHit	   hit;
+			RayPayload payload;
+		#if defined( TraceTransparencyDither )
+			payload.rng = rng;
+		#endif
+	
+			ray.minT = 0.0f;
+			bool isOccluded = ray.maxT > 0.0f ? traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit ) : false;
+			// check visibility, if not visible then the target pdf is 0
+			if( isOccluded )
+			{
+				newTargetPdf = 0;
+			}
+
+			combineReservoir( res, prevRes, r, newTargetPdf );
+		}
+	}
+	const float	newTargetFunc = calcReservoirTargetPDF( res );
+	const float	weight = res.W * rcpSafe( newTargetFunc * res.M );
+	res.M = clamp( res.M, ushort( 0 ), ushort( 20 ) );
+	res.age++;
+
+	const uint4 restirData0 = uint4( res.Lradiance, asuint( res.distance ) );
+	const uint4 restirData1 = uint4( asuint( res.pdfTarget ), asuint( weight ), ( uint( res.M ) << 16 ) | uint( res.age ), asuint( res.lightIdx ) );
+	imageStoreArray( tTemporalResampled, outputCoord, 0, restirData0 );
+	imageStoreArray( tTemporalResampled, outputCoord, 1, restirData1 );
+}

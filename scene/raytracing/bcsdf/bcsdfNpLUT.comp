@@ -1,0 +1,58 @@
+#include "bcsdfChiang.comp"
+#include "data/shader/common/const.sh"
+
+#define BCSDF_LUT_DIMENSION (64)
+#define BCSDF_NUM_SAMPLES (256)
+#define BCSDF_DH (1.0 / float(BCSDF_NUM_SAMPLES - 1))
+
+USE_LOADSTORE_TEXTURE3D(float, tLUT, 0);
+
+float calculateEtaPrime( float ior, float cosThetaO )
+{
+    const float sinThetaO = sqrt( 1.0 - cosThetaO * cosThetaO );
+    return sqrt( ior * ior - sinThetaO * sinThetaO ) / cosThetaO;
+}
+
+// Np scattering LUT, parameterized by:
+// x: phi
+// y: cosThetaO
+// z: beta_n
+COMPUTE(8, 8, 8)
+{
+    const vec3 uvw = vec3(DISPATCH_THREAD_ID + 0.5) / vec3(BCSDF_LUT_DIMENSION, BCSDF_LUT_DIMENSION, BCSDF_LUT_DIMENSION);
+
+    const float phi = FOURPI * uvw.x - TWOPI; // Remap 0..1 -> -2PI..2PI
+    const float etap = calculateEtaPrime(1.55, uvw.y); // Fixed IOR of 1.55
+    const float s = logisticScale( clamp( uvw.z, 0.01, 1.0 ) );
+
+    vec3 N = vec3(0.0, 0.0, 0.0);
+
+    // Integrate over the fiber width
+    for (uint i = 0; i < BCSDF_NUM_SAMPLES; ++i)
+    {
+        const float h = -1.0 + 2.0 * i * BCSDF_DH; // Remap t from 0..1 -> -1..1
+
+        const float sinGammaT = h / etap;
+	    const float	gammaT = asinSafe( sinGammaT );
+	    const float	gammaO = asinSafe( h );
+
+        const float N_R   = azimuthalScattering( phi, 0, s, gammaO, gammaT );
+        const float N_TT  = azimuthalScattering( phi, 1, s, gammaO, gammaT );
+        const float N_TRT = azimuthalScattering( phi, 2, s, gammaO, gammaT );
+        N += vec3( N_R, N_TT, N_TRT ) * BCSDF_DH;
+    }
+    N *= 0.5;
+
+    // Flip the image vertically
+    uint3 coord = uint3(DISPATCH_THREAD_ID.x, BCSDF_LUT_DIMENSION - 1 - DISPATCH_THREAD_ID.y, DISPATCH_THREAD_ID.z);
+    imageStore(tLUT, coord, vec4(N, 1.0));
+}
+
+//USE_TEXTURE3D(tNpLUT);
+//vec3 loadNpLUT( float phi, float cosThetaO, float beta_n )
+//{
+//    const float x = (phi + TWOPI) / FOURPI;
+//    const float y = cosThetaO;
+//    const float z = beta_n;
+//    return texture3DLod( tNpLUT, vec3(x, y, z), 0.0 ).rgb;
+//}

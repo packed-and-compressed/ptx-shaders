@@ -1,0 +1,754 @@
+#include "buffers.comp"
+#include "reservoir.comp"
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/mat/hybridConstants.comp"
+
+#ifdef DIRECT_REPROJECTION
+	#define NORMAL_VARIANCE_FACTOR 2.0f
+#elif defined( DIFFUSE_GI_REPROJECTION )
+	#define NORMAL_VARIANCE_FACTOR 4.0f
+#elif defined( SPECULAR_REPROJECTION )
+	#define NORMAL_VARIANCE_FACTOR 1.0f
+#endif
+
+uniform uint2 uScreenSize;
+uniform uint2 uGBufferSize;
+uniform vec2  uInvScreenSize;
+uniform vec2  uMinAlpha;
+
+uniform uint  uFrameIndex;
+uniform float uTemporalDampening;	// default: 0.5f, this gives more weight to previous accumulated radiance
+uniform float uSampleThreshold;		// default: 24, specifies the end sample where we use more current samples
+uniform float uMaxAlpha;			// default: 0.9, 90% current sample, 10% previous sample
+uniform float uMinTemporalAlpha;
+			
+uniform vec4  uUnproject;			// { -2/proj[0][0], -2/proj[1][1], (1-proj[2][0])/proj[0][0], (1-proj[2][1])/proj[1][1] }
+uniform vec4  uPrevUnproject;		// { -2/proj[0][0], -2/proj[1][1], (1-proj[2][0])/proj[0][0], (1-proj[2][1])/proj[1][1] }
+
+uniform mat4  uInvViewMatrix;
+uniform mat4  uPrevInvViewMatrix;
+uniform mat4  uPrevViewProjectionMatrix;
+
+// Reprojected result
+USE_LOADSTORE_TEXTURE2DARRAY( float, tResult, 0 );
+// SVGF results (keeping track of moments and spp)
+USE_LOADSTORE_TEXTURE2DARRAY( float, tSVGFMoments, 1 );
+#ifdef HYBRID_DEBUG
+USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 3 );
+#endif
+
+#ifdef RT_RADIANCE_TEXTURE
+	USE_TEXTURE2DARRAY( tRadiance );
+#else
+	USE_BUFFER( uint2, bRadiance );
+	uniform uint2 uRadianceStride;
+#endif
+
+#ifdef ANTI_LAG
+	USE_TEXTURE2DARRAY( tGradient );
+	uniform int uGradientDownSample;
+#endif
+
+// Previous SVGF
+USE_TEXTURE2DARRAY( tPrevRadiance );
+USE_TEXTURE2DARRAY( tPrevSVGFMoments );
+
+// G-Buffers
+USE_TEXTURE2D( tDepth );
+USE_TEXTURE2D_NOSAMPLER( tNormal );
+USE_TEXTURE2D( tPrevDepth );
+USE_TEXTURE2D_NOSAMPLER( tPrevNormal );
+USE_TEXTURE2DARRAY_NOSAMPLER( tAlbedo );
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tObjectID );
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tPrevObjectID );
+
+USE_TEXTURE2D_NOSAMPLER( tMotionVector );
+#if defined( SPECULAR_REPROJECTION )
+	USE_TYPEDTEXTURE2DARRAY( uint, tReservoir );
+	USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tSecondaryNormalObjID );
+	USE_TEXTURE2D( tSecondaryDifferential );
+	USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tPrevSecondaryNormalObjID );
+	USE_TYPEDTEXTURE2D_NOSAMPLER( float, tSpecularFeature );
+#else
+	uniform uint2 uRefractionGBufferSize;
+#endif
+
+uniform int uOutputChannel;
+
+#ifdef HAS_REFRACTION
+// this pass includes refraction and so we need to make sure we have
+// the object id of the refraction object and the object ID(s) of the objects in the 
+// refraction
+using ObjectID = uint2;
+
+bool objectIDMatch( const ObjectID curr, const ObjectID prev, const bool isGlossy ) 
+{
+	if( curr.y == ~uint(0) || prev.y == ~uint(0) || isGlossy )
+	{
+		return curr.x == prev.x;
+	}
+	return ( curr.x == prev.x ) && ( curr.y == prev.y );
+}
+
+#else
+// general case is we just have the object id of the object itself
+using ObjectID = uint;
+
+bool objectIDMatch( const ObjectID curr, const ObjectID prev, const bool isGlossy ) 
+{
+	return curr == prev;
+}
+
+#endif
+
+#if defined( NEIGHBORHOOD_CLAMPING ) || defined( ANTI_LAG )
+
+#ifdef NEIGHBORHOOD_CLAMPING
+	groupshared half2 gCacheRadiance0[16][16];
+	groupshared half2 gCacheRadiance1[16][16];
+#endif
+#ifdef ANTI_LAG
+	groupshared float gCacheAntilagAlpha[16][16];
+#endif
+
+// only cache radiance for neighborhood clamping when we are doing neighborhood clamping
+void initCache( int2 dispatchThreadId, int2 groupThreadId, int2 res )
+{
+	// load 16x16 region into shared memory using 4 8x8 blocks.
+	const int2  offset[4] = { int2( 0, 0 ), int2( 8, 0 ), int2( 0, 8 ), int2( 8, 8 ) };
+
+	// start in the upper left corner of the 16x16 region.
+	dispatchThreadId -= 4;
+	for( int i = 0; i < 4; ++i )
+	{
+		const int2 threadId = dispatchThreadId + offset[i];
+		const int2 cacheId = groupThreadId + offset[i];
+
+	#ifdef NEIGHBORHOOD_CLAMPING
+		half4 radiance = half4( 0.0, 0.0, 0.0, 0.0 );
+		if( threadId.x >= 0 && threadId.y >= 0 &&
+			threadId.x < res.x && threadId.y < res.y )
+		{
+			radiance = half4( imageLoadArray( tRadiance, uint2( threadId ), uOutputChannel ) );
+		}
+		gCacheRadiance0[cacheId.y][cacheId.x] = half2( radiance.x, radiance.y );
+		gCacheRadiance1[cacheId.y][cacheId.x] = half2( radiance.z, radiance.w );
+	#endif
+
+	#ifdef ANTI_LAG
+		const int2 gradientThreadId = threadId / uGradientDownSample;
+		float antilagAlpha = 0.0;
+		if( gradientThreadId.x >= 0 && gradientThreadId.y >= 0 &&
+			gradientThreadId.x < ( res.x / uGradientDownSample )  && gradientThreadId.y < ( res.y / uGradientDownSample ) )
+		{
+			const vec2	gradientData0 = imageLoadArray( tGradient, uint2( gradientThreadId ), 0 ).xy;
+			antilagAlpha = clamp( float( gradientData0.x ) > 1e-4f ? abs( float( gradientData0.y / gradientData0.x ) ) : 0.0f, 0.0f, 200.0f );
+		}
+		gCacheAntilagAlpha[cacheId.y][cacheId.x] = antilagAlpha;
+	#endif
+	}
+}
+
+#ifdef NEIGHBORHOOD_CLAMPING
+void getNeighborhoodMinMax(
+	const int2  groupCoord,
+	inout vec4	minC,
+	inout vec4	maxC )
+{
+	const int radius = 2;
+	// group thread id
+	for( int row = -radius; row <= radius; ++row )
+	{
+		for( int column = -radius; column <= radius; ++column )
+		{
+			const int2 offset = int2( column, row );
+			const half2 radiance0 = gCacheRadiance0[groupCoord.y + row][groupCoord.x + column];
+			const half2 radiance1 = gCacheRadiance1[groupCoord.y + row][groupCoord.x + column];
+
+			const vec4 c = vec4( radiance0.x, radiance0.y, radiance1.x, radiance1.y );
+			minC = min( minC, c );
+			maxC = max( maxC, c );
+		}
+	}
+}
+#endif
+
+#endif
+
+bool isInsideScreen( const int2 coord )
+{
+	if( ( coord.x >= 0 ) &&
+		( coord.x < int( uScreenSize.x ) ) &&
+		( coord.y >= 0 ) &&
+		( coord.y < int( uScreenSize.y ) ) )
+	{
+		return true;
+	}
+	return false;
+}
+
+
+float sampleDepth( bool isCurrent, uint2 coord )
+{
+	// we normalize depth for temporal reprojection heuristics
+	float depth;
+	if( isCurrent )
+	{
+		depth = imageLoad(tDepth, coord).x;
+	}
+	else
+	{
+		depth = imageLoad( tPrevDepth, coord ).x;
+	}
+	return depth;
+}
+
+
+vec3 sampleNormal( bool isCurrent, uint2 coord )
+{
+	vec3 normal;
+	if( isCurrent )
+	{
+		normal = imageLoad( tNormal, coord ).xyz;
+		normal = mulVec( uInvViewMatrix, normal ).xyz;
+	}
+	else
+	{
+		normal = imageLoad( tPrevNormal, coord ).xyz;
+		normal = mulVec( uPrevInvViewMatrix, normal ).xyz;
+	}
+	return normal;
+}
+
+#ifdef HAS_REFRACTION
+
+uint2 sampleObjID( bool isCurrent, uint2 coord )
+{
+	uint2 objectIds;
+	if( isCurrent )
+	{
+		objectIds = imageLoad( tObjectID, coord ).xy;
+	}
+	else
+	{
+		objectIds = imageLoad( tPrevObjectID, coord ).xy;
+	}
+	return uint2( objectIds.x - 1, objectIds.y - 1 );
+}
+
+#else
+
+uint sampleObjID( bool isCurrent, uint2 coord )
+{
+	uint objectId;
+	if( isCurrent )
+	{
+		objectId = imageLoad( tObjectID, coord ).x;
+	}
+	else
+	{
+		objectId = imageLoad( tPrevObjectID, coord ).x;
+	}
+	return uint( objectId - 1 );
+}
+
+#endif
+
+float loadRoughness(
+	const uint2 coord )
+{
+	return max( 0.0f, 1.0f - imageLoadArray( tAlbedo, coord, HybridAlbedoChannel::HYBRID_ALBEDO_SPECULAR_GLOSSINESS ).w );
+}
+
+#ifdef SPECULAR_REPROJECTION
+
+vec2 hitPositionReproj(
+	const vec2 uv, 
+	const float reflectedRayLength)
+{
+	// view space ray direction
+	vec3		viewSpaceRay;
+	viewSpaceRay.z = texture2DLod( tDepth, uv, 0.0 ).x;
+	viewSpaceRay.xy = viewSpaceRay.z * ( uv * uUnproject.xy + uUnproject.zw );
+
+	const float surfaceDepth = length( viewSpaceRay );
+	const float	rayLength = surfaceDepth + reflectedRayLength;
+
+	viewSpaceRay = normalize( viewSpaceRay );
+	viewSpaceRay *= rayLength;
+
+	const vec3 worldPos = mulPoint( uInvViewMatrix, viewSpaceRay ).xyz;
+	const vec4 clipPos = mulPoint( uPrevViewProjectionMatrix, worldPos );
+	vec2 ndcPos = ( clipPos.xy / clipPos.w );
+	ndcPos = ndcPos * vec2( 0.5f, -0.5f ) + vec2( 0.5f, 0.5f );
+	return ndcPos;
+}
+
+vec2 getReprojectedPrevCoord(
+	const uint2 outputCoord, 
+	const float currentRoughness,
+	const vec2	motionVector,
+	out   bool  useSpecularReproj )
+{
+	const float rayDistance = imageLoad( tSpecularFeature, outputCoord ).x;
+
+	vec2		prevCoord;
+	useSpecularReproj = false;
+	if( currentRoughness < 0.2f && rayDistance > 0.0f  )
+	{
+		const vec2 hitPosReprojectUV = hitPositionReproj( vec2( outputCoord ) * uInvScreenSize, rayDistance );
+        if( hitPosReprojectUV.x >= 0.0f && hitPosReprojectUV.x <= 1.0f && hitPosReprojectUV.y >= 0.0f && hitPosReprojectUV.y <= 1.0f )
+		{
+            prevCoord = hitPosReprojectUV * vec2( uScreenSize.xy );
+			const uint2 secondaryHitData = imageLoad( tSecondaryNormalObjID, outputCoord ).xy;
+			const vec3 secondaryNormal = unpackUnitVectorOct( secondaryHitData.x );
+			const uint secondaryObjID = secondaryHitData.y - 1;
+
+			const uint2 prevSecondaryHitData = imageLoad( tPrevSecondaryNormalObjID, prevCoord ).xy;
+			const vec3 prevSecondaryNormal = unpackUnitVectorOct( prevSecondaryHitData.x );
+			const uint prevSecondaryObjID = prevSecondaryHitData.y - 1;
+
+			const bool normalMatch = max( 0.0f, dot( secondaryNormal, prevSecondaryNormal ) ) > 0.95f;
+			const bool objMatch = secondaryObjID == prevSecondaryObjID;
+			const bool match = normalMatch && objMatch;
+			if( match )
+			{
+				useSpecularReproj = true;
+			}
+		}
+	}
+
+	if( !useSpecularReproj )
+	{
+		// calculate previous uv
+		prevCoord = vec2( outputCoord );
+		prevCoord = prevCoord - motionVector * vec2( uScreenSize.xy );
+	}
+	return prevCoord;
+}
+
+#endif
+
+vec2 getPrevCoord(
+	const uint2	outputCoord,
+	const vec2	motionVector, 
+	const float currentRoughness,
+	inout bool  useSpecularReproj )
+{	
+	useSpecularReproj = false;
+	// calculate previous uv
+#ifdef SPECULAR_REPROJECTION
+	const vec2 prevCoord = getReprojectedPrevCoord( outputCoord, currentRoughness, motionVector, useSpecularReproj );
+#else
+	const vec2 prevCoord = vec2( outputCoord ) - motionVector * vec2( uScreenSize.xy );
+#endif
+	return prevCoord;	
+}
+
+half4 getRadiance(
+	const uint2 outputCoord )
+{
+	// get current pixel
+#ifdef RT_RADIANCE_TEXTURE
+	const half4 radiance = half4( imageLoadArray( tRadiance, outputCoord, uOutputChannel ) );
+#else
+	const uint	offset = uOutputChannel * uRadianceStride.x + outputCoord.y * uRadianceStride.y + outputCoord.x;
+	const half4	radiance = unpackVec4h( bRadiance[offset] );
+#endif
+	return radiance;
+}
+
+half4 getPrevRadiance(
+	const uint2 outputCoord )
+{
+	// get current pixel
+#ifdef RT_RADIANCE_TEXTURE
+	const half4 radiance = half4( imageLoadArray( tPrevRadiance, outputCoord, uOutputChannel ) );
+#else
+	const uint	offset = uOutputChannel * uRadianceStride.x + outputCoord.y * uRadianceStride.y + outputCoord.x;
+	const half4	radiance = unpackVec4h( bPrevRadiance[offset] );
+#endif
+	return radiance;
+}
+
+#ifdef ANTI_LAG
+float getAntiLagAlpha(
+	const int2 groupId )
+{
+	float antilagAlpha = 0.0f;
+	for( int row = -2; row <= 2; row++ )
+	{
+		for( int col = -2; col <= 2; col++ )
+		{
+			const float alpha = gCacheAntilagAlpha[groupId.y + row][groupId.x + col];
+			antilagAlpha = max( antilagAlpha, alpha );
+		}
+	}
+	return antilagAlpha;
+}
+#endif
+
+vec3 computeAlpha(
+	const uint2		currentGBufferCoord, 
+	const uint2		groupCoord,
+	const ObjectID	currentObjID,
+	const float		sppSum,
+	const bool		isValid, 
+	const uint		specularLobeFlag,
+	const float		currentRoughness,
+	const bool		isGlossy,
+	out   bool		calculateNewSpp,
+	out   bool		hasTransmission )
+{
+	hasTransmission = false;
+	calculateNewSpp = false;
+	bool calculateAlpha = true;
+	// increment sample
+	float newSpp = clamp( isValid ? sppSum + 1.0f : 1.0f, 0.0f, 64.0f );
+	// interpolation with previous frame
+	float alpha, momentsAlpha;
+#ifdef ANTI_LAG
+	float antilagAlpha = 0.0f;
+	bool antiLag = isValid;
+	{
+	#if defined( SPECULAR_REPROJECTION )
+		if( ( ( specularLobeFlag & ( HYBRID_GLINTS_FLAG | HYBRID_HAS_SPECULAR_FLAG ) ) == 0 ) )
+		{
+			// we do anti lag for glints all the time, for the general case, we disable antilag for rough materials
+			// to reduce flickering, antilag is really only used for abruptly changing shading, like shadow or reflection,
+			// it may introduce unwanted artifact if your rough specular indirect is noisy
+			antiLag = antiLag && !isGlossy;
+		}
+
+	#else
+		#ifdef HAS_REFRACTION
+			hasTransmission = imageLoadArray( tAlbedo, currentGBufferCoord, HybridAlbedoChannel::HYBRID_ALBEDO_REFRACTION ).w > 0.0f;
+			if( currentObjID.y == ~uint( 0 ) && hasTransmission && isGlossy )
+			{
+				antiLag = false;
+			}
+		#endif
+	#endif
+		// if we do apply antilag, make sure we compute the interpolation factor alpha using antilag
+		if( antiLag )
+		{
+			antilagAlpha = clamp( getAntiLagAlpha( int2( groupCoord ) ), 0.0f, 1.0f );
+		#if defined( SPECULAR_REPROJECTION )
+			const float minAlpha = uMinAlpha.y;
+		#else
+			const float minAlpha = uMinAlpha.x;
+		#endif
+		
+			const float a = uTemporalDampening;
+		#if defined( ADVAMCED_FILTER_BLENDING )
+			const float b = uSampleThreshold;
+			const float c = uMaxAlpha;
+			
+			// calculate the updated alpha and moments alpha
+			if( float( uFrameIndex ) >= ( b / 2) )
+			{
+				alpha = max( minAlpha, c / ( a * ( -min( float( uFrameIndex ), b ) + b ) + 1.0f ) );
+				calculateNewSpp = false;
+			}
+			else
+		#endif
+			{
+				alpha = max( minAlpha, 1.0 / ( a * sppSum + 1.0 ) );
+				calculateNewSpp = true;
+			}
+			alpha = clamp( alpha, 0.0f, 1.0f );
+			momentsAlpha = alpha;
+			// use antilag alpha to interpolate alpha 
+			alpha = mix( alpha, 1.0f, antilagAlpha );
+			momentsAlpha = mix( momentsAlpha, 1.0f,  antilagAlpha );
+			calculateAlpha = false;
+		}
+	}
+#endif
+
+	if (calculateAlpha)
+	{
+		const float		minAlpha = 0.1f;
+		const float		minMomentsAlpha = 0.2f;
+		alpha = isValid ? max( 1.0f / ( sppSum + 1.0f ), minAlpha ) : 1.0f;
+		momentsAlpha = isValid ? max( 1.0f / ( sppSum + 1.0f ), minMomentsAlpha ) : 1.0f;
+	}
+	return vec3( newSpp, max( uMinTemporalAlpha, alpha ), max( uMinTemporalAlpha, momentsAlpha ) );
+}
+
+#if defined( SPECULAR_REPROJECTION ) || defined( NEIGHBORHOOD_CLAMPING )
+	#define CLAMP_RADIANCE( radiance ) clamp( vec4( radiance ), minC, maxC )
+#else
+	#define CLAMP_RADIANCE( radiance ) vec4( radiance )
+#endif
+
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+#if defined( SPECULAR_REPROJECTION ) || defined( NEIGHBORHOOD_CLAMPING ) || defined( ANTI_LAG )
+	// group thread id
+	uint2 groupCoord = GROUP_THREAD_ID.xy;
+	// only setup cache for specular because of neighborhood clamping
+	initCache( int2( outputCoord ), int2( groupCoord ), int2( uScreenSize ) );
+	// wait for all threads to finish.
+	groupMemoryBarrierWithGroupSync();
+	// recenter because (0,0) mapped to (-4,-4)
+	groupCoord += 4;
+#endif
+	// make sure we are only accessing memory of pixels inside the screen dimension
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	// current data for current pixel
+	const uint		pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+	// general gbuffer data
+	const uint2		currentGBufferCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize ) );
+	const float		currentRoughness = loadRoughness( currentGBufferCoord );
+	const bool		isGlossy = currentRoughness > 0.6f;
+	const float		currentDepth = sampleDepth( true, currentGBufferCoord );
+	const vec3		currentNormal = sampleNormal( true, currentGBufferCoord ).xyz;
+	const ObjectID	currentObjID = sampleObjID( true, currentGBufferCoord );
+
+	// get reflection's secondary hit data
+#ifdef SPECULAR_REPROJECTION
+	const uint2 secondaryHitData = imageLoad( tSecondaryNormalObjID, uint2( outputCoord ) ).xy;
+	const vec3	secondaryNormal = unpackUnitVectorOct( secondaryHitData.x );
+	const uint	secondaryObjID = secondaryHitData.y - 1;
+	const uint4 specularLobe = imageLoadArray( tReservoir, currentGBufferCoord, 1 );
+#endif
+
+	// motion vector data
+	const vec4	motionVectorData = imageLoad( tMotionVector, currentGBufferCoord );
+	const vec2	motionVector = motionVectorData.xy;
+	const float fWidthDepth = motionVectorData.z;
+	const float fWidthNormal = motionVectorData.w;
+#if defined( SPECULAR_REPROJECTION ) || defined( NEIGHBORHOOD_CLAMPING )
+	// range for neighborhood clamping
+	vec4 minC = vec4( FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX );
+	vec4 maxC = vec4( -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX );
+	getNeighborhoodMinMax( int2( groupCoord ), minC, maxC );
+#endif
+
+	// calculate previous uv
+	bool useSpecularReproj;
+	const vec2	prevCoord = getPrevCoord( outputCoord, motionVector, currentRoughness, useSpecularReproj );
+	const half4 radiance = getRadiance( outputCoord );
+	const vec4	currentPixel = vec4( radiance );
+
+	// 2-tap bilinear filter
+#ifdef BILINEAR_FILTER
+	bool enableBilinearFilter = isGlossy;
+	int2 filterOffset[4];
+	filterOffset[0] = int2( 0, 0 );
+	filterOffset[1] = int2( 1, 0 );
+	filterOffset[2] = int2( 0, 1 );
+	filterOffset[3] = int2( 1, 1 );
+	// check for all 4 taps of the bilinear filter for validity
+	bool v[4] = { false, false, false, false };
+#else
+	// check for all 4 taps of the bilinear filter for validity
+	bool v = false;
+#endif
+	bool isValid = false;
+
+#ifdef HAS_REFRACTION
+	const bool isBackground = ( currentObjID.x != ~uint( 0 ) ) && ( currentObjID.y != ~uint(0) );
+#else
+	const bool isBackground = currentObjID != ~uint( 0 );
+#endif
+	{
+	#ifdef BILINEAR_FILTER
+		const int sampleCount = enableBilinearFilter ? 4 : 1;
+		for( int sampleIdx = 0; sampleIdx < sampleCount; sampleIdx++ )
+	#endif
+		{
+		#ifdef BILINEAR_FILTER
+			const vec2 prevNeighborCoord = vec2( prevCoord + vec2( filterOffset[sampleIdx] ) );
+		#else
+			const vec2 prevNeighborCoord = vec2( prevCoord );
+		#endif
+			if( prevNeighborCoord.x >= 0 &&
+				prevNeighborCoord.y >= 0 &&
+				prevNeighborCoord.x < uScreenSize.x &&
+				prevNeighborCoord.y < uScreenSize.y )
+			{
+				const uint2		prevNeighborGBufferCoord = uint2( ( vec2( prevNeighborCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize ) );
+				const vec3		prevNormal = sampleNormal( false, prevNeighborGBufferCoord ).xyz;
+				const ObjectID	prevObjID = sampleObjID( false, prevNeighborGBufferCoord );
+				const float		prevDepth = sampleDepth( false, prevNeighborGBufferCoord );
+				const bool		positionMatch = useSpecularReproj || ( abs( currentDepth - prevDepth ) < abs( currentDepth * 0.1f ) );
+				
+				// Adjust the threshold based on the variance factor
+				const float		normalThreshold = 0.9030779018f - sqrt( fWidthNormal ) * NORMAL_VARIANCE_FACTOR;
+				const bool		normalMatch = ( dot( currentNormal, prevNormal ) > normalThreshold );
+				const bool		objMatch = objectIDMatch( currentObjID, prevObjID, isGlossy );
+
+			#ifdef BILINEAR_FILTER
+				v[sampleIdx] = positionMatch && normalMatch && objMatch;
+				isValid = isValid || v[sampleIdx];
+			#else
+				v = positionMatch && normalMatch && objMatch;
+				isValid = isValid || v;
+			#endif
+			}
+		}
+	}
+
+	bool  hasTransparency = false;
+	vec4  valueSum = vec4( 0, 0, 0, 0 );
+	float weightSum = 0;
+	float sppSum = 0.0;
+	float momentSum = 0.0;
+	float momentSum2 = 0.0;
+	if( isValid )
+	{
+		const float x = frac( prevCoord.x );
+		const float y = frac( prevCoord.y );
+
+	#ifdef BILINEAR_FILTER
+		// bilinear weights
+		const float w[4] = {
+			( 1 - x ) * ( 1 - y ),
+			x * ( 1 - y ),
+			( 1 - x ) * y,
+			x * y
+		};
+	#endif
+
+	#ifdef BILINEAR_FILTER
+		const int sampleCount = enableBilinearFilter ? 4 : 1;
+		for( int sampleIdx = 0; sampleIdx < sampleCount; sampleIdx++ )
+	#endif
+		{
+		#ifdef BILINEAR_FILTER
+			const vec2 prevNeighborCoord = vec2( int2( prevCoord ) + filterOffset[sampleIdx] );
+		#else
+			const vec2 prevNeighborCoord = vec2( int2( prevCoord ) );
+		#endif
+			bool  isReprojected = false;
+			float weight = 1.0f;
+		#ifdef BILINEAR_FILTER
+			weight = enableBilinearFilter ? w[sampleIdx] : 1.0f;
+			isReprojected = v[sampleIdx];
+		#else
+			isReprojected = v;
+		#endif
+	
+			if( isReprojected && weight > 0.0f )
+			{
+				// neighborhood clamping
+				const half4 radiance = getPrevRadiance( uint2( prevNeighborCoord ) );
+				const vec3	data = imageLoadArray( tPrevSVGFMoments, uint2( prevNeighborCoord ), uOutputChannel ).xyz;
+				valueSum += weight * CLAMP_RADIANCE( vec4( radiance ) );
+				momentSum += weight * data.y;
+				momentSum2 += weight * data.z;
+				sppSum += weight * data.x;
+				weightSum += weight;
+				hasTransparency = hasTransparency || ( radiance.w < 0.5f );
+			}
+		}
+		// redistribute weights in case not all taps were used
+		isValid = ( weightSum >= 0.01f );
+		valueSum = isValid ? valueSum / weightSum : vec4( 0, 0, 0, 0 );
+		sppSum = isValid ? sppSum / weightSum : 0.0f;
+		momentSum = isValid ? momentSum / weightSum : 0.0f;
+		momentSum2 = isValid ? momentSum2 / weightSum : 0.0f;
+	}
+
+#ifdef SPECULAR_REPROJECTION
+	const bool fallbackReprojection = isGlossy;
+#else
+	const bool fallbackReprojection = true;
+#endif
+	
+	// fall back reprojection to check neighborhoods of previous frame, not doing this for now as it is expensive enough already
+#ifdef REPROJECTION_FALLBACK
+	if( !isValid && fallbackReprojection && !isBackground )
+	{
+		for( int row = -1; row <= 1; ++row )
+		{
+			for( int column = -1; column <= 1; ++column )
+			{
+				const vec2 p = vec2( prevCoord + vec2( column, row ) );
+				if( p.x >= 0 &&
+					p.y >= 0 &&
+					p.x < uScreenSize.x &&
+					p.y < uScreenSize.y )
+				{
+					const uint2		prevNeighborGBufferCoord = uint2( ( vec2( p ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize ) );
+					const float		prevDepth = sampleDepth( false, prevNeighborGBufferCoord );
+					const ObjectID	prevObjID = sampleObjID( false, prevNeighborGBufferCoord );
+					const vec3		prevNormal = sampleNormal( false, prevNeighborGBufferCoord ).xyz;
+					
+					const bool		positionMatch = abs( currentDepth - prevDepth ) < abs( currentDepth * 0.1f ) );
+					// Adjust the threshold based on the variance factor
+					const float		normalThreshold = 0.9030779018f - sqrt( fWidthNormal ) * NORMAL_VARIANCE_FACTOR;
+					const bool		normalMatch = ( dot( currentNormal, prevNormal ) > normalThreshold );
+					const bool		objMatch = objectIDMatch( currentObjID, prevObjID, isGlossy );
+					if( positionMatch && normalMatch && objMatch )
+					{
+						const half4 radiance = getPrevRadiance( uint2( p ) );
+						const uint	momentsOffset = uOutputChannel * ( uScreenSize.x * uScreenSize.y ) + p.y * uScreenSize.x + p.x;
+						const vec3  data = imageLoadArray( tPrevSVGFMoments, uint2( p ), uOutputChannel ).xyz;
+						momentSum += data.y;
+						momentSum2 += data.z;
+						// neighborhood clamping (only if enabled )
+						valueSum += CLAMP_RADIANCE( vec4( radiance ) );
+						weightSum += 1.0f;
+						sppSum += data.x;
+						hasTransparency = hasTransparency || ( radiance.w < 0.5f );
+					}
+				}
+			}
+		}
+		// redistribute weights in case not all taps were used
+		isValid = ( weightSum >= 0.01f );
+		valueSum = isValid ? valueSum / weightSum : vec4( 0, 0, 0, 0.0f );
+		sppSum = isValid ? sppSum / weightSum : 0.0f;
+		momentSum = isValid ? momentSum / weightSum : 0.0f;
+		momentSum2 = isValid ? momentSum2 / weightSum : 0.0f;
+	}
+#endif
+
+#ifdef SPECULAR_REPROJECTION
+	const uint specularLobeFlag = specularLobe.w;
+#else
+	const uint specularLobeFlag = 0;
+#endif
+	// compute alpha for interpolating between current frame and previous (reprojected) frame
+	bool calculateNewSpp = false, hasTransmission = false;;
+	const vec3 newSppAndAlpha = computeAlpha( currentGBufferCoord, groupCoord, currentObjID, sppSum, isValid, specularLobeFlag, currentRoughness, isGlossy, calculateNewSpp, hasTransmission );
+	float newSpp = newSppAndAlpha.x;
+	const float alpha = newSppAndAlpha.y;
+	const float momentsAlpha = newSppAndAlpha.z;
+
+	// we do not calculate variance at this point if spp is less than 4, because we would then underestimate variance
+	// we want blurring to be quite large initially
+	const float	 newFirstMoment = lerp( momentSum, luminance( currentPixel.xyz ), momentsAlpha ) ;
+	const float	 newSecondMoment = lerp( momentSum2, pow( luminance( currentPixel.xyz ), 2.0f ), momentsAlpha );
+	const float	 variance = max(newSecondMoment - newFirstMoment * newFirstMoment, 0.0f );
+	const vec4	 result = clamp( lerp( valueSum, currentPixel, alpha ), vec4( 0, 0, 0, 0 ), vec4( 65504.0f, 65504.0f, 65504.0f, 1.0f ) );
+	// attempting to reproject transparency with result.w, otherwise we used currentPixel.w in the past
+	imageStoreArray( tResult, DISPATCH_THREAD_ID.xy, uOutputChannel, vec4( result.xyz, hasTransparency ? result.w : currentPixel.w ) );
+
+	// for ASVGF we compute new sample count based on variance
+	if( calculateNewSpp )
+	{
+	#ifdef SPECULAR_REPROJECTION
+		const float k = mix( 0.1f, 1.0f, currentRoughness );
+	#else
+		const float k = hasTransmission ? 1.0f : 0.02f;
+	#endif
+		const float w = variance / ( variance + k );
+		newSpp = mix( newSpp, 1.0f, w );
+	}
+
+	// moments okay to clamp ( for 16 bit ), because atrous weighting is supposed to be (0 to inf)
+	const vec4 newMoments = clamp( vec4( newSpp, newFirstMoment, newSecondMoment, variance ), vec4( 0, 0, 0, 0 ), vec4( 65504.0f, 65504.0f, 65504.0f, 65504.0f ) );
+	imageStoreArray( tSVGFMoments, outputCoord, uOutputChannel, newMoments );
+}

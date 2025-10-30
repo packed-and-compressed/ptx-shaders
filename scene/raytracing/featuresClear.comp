@@ -1,0 +1,17 @@
+#include "data/shader/common/colorspace.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+
+USE_TEXTURE2D_NOSAMPLER(tBackground);
+USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,0);
+
+COMPUTE(8,8,1)
+{
+	const uint2 screenCoord = uint2(DISPATCH_THREAD_ID_8x8.xy);
+
+	vec3 bgcolor = imageLoad( tBackground, screenCoord ).rgb;
+	vec3 albedo  = linearTosRGB( bgcolor );
+	vec3 normal  = vec3( 0.0, 0.0, 0.0 );
+
+	imageStoreArray( tFeatures, screenCoord, 0, half4( half3( albedo ), half( 0.0 ) ) );
+	imageStoreArray( tFeatures, screenCoord, 1, half4( half3( normal ), half( 0.0 ) ) );
+}

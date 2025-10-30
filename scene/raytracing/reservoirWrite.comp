@@ -1,0 +1,99 @@
+#include "buffers.comp"
+#include "reservoir.comp"
+#include "data/shader/common/rng.comp"
+
+uniform uint2 uTargetSize;
+uniform uint2 uOriginalFullScreenSize;
+uniform int	  uMultiplyWeight;
+
+USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tReservoir );
+
+#ifdef TO_RADIANCE_OUTPUT
+	// write to a single channel in radiance buffer
+	uniform uint uOutputChannels;
+	
+	#define RT_RADIANCE_ATTACHMENT 0
+	#include "data/shader/scene/raytracing/output.comp"
+#elif defined( SPLIT_DIFFUSE_GI )
+	// special case of splatting to two different channels in radiance buffer
+	uniform uint2 uOutputChannels;// direct, diffuse
+
+	#define RT_RADIANCE_ATTACHMENT 0
+	#include "data/shader/scene/raytracing/output.comp"
+#elif defined( TO_DEBUG_OUTPUT )
+
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tResult, 0 );
+#endif
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uTargetSize.x || outputCoord.y >= uTargetSize.y )
+	{
+		return;
+	}
+	uint2 inputCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize ) * vec2( uTargetSize ) );
+	inputCoord.x = clamp( inputCoord.x, 0u, uint( uTargetSize.x - 1 ) );
+	inputCoord.y = clamp( inputCoord.y, 0u, uint( uTargetSize.y - 1 ) );
+
+	// load reservoir data
+	const uint2 fullscreenCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize ) * vec2( uOriginalFullScreenSize ) );
+		
+	uint4	   resData0;
+	uint4	   resData1;
+	resData0 = imageLoadArray( tReservoir, fullscreenCoord, 0 );
+	resData1 = imageLoadArray( tReservoir, fullscreenCoord, 1 );
+
+	vec3 rayDir;
+	vec3 radiance;
+	const uint pixelIdx = inputCoord.y * uTargetSize.x + inputCoord.x;
+	unpackVec2x3f( resData0.xyz, rayDir, radiance );
+	vec3 result = radiance;
+	const float weight = asfloat( resData1.y );
+	if(uMultiplyWeight)
+	{
+		result *= weight;
+	}
+
+#ifdef TO_RADIANCE_OUTPUT
+	const uint outputDesc = makeOutputDesc( ushort2( outputCoord ), uOutputChannels );
+	// ensure accumulated radiance is non-negative and at most largest half-float normal number
+	// filters out any NaNs and +Infs that might have crept in
+	vec4	   currentResult = vec4( radianceLoad( outputDesc ) );
+	currentResult += vec4( result, 0.0f );
+	currentResult.xyz = clamp( currentResult.xyz, vec3( 0, 0, 0 ), vec3( 65504, 65504, 65504 ) );
+	radianceStore( outputDesc, half4( currentResult ) );
+#elif defined( SPLIT_DIFFUSE_GI )
+	const bool hasTransmission = ( f16tof32( resData1.w & 0xffff ) ) > 1e-5f;
+	if( hasTransmission )
+	{
+		// if full screen size (direct light pass) is higher than 
+		if( uOriginalFullScreenSize.x <= uTargetSize.x && uOriginalFullScreenSize.y <= uTargetSize.y )
+		{
+			const uint outputDesc = makeOutputDesc( ushort2( fullscreenCoord ), uOutputChannels.x );
+			// ensure accumulated radiance is non-negative and at most largest half-float normal number
+			// filters out any NaNs and +Infs that might have crept in
+			vec4	   currentResult = vec4( radianceLoad( outputDesc ) );
+			currentResult += vec4( result, 0.0f );
+			currentResult.xyz = clamp( currentResult.xyz, vec3( 0, 0, 0 ), vec3( 65504, 65504, 65504 ) );
+			radianceStore( outputDesc, half4( currentResult ) );
+		}
+	}
+	else
+	{
+		const uint outputDesc = makeOutputDesc( ushort2( inputCoord ), uOutputChannels.y );
+		// ensure accumulated radiance is non-negative and at most largest half-float normal number
+		// filters out any NaNs and +Infs that might have crept in
+		vec4	   currentResult = vec4( radianceLoad( outputDesc ) );
+		currentResult += vec4( result, 0.0f );
+		currentResult.xyz = clamp( currentResult.xyz, vec3( 0, 0, 0 ), vec3( 65504, 65504, 65504 ) );
+		radianceStore( outputDesc, half4( currentResult ) );
+	}
+#elif defined( TO_DEBUG_OUTPUT )
+	// ensure accumulated radiance is non-negative and at most largest half-float normal number
+	// filters out any NaNs and +Infs that might have crept in
+	result = clamp( result, vec3( 0, 0, 0 ), vec3( 65504, 65504, 65504 ) );
+	imageStoreArray( tResult, outputCoord, 0, vec4( result, 1.0f ) );
+	imageStoreArray( tResult, outputCoord, 1, vec4( 0.0f, 0.0f, 0.0f, 1.0f ) );
+#endif
+}

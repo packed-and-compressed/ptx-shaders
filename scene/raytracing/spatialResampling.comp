@@ -1,0 +1,192 @@
+#include "data/shader/common/ldsamplerHybrid.comp"
+#include "data/shader/common/rngHybrid.comp"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/resampling.comp"
+
+uniform float uReSTIRGIBufferScale;
+
+USE_TEXTURE2DARRAY( tReSTIRSample );// temp texture with position and shadow catcher flag
+
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tSpatialResampled, 0 );
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 1 );
+#endif
+
+//#define USE_SHARED_MEMORY
+#ifdef USE_SHARED_MEMORY
+groupshared half4 gCachedGBuffer[16][16];
+groupshared uint4 gCachedReservoir0[16][16];
+groupshared uint4 gCachedReservoir1[16][16];
+
+void initCache(
+	const uint2 outputCoord,
+	const uint2 groupCoord )
+{
+	bool outOfBounds = false;
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		outOfBounds = true;
+	}
+
+	// current frame data
+	const half  currentDepth = outOfBounds ? half( abs( imageLoad( tDepth, outputCoord ).x ) ) : half( 0.0f );
+	const half3	currentNormal = outOfBounds ? half3( sampleNormal( true, uint2( outputCoord ) ).xyz ) : half3( 0, 0, 0 );
+	gCachedGBuffer[groupCoord.y][groupCoord.x] = half4( currentNormal, currentDepth );
+	// current frame's temporal reservoir
+	const uint4	resData0 = outOfBounds ? imageLoadArray( tInitialReservoir, outputCoord, 0 ) : uint4( 0, 0, 0, 0 );
+	const uint4	resData1 = outOfBounds ? imageLoadArray( tInitialReservoir, outputCoord, 1 ) : uint4( 0, 0, 0, 0 );
+	gCachedReservoir0[groupCoord.y][groupCoord.x] = resData0;
+	gCachedReservoir1[groupCoord.y][groupCoord.x] = resData1;
+}
+
+bool isCachedNeighborValid(
+	const half  currentDepth,
+	const half3	currentNormal,
+	const uint2	neighborGroupCoord )
+{
+	const half neighborDepth = gCachedGBuffer[neighborGroupCoord.y][neighborGroupCoord.x].w;
+	const half3	neighborNormal = gCachedGBuffer[neighborGroupCoord.y][neighborGroupCoord.x].xyz;
+	bool		isValid = true;
+	isValid = isValid && ( dot( neighborNormal, currentNormal ) > half( 0.9030779018f ) );
+	isValid = isValid && ( ( abs( neighborDepth - currentDepth ) ) < half( max( neighborDepth, currentDepth ) * 0.1f ) );
+
+	return isValid;
+}
+#endif
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	const uint2 groupCoord  = uint2( GROUP_THREAD_ID.xy );
+	
+#ifdef USE_SHARED_MEMORY
+	initCache( outputCoord, groupCoord );
+	// wait for all threads to finish.
+	groupMemoryBarrierWithGroupSync();
+#endif
+
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	// rng
+	const uint4 rngData = rngLoadHybrid( outputCoord );
+	RNG			rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, rngData.x );
+	// current data
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+	Reservoir	res = loadReservoirData<false>( outputCoord );
+	// convert to total weight from average weight
+	res.W = res.W * res.M * res.pdfTarget;
+
+	if( uEnabled )
+	{
+		// random number
+		float		r = rngNextFloat( rng );
+		// current frame data
+#ifdef USE_SHARED_MEMORY
+		const half  currentDepth = gCachedGBuffer[GROUP_THREAD_ID.y][GROUP_THREAD_ID.x].w;
+		half3		currentNormal = gCachedGBuffer[GROUP_THREAD_ID.y][GROUP_THREAD_ID.x].xyz;
+#else
+		const float currentDepth = abs( imageLoad( tDepth, outputCoord ).x );
+		vec3		currentNormal = sampleNormal( true, uint2( outputCoord ) ).xyz;
+#endif
+		// we do not resampling with shadow catcher
+		const float searchRadiusRatio = 0.1f;
+		float		searchRadius = uScreenSize.x * searchRadiusRatio;
+		// get some current pixel data
+		const vec4	restirSampleData = imageLoadArray( tReSTIRSample, outputCoord, 0 );
+		const vec3	currentPos = restirSampleData.xyz;
+		const bool	isShadowCatcher = ( asuint( restirSampleData.w ) & RT_RAYFLAG_SHADOWCATCHER ) > 0;
+		const bool	allowSkySampling = ( asuint( restirSampleData.w ) & HYBRID_PATH_ALLOW_SKY_SAMPLE ) > 0;
+		
+#ifdef USE_SHARED_MEMORY
+		// group thread id
+		uint2 outputCoordInFirstLane;
+		uint2 groupCoord = GROUP_THREAD_ID.xy;
+		if( waveIsFirstLane() )
+		{
+			outputCoordInFirstLane = outputCoord;
+		}
+		
+		// broadcast material index to other threads in the wave if using wave intrinsic for fetching material index
+		const uint2 startOutputCoord = waveBroadcastFirst( outputCoordInFirstLane );
+#endif
+
+		for( int i = 0; i < uIteration && !isShadowCatcher; ++i )
+		{
+			bool validNeighbor = false;
+		#ifdef USE_SHARED_MEMORY
+			const uint2 offset = uint2( rngNextVec2( rng ) * 16.0f );
+			const uint2	neighborCoord = startOutputCoord + offset;
+			const uint2 neighborGroupCoord = offset;
+			validNeighbor = isCachedNeighborValid( currentDepth, currentNormal, neighborGroupCoord );
+		#else
+			const uint2	neighborCoord = uint2( vec2( outputCoord ) + neighborOffset( rngNextFloat( rng ), i, uIteration, searchRadius ) );
+			validNeighbor = isNeighborValid( currentDepth, currentNormal, neighborCoord );
+		#endif
+			if( validNeighbor )
+			{
+			#ifdef USE_SHARED_MEMORY
+				const uint4 resData0 = gCachedReservoir0[neighborGroupCoord.y][neighborGroupCoord.x];
+				const uint4 resData1 = gCachedReservoir1[neighborGroupCoord.y][neighborGroupCoord.x];
+				Reservoir  neighbor = loadReservoir( resData0, resData1 );
+			#else
+				Reservoir  neighbor = loadReservoirData<true>( neighborCoord );
+			#endif
+
+				const vec4 restirSampleData = imageLoadArray( tReSTIRSample, neighborCoord, 0 );
+				if( neighbor.age > uReSTIRAgeThreshold || neighbor.M <= 0 )
+				{
+					continue;
+				}
+				
+				const vec3 neighborPos = restirSampleData.xyz;
+				float	   newTargetPdf = calcReservoirTargetPDF( neighbor );
+
+				vec3 rayDir, radiance;
+				unpackVec2x3f( neighbor.Lradiance, rayDir, radiance );
+				Ray ray;
+				ray.origin = currentPos + vec3( currentNormal ) * uRayOriginBias;
+				ray.direction = normalize( rayDir );
+				ray.maxT = neighbor.distance;
+				if ( ray.maxT != INFINITY )
+				{
+					// point sampling on light source, we need to correct the ray direction
+					ray.direction = neighbor.distance > 0.0f ? ( neighborPos + normalize( rayDir ) * neighbor.distance ) - ray.origin : ray.direction;
+					ray.maxT = neighbor.distance == 0.0f ? 0.0f : length( ray.direction ) * 0.99f;
+					ray.direction = normalize( ray.direction );
+					neighbor.Lradiance = packVec2x3f( ray.direction, radiance );
+				}
+				ray.minT = 0.0f;
+
+				RayHit	   hit;
+				RayPayload payload;
+			#if defined( TraceTransparencyDither )
+				payload.rng = rng;
+			#endif
+				// check visibility, if not visible then the target pdf is 0
+				bool	   isOccluded = ray.maxT > 0.0f ? traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit ) : false;
+				if( isOccluded )
+				{
+					newTargetPdf = 0;
+				}
+				if( combineReservoir( res, neighbor, r, newTargetPdf ) )
+				{
+					// Expand search radius.
+					searchRadius *= 3.0f;
+				}
+			}
+		}
+	}
+	
+    // calculate new weight
+	const float newTargetFunc = calcReservoirTargetPDF( res );
+	const float	weight = res.W * rcpSafe( newTargetFunc * res.M );
+	res.M = clamp( res.M, ushort( 0 ), ushort( 20 ) );
+
+	const uint4 restirData0 = uint4( res.Lradiance, asuint( res.distance ) );
+	const uint4 restirData1 = uint4( asuint( res.pdfTarget ), asuint( weight ), ( uint( res.M ) << 16 ) | uint( res.age ), asuint( res.lightIdx ) );
+	imageStoreArray( tSpatialResampled, outputCoord, 0, restirData0 );
+	imageStoreArray( tSpatialResampled, outputCoord, 1, restirData1 );
+}

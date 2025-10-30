@@ -1,0 +1,28 @@
+USE_TEXTURECUBE(tSkyTexture);
+uniform float	uSkyBrightness;
+uniform mat4	uWorldToSkyTransform;
+
+#define	SAMPLE_COUNT	32
+uniform vec4	uSkySampleKernel[SAMPLE_COUNT/2];
+uniform float	uSkySampleLod;
+
+vec3	missSkyBlur( vec3 dir )
+{
+	vec3 basisZ = mulVec( uWorldToSkyTransform, dir );
+	vec3 basisX = normalize( cross( vec3(0.0,1.0,0.0), basisZ ) );
+	vec3 basisY = cross( basisZ, basisX );
+	
+	vec3 color = vec3( 0.0, 0.0, 0.0 );
+	HINT_UNROLL
+	for( int i=0; i<SAMPLE_COUNT/2; ++i )
+	{
+		vec4 s = uSkySampleKernel[i];
+
+		vec3 s0 = (basisZ + s.x*basisX) + s.y*basisY;
+		color += textureCubeLod( tSkyTexture, s0, uSkySampleLod ).xyz;
+
+		vec3 s1 = (basisZ + s.z*basisX) + s.w*basisY;
+		color += textureCubeLod( tSkyTexture, s1, uSkySampleLod ).xyz;
+	}
+	return color * (uSkyBrightness / float(SAMPLE_COUNT));
+}

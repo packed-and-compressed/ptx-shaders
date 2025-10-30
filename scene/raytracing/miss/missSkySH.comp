@@ -1,0 +1,27 @@
+uniform vec4	uSkyCoefficients[9];
+uniform mat4	uWorldToSkyTransform;
+
+vec3	missSkySH( vec3 dir )
+{
+	vec3 d = mulVec( uWorldToSkyTransform, dir );
+
+	//l = 0 band
+	vec3 r = uSkyCoefficients[0].xyz;
+
+	//l = 1 band
+	r += uSkyCoefficients[1].xyz * d.y;
+	r += uSkyCoefficients[2].xyz * d.z;
+	r += uSkyCoefficients[3].xyz * d.x;
+
+	//l = 2 band
+	vec3 swz = d.yyz * d.xzx;
+	r += uSkyCoefficients[4].xyz * swz.x;
+	r += uSkyCoefficients[5].xyz * swz.y;
+	r += uSkyCoefficients[7].xyz * swz.z;
+
+	vec3 sqr = d * d;
+	r += uSkyCoefficients[6].xyz * ( 3.0*sqr.z - 1.0 );
+	r += uSkyCoefficients[8].xyz * ( sqr.x - sqr.y );
+
+	return r;
+}

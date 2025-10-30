@@ -1,0 +1,6 @@
+uniform vec3	uBackgroundColor;
+
+vec3	missColor( vec3 dir )
+{
+	return uBackgroundColor;
+}

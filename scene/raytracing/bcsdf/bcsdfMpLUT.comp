@@ -1,0 +1,61 @@
+#include "bcsdfChiang.comp"
+
+void alphaScaleFromAlpha( float alpha, inout vec3 sin2kAlpha, inout vec3 cos2kAlpha )
+{
+	sin2kAlpha[0] = sin( radians( alpha ) );
+	cos2kAlpha[0] = sqrt( max( 0.0, 1.0 - sqr( sin2kAlpha[0] ) ) );
+
+	// Get the lobe alpha terms by solving for the trigonometric double angle identities
+	for( int i = 1; i < 3; ++i )
+	{
+		sin2kAlpha[i] = 2 * cos2kAlpha[i - 1] * sin2kAlpha[i - 1];
+		cos2kAlpha[i] = sqr( cos2kAlpha[i - 1] ) - sqr( sin2kAlpha[i - 1] );
+	}
+}
+
+#define BCSDF_LUT_DIMENSION (64)
+
+USE_LOADSTORE_TEXTURE3D(float, tLUT, 0);
+
+// Mp scattering LUT, parameterized by:
+// x: sinThetaO
+// y: sinThetaI
+// z: beta_m
+COMPUTE(8, 8, 8)
+{
+    const vec3 uvw = vec3(DISPATCH_THREAD_ID + 0.5) / vec3(BCSDF_LUT_DIMENSION, BCSDF_LUT_DIMENSION, BCSDF_LUT_DIMENSION);
+
+    const float sinThetaO = uvw.x * 2.0 - 1.0;
+    const float cosThetaO = sqrtSafe(1.0 - sinThetaO * sinThetaO);
+    const float sinThetaI = uvw.y * 2.0 - 1.0;
+    const float cosThetaI = sqrtSafe(1.0 - sinThetaI * sinThetaI);
+
+    const vec4 v = longitudinalVariance(uvw.z);
+    vec3 sin2kAlpha, cos2kAlpha;
+    alphaScaleFromAlpha(0.0, sin2kAlpha, cos2kAlpha);
+
+    vec3 M;
+
+    for( uint p = 0; p < 3; ++p )
+	{
+		// Compute terms accounting for hair tilt scales
+		float sinThetaOp;
+		float cosThetaOp;
+		adjustHairCuticleTilts( p, sin2kAlpha, cos2kAlpha, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp );
+
+		M[p] = longitudinalScattering( cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, v[p] );
+	}
+
+    // Flip the image vertically
+    uint3 coord = uint3(DISPATCH_THREAD_ID.x, BCSDF_LUT_DIMENSION - 1 - DISPATCH_THREAD_ID.y, DISPATCH_THREAD_ID.z);
+    imageStore(tLUT, coord, vec4(M, 1.0));
+}
+
+//USE_TEXTURE3D(tMpLUT);
+//vec3 loadMpLUT( float sinThetaO, float sinThetaI, float beta_m )
+//{
+//    const float x = 0.5 + 0.5 * sinThetaO;
+//    const float y = 0.5 + 0.5 * sinThetaI;
+//    const float z = beta_m;
+//    return texture3DLod( tMpLUT, vec3(x, y, z), 0.0 ).rgb;
+//}

@@ -1,0 +1,318 @@
+#ifndef MSET_RAYTRACING_OUTPUT_COMP
+#define MSET_RAYTRACING_OUTPUT_COMP
+
+#include "buffers.comp"
+
+//radiance channels
+#define RT_RADIANCE_DIRECT              0
+#define RT_RADIANCE_INDIRECT_DIFFUSE    1
+#define RT_RADIANCE_INDIRECT_SPECULAR   2
+    
+//features
+#define RT_FEATURE_ALBEDO               0
+#define RT_FEATURE_NORMAL               1
+
+//hybrid channels
+#define HYBRID_RADIANCE_DIRECT      0
+#define HYBRID_RADIANCE_DIFFUSE_GI  1
+#define HYBRID_RADIANCE_SPECULAR    2
+
+//default radiance attachment ID
+#ifndef RT_RADIANCE_ATTACHMENT
+#define RT_RADIANCE_ATTACHMENT 0
+#endif
+
+//default features attachment ID
+#ifndef RT_FEATURES_ATTACHMENT
+#define RT_FEATURES_ATTACHMENT 1
+#endif
+
+//enable features texture when the corresponding RT lighting permutation flag is defined
+#ifdef OutputFeatures
+#define RT_FEATURES_TEXTURE
+#endif
+
+#ifdef RT_RADIANCE_TEXTURE
+    #if   RT_RADIANCE_ATTACHMENT == 0
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,0);
+    #elif RT_RADIANCE_ATTACHMENT == 1
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,1);
+    #elif RT_RADIANCE_ATTACHMENT == 2
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,2);
+    #elif RT_RADIANCE_ATTACHMENT == 3
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,3);
+    #elif RT_RADIANCE_ATTACHMENT == 4
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,4);
+    #elif RT_RADIANCE_ATTACHMENT == 5
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,5);
+    #elif RT_RADIANCE_ATTACHMENT == 6
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,6);
+    #elif RT_RADIANCE_ATTACHMENT == 7
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,7);
+    #elif RT_RADIANCE_ATTACHMENT == 8
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,8);
+    #elif RT_RADIANCE_ATTACHMENT == 9
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,9);
+    #elif RT_RADIANCE_ATTACHMENT == 10
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,10);
+    #elif RT_RADIANCE_ATTACHMENT == 11
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,11);
+    #elif RT_RADIANCE_ATTACHMENT == 12
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,12);
+    #elif RT_RADIANCE_ATTACHMENT == 13
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,13);
+    #elif RT_RADIANCE_ATTACHMENT == 14
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,14);
+    #elif RT_RADIANCE_ATTACHMENT == 15
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,15);
+    #elif RT_RADIANCE_ATTACHMENT == 16
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,16);
+    #elif RT_RADIANCE_ATTACHMENT == 17
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,17);
+    #elif RT_RADIANCE_ATTACHMENT == 18
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,18);
+    #elif RT_RADIANCE_ATTACHMENT == 19
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,19);
+    #elif RT_RADIANCE_ATTACHMENT == 20
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,20);
+    #elif RT_RADIANCE_ATTACHMENT == 21
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,21);
+    #elif RT_RADIANCE_ATTACHMENT == 22
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,22);
+    #elif RT_RADIANCE_ATTACHMENT == 23
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,23);
+    #elif RT_RADIANCE_ATTACHMENT == 24
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,24);
+    #elif RT_RADIANCE_ATTACHMENT == 25
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,25);
+    #elif RT_RADIANCE_ATTACHMENT == 26
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,26);
+    #elif RT_RADIANCE_ATTACHMENT == 27
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,27);
+    #elif RT_RADIANCE_ATTACHMENT == 28
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,28);
+    #elif RT_RADIANCE_ATTACHMENT == 29
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,29);
+    #elif RT_RADIANCE_ATTACHMENT == 30
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tRadiance,30);
+    #endif
+#else
+    #if   RT_RADIANCE_ATTACHMENT == 0
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,0);
+    #elif RT_RADIANCE_ATTACHMENT == 1
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,1);
+    #elif RT_RADIANCE_ATTACHMENT == 2
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,2);
+    #elif RT_RADIANCE_ATTACHMENT == 3
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,3);
+    #elif RT_RADIANCE_ATTACHMENT == 4
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,4);
+    #elif RT_RADIANCE_ATTACHMENT == 5
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,5);
+    #elif RT_RADIANCE_ATTACHMENT == 6
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,6);
+    #elif RT_RADIANCE_ATTACHMENT == 7
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,7);
+    #elif RT_RADIANCE_ATTACHMENT == 8
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,8);
+    #elif RT_RADIANCE_ATTACHMENT == 9
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,9);
+    #elif RT_RADIANCE_ATTACHMENT == 10
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,10);
+    #elif RT_RADIANCE_ATTACHMENT == 11
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,11);
+    #elif RT_RADIANCE_ATTACHMENT == 12
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,12);
+    #elif RT_RADIANCE_ATTACHMENT == 13
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,13);
+    #elif RT_RADIANCE_ATTACHMENT == 14
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,14);
+    #elif RT_RADIANCE_ATTACHMENT == 15
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,15);
+    #elif RT_RADIANCE_ATTACHMENT == 16
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,16);
+    #elif RT_RADIANCE_ATTACHMENT == 17
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,17);
+    #elif RT_RADIANCE_ATTACHMENT == 18
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,18);
+    #elif RT_RADIANCE_ATTACHMENT == 19
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,19);
+    #elif RT_RADIANCE_ATTACHMENT == 20
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,20);
+    #elif RT_RADIANCE_ATTACHMENT == 21
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,21);
+    #elif RT_RADIANCE_ATTACHMENT == 22
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,22);
+    #elif RT_RADIANCE_ATTACHMENT == 23
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,23);
+    #elif RT_RADIANCE_ATTACHMENT == 24
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,24);
+    #elif RT_RADIANCE_ATTACHMENT == 25
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,25);
+    #elif RT_RADIANCE_ATTACHMENT == 26
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,26);
+    #elif RT_RADIANCE_ATTACHMENT == 27
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,27);
+    #elif RT_RADIANCE_ATTACHMENT == 28
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,28);
+    #elif RT_RADIANCE_ATTACHMENT == 29
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,29);
+    #elif RT_RADIANCE_ATTACHMENT == 30
+        USE_LOADSTORE_BUFFER(uint2,bRadiance,30);
+    #endif
+    uniform uint2 uRadianceStride;
+#endif
+
+#ifdef RT_FEATURES_TEXTURE
+    #if   RT_FEATURES_ATTACHMENT == 0
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,0);
+    #elif RT_FEATURES_ATTACHMENT == 1
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,1);
+    #elif RT_FEATURES_ATTACHMENT == 2
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,2);
+    #elif RT_FEATURES_ATTACHMENT == 3
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,3);
+    #elif RT_FEATURES_ATTACHMENT == 4
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,4);
+    #elif RT_FEATURES_ATTACHMENT == 5
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,5);
+    #elif RT_FEATURES_ATTACHMENT == 6
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,6);
+    #elif RT_FEATURES_ATTACHMENT == 7
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,7);
+    #elif RT_FEATURES_ATTACHMENT == 8
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,8);
+    #elif RT_FEATURES_ATTACHMENT == 9
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,9);
+    #elif RT_FEATURES_ATTACHMENT == 10
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,10);
+    #elif RT_FEATURES_ATTACHMENT == 11
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,11);
+    #elif RT_FEATURES_ATTACHMENT == 12
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,12);
+    #elif RT_FEATURES_ATTACHMENT == 13
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,13);
+    #elif RT_FEATURES_ATTACHMENT == 14
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,14);
+    #elif RT_FEATURES_ATTACHMENT == 15
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,15);
+    #elif RT_FEATURES_ATTACHMENT == 16
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,16);
+    #elif RT_FEATURES_ATTACHMENT == 17
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,17);
+    #elif RT_FEATURES_ATTACHMENT == 18
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,18);
+    #elif RT_FEATURES_ATTACHMENT == 19
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,19);
+    #elif RT_FEATURES_ATTACHMENT == 20
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,20);
+    #elif RT_FEATURES_ATTACHMENT == 21
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,21);
+    #elif RT_FEATURES_ATTACHMENT == 22
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,22);
+    #elif RT_FEATURES_ATTACHMENT == 23
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,23);
+    #elif RT_FEATURES_ATTACHMENT == 24
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,24);
+    #elif RT_FEATURES_ATTACHMENT == 25
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,25);
+    #elif RT_FEATURES_ATTACHMENT == 26
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,26);
+    #elif RT_FEATURES_ATTACHMENT == 27
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,27);
+    #elif RT_FEATURES_ATTACHMENT == 28
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,28);
+    #elif RT_FEATURES_ATTACHMENT == 29
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,29);
+    #elif RT_FEATURES_ATTACHMENT == 30
+        USE_LOADSTORE_TEXTURE2DARRAY(half,tFeatures,30);
+    #endif
+#endif
+
+uint makeOutputDesc( ushort2 coord, uint channel )
+{
+    uint desc = uint(coord.x) | ( uint(coord.y)<<16 );
+    desc |= (channel << 13) & RT_RAYFLAG_CHANNEL;
+    return desc;
+}
+
+uint makeOutputDesc( uint desc, uint channel )
+{
+    desc &= RT_OUTPUTCOORD_MASK; //mask-out flag bits
+    desc |= (channel << 13) & RT_RAYFLAG_CHANNEL;
+    return desc;
+}
+
+ushort2 makeOutputCoord( uint desc )
+{
+    desc &= RT_OUTPUTCOORD_MASK; //mask-out flag bits
+    return ushort2( desc, desc>>16 );
+}
+
+half4 radianceLoad( ushort channel, ushort2 coord )
+{
+#ifdef RT_RADIANCE_TEXTURE
+    return imageLoadRWArray( tRadiance, (uint2)coord, (uint)channel );
+#else
+    uint offset = channel * uRadianceStride.x + coord.y * uRadianceStride.y + coord.x;
+    return unpackVec4h( bRadiance[offset] );
+#endif
+}
+
+half4 radianceLoad( uint desc )
+{
+    ushort2 coord   = makeOutputCoord( desc );
+    ushort  channel = ushort( (desc & RT_RAYFLAG_CHANNEL) >> 13 );
+    return radianceLoad( channel, coord );
+}
+
+void radianceStore( ushort channel, ushort2 coord, half4 radiance )
+{
+#ifdef RT_RADIANCE_TEXTURE
+    imageStoreArray( tRadiance, coord, channel, radiance );
+#else
+    uint offset = channel * uRadianceStride.x + coord.y * uRadianceStride.y + coord.x;
+    bRadiance[offset] = packVec4h( radiance );
+#endif
+}
+
+void radianceStore( uint desc, half4 radiance )
+{
+    ushort2 coord   = makeOutputCoord( desc );
+    ushort  channel = ushort( (desc & RT_RAYFLAG_CHANNEL) >> 13 );
+    radianceStore( channel, coord, radiance );
+}
+
+half4 radianceAdd( ushort channel, ushort2 coord, half4 value )
+{
+    half4 radiance = radianceLoad( channel, coord );
+    radiance += value;
+    radianceStore( channel, coord, radiance );
+    return radiance;    
+}
+
+half4 radianceAdd( uint desc, half4 value )
+{
+    ushort2 coord   = makeOutputCoord( desc );
+    ushort  channel = ushort( (desc & RT_RAYFLAG_CHANNEL) >> 13 );
+    return radianceAdd( channel, coord, value );
+}
+
+half3 radianceAdd( ushort channel, ushort2 coord, half3 value )
+{
+    return radianceAdd( channel, coord, half4(value, 0.0) ).rgb;
+}
+
+half3 radianceAdd( uint desc, half3 value )
+{
+    return radianceAdd( desc, half4(value, 0.0) ).rgb;
+}
+
+void featureStore( ushort feature, ushort2 coord, half4 value )
+{
+#ifdef RT_FEATURES_TEXTURE
+    imageStoreArray( tFeatures, coord, feature, value );
+#endif
+}
+
+#endif

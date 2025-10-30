@@ -1,0 +1,56 @@
+#ifndef MSET_MEDIUM_HOMOGENOUS_COMP
+#define MSET_MEDIUM_HOMOGENOUS_COMP
+
+#include "data/shader/mat/state.frag"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/tangentbasis.sh"
+#include "phase.comp"
+
+uniform vec3  uSceneMediumExtinction;
+uniform float uSceneMediumScatter;
+uniform float uSceneMediumAnisotropy;
+
+vec3 getMediumExtinction( FragmentState fs )
+{
+	return fs.frontFacing ? fs.mediumExtinction : uSceneMediumExtinction;
+}
+
+vec3 getMediumScatter( FragmentState fs )
+{
+	return fs.frontFacing ? fs.mediumScatter : uSceneMediumScatter;
+}
+
+float getMediumAnisotropy( FragmentState fs )
+{
+	return fs.frontFacing ? fs.mediumAnisotropy : uSceneMediumAnisotropy;
+}
+
+bool isAttenuatingMedium( vec3 mediumExtinction )
+{
+	return maxcomp( mediumExtinction ) >= 1e-6;
+}
+
+bool isScatteringMedium( vec3 mediumScatter )
+{
+	return maxcomp( mediumScatter ) >= 1e-6;
+}
+
+vec3 mediumTransmittance( vec3 mediumExtinction, float t )
+{
+	return exp( -t * mediumExtinction );
+}
+
+float sampleMediumPhase( vec2 r, float mediumAnisotropy, vec3 V, out vec3 L )
+{
+	//create an ad-hoc tangent basis around outgoing view direction
+	TangentBasis basis = createTangentBasis( V );
+
+	//sample incident direction from phase function
+	vec3 L_t = samplePhaseHG_t( r, mediumAnisotropy );
+	L = transformVecFrom( basis, L_t );
+
+	//evaluate phase function; -L is cos_theta since V points away from scattering point
+	return evaluatePhaseHG( mediumAnisotropy, -L_t.z );
+}
+
+#endif

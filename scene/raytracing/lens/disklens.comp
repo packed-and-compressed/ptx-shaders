@@ -1,0 +1,32 @@
+#ifndef MSET_LENS_DISK_COMP
+#define MSET_LENS_DISK_COMP
+
+#include "data/shader/common/const.sh"
+
+//samples circular lens uniformly with concentric disk sampling
+//see "A Low Distortion Map Between Disk and Square", P. Shirley, K. Chiu
+vec2 sampleLensDisk( vec2 r, float radius )
+{
+	vec2 uv = 2.0 * r - vec2(1.0,1.0);
+	if( uv.x == 0.0 && uv.y == 0.0 )
+	{
+		return vec2( 0.0, 0.0 );
+	}
+	else
+	{
+		float R, theta;
+		if( abs(uv.x) > abs(uv.y) )
+		{
+			R = radius * uv.x;
+			theta = (PI/4.0) * ( uv.y / uv.x );
+		}
+		else
+		{
+			R = radius * uv.y;
+			theta = (PI/2.0) - (PI/4.0) * ( uv.x / uv.y );
+		}
+		return vec2( R * cos(theta), R * sin(theta) );
+	}
+}
+
+#endif

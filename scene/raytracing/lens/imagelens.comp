@@ -1,0 +1,59 @@
+USE_TEXTURE2D_NOSAMPLER(tLensImage);
+
+uniform vec2 uLensImageInvDimensions;
+uniform int  uLensImageMaxLevel;
+
+//hierarchical sample lens image mask descending down the MIP chain
+vec2 sampleLensImage( vec4 r, float radius )
+{
+	uint2 p = uint2( 0, 0 );
+	for( int level = uLensImageMaxLevel - 1; level >= 0; --level )
+	{
+		p <<= uint2( 1, 1 );
+		
+		vec4 imp = vec4(
+			imageLoadLod( tLensImage, p.xy, level ).r,
+			imageLoadLodOffset( tLensImage, p.xy, level, int2( 0, 1 ) ).r,
+			imageLoadLodOffset( tLensImage, p.xy, level, int2( 1, 0 ) ).r,
+			imageLoadLodOffset( tLensImage, p.xy, level, int2( 1, 1 ) ).r );
+
+		float left  = imp.x + imp.y;
+		float right = imp.z + imp.w;
+		
+		float pLeft = left / ( left + right );
+		if( r.x < pLeft )
+		{
+			r.x /= pLeft;
+			float pLower = imp.x / left;
+			if( r.y < pLower )
+			{
+				r.y /= pLower;
+			}
+			else
+			{
+				p.y++;
+				r.y = ( r.y - pLower ) / ( 1.0 - pLower );
+			}
+		}
+		else
+		{
+			p.x++;
+			r.x = ( r.x - pLeft ) / ( 1.0 - pLeft );
+			float pLower = imp.z / right;
+			if( r.y < pLower )
+			{
+				r.y /= pLower;
+			}
+			else
+			{
+				p.y++;
+				r.y = ( r.y - pLower ) / ( 1.0 - pLower );
+			}
+		}
+  
+        r = min(r, 1.0 - FLT_EPSILON);
+	}
+
+	vec2 uv = vec2( p.x + r.z, p.y + r.w ) * uLensImageInvDimensions;
+	return 2.0 * radius * ( uv - vec2( 0.5, 0.5 ) );
+}

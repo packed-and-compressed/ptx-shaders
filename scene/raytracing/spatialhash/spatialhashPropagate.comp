@@ -1,0 +1,56 @@
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/spatialhash/spatialhash.comp"
+
+USE_BUFFER( uint, bSpatialHashCheckSum );
+
+USE_INTERLOCKED_BUFFER( bSpatialHashRadianceCache, 0 );
+USE_LOADSTORE_BUFFER( uint4, bSpatialHashIndirectBuffer0, 1 );
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 2 );
+#endif
+
+uniform uint uMaxRayCount;
+
+#define ACCUMULATE_RADIANCE
+#define LINEAR_PROBE_ENTRY_COUNT 4
+
+COMPUTE( 64, 1, 1 )
+{
+	const uint outputCoord = uint( DISPATCH_THREAD_ID.x );
+	if( outputCoord >= uMaxRayCount )
+	{
+		return;
+	}
+
+	const uint4 uploadData = bSpatialHashIndirectBuffer0[outputCoord];
+	
+	const uint cellIdx = uploadData.w;
+	if( cellIdx != ~uint( 0 ) && cellIdx < ( uRadianceCacheEntryCount * LINEAR_PROBE_ENTRY_COUNT ) )
+	{
+		vec3 radiance, throughput;
+		unpackVec2x3f( uploadData.xyz, radiance, throughput );
+
+#ifdef ACCUMULATE_RADIANCE
+		const uint4 data = interlockedLoad4( bSpatialHashRadianceCache, cellIdx * 4 );
+		if( data.w < 1000 )
+		{
+			uint dummy;
+			interlockedAdd( bSpatialHashRadianceCache, cellIdx * 4 + 0, uint( radiance.x * 1e3f ), dummy );
+			interlockedAdd( bSpatialHashRadianceCache, cellIdx * 4 + 1, uint( radiance.y * 1e3f ), dummy );
+			interlockedAdd( bSpatialHashRadianceCache, cellIdx * 4 + 2, uint( radiance.z * 1e3f ), dummy );
+			interlockedAdd( bSpatialHashRadianceCache, cellIdx * 4 + 3, 1, dummy );
+		}
+#else
+		uint res;
+		interlockedCompareExchange( bSpatialHashRadianceCache, cellIdx * 4 + 3, 0u, 1, res );
+		if( res == 0 )
+		{
+			interlockedStore( bSpatialHashRadianceCache, cellIdx * 4 + 0, uint( radiance.x * 1e3f ) );
+			interlockedStore( bSpatialHashRadianceCache, cellIdx * 4 + 1, uint( radiance.y * 1e3f ) );
+			interlockedStore( bSpatialHashRadianceCache, cellIdx * 4 + 2, uint( radiance.z * 1e3f ) );
+		}
+#endif
+	}
+
+	bSpatialHashIndirectBuffer0[outputCoord] = uint4( 0, 0, 0, ~uint( 0 ) );
+}

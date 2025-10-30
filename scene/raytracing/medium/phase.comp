@@ -1,0 +1,35 @@
+#ifndef MSET_MEDIUM_PHASE_COMP
+#define MSET_MEDIUM_PHASE_COMP
+
+#include "data/shader/common/const.sh"
+
+//Henyey-Greenstein phase function
+float evaluatePhaseHG( float g, float cos_theta )
+{
+	float denom = 1.0 + g*g + 2.0*g*cos_theta;
+	return INVFOURPI * ( 1.0 - g*g ) / ( denom * sqrt(denom) );
+}
+
+//sample direction from HG phase function
+vec3 samplePhaseHG_t( vec2 r, float g )
+{
+	float cos_theta;
+	if( abs(g) < 1e-3 )
+	{
+		//isotropic case (uniform over sphere)
+		cos_theta = 1.0 - 2.0 * r.x;
+	}
+	else
+	{
+		//anisotropic case
+		float t = ( 1.0 - g*g ) / ( 1.0 - g + 2.0*g*r.x );
+		cos_theta = ( 1.0 + g*g - t*t ) / ( 2.0*g );
+	}
+
+	float sin_theta = sqrt( saturate( 1.0 - cos_theta*cos_theta ) );
+	float cos_phi = cos( TWOPI * r.y );
+	float sin_phi = sin( TWOPI * r.y );
+	return vec3( cos_phi * sin_theta, sin_phi * sin_theta, cos_theta );
+}
+
+#endif

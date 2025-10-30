@@ -1,0 +1,92 @@
+#ifndef MSET_BSDF_MICROFIBER_H
+#define MSET_BSDF_MICROFIBER_H
+
+#include "data/shader/mat/fresnel.frag"
+
+//combined diffuse+microfiber BRDF
+//based on "Production Friendly Microfacet Sheen BRDF", Alejandro Conty Estevez, Christopher Kulla
+
+USE_TEXTURE2D(tMicrofiberSheenAlbedoLUT);
+
+struct MicrofiberGCurve
+{
+	float a, b, c, d, e;
+};
+
+MicrofiberGCurve G_MicrofiberInterpolate( float roughness )
+{
+	float r  = 1.0 - roughness;
+	float r2 = r * r;
+
+	MicrofiberGCurve g;
+	g.a = mix(  21.5473,  25.3245, r2 );
+	g.b = mix(  3.82987,  3.32435, r2 );
+	g.c = mix(  0.19823,  0.16801, r2 );
+	g.d = mix( -1.97760, -1.27393, r2 );
+	g.e = mix( -4.32054, -4.85967, r2 );
+	return g;
+}
+
+float G_MicrofiberL( MicrofiberGCurve g, float x )
+{
+	return g.a * rcp(1.0 + g.b*pow(x, g.c)) + g.d*x + g.e;
+}
+
+float G1_Microfiber( MicrofiberGCurve g, float cosTheta )
+{
+	return cosTheta < 0.5
+		? exp( G_MicrofiberL(g, cosTheta) )
+		: exp( 2.0*G_MicrofiberL(g, 0.5) - G_MicrofiberL(g, saturate(1.0 - cosTheta)) );
+}
+
+float G2_Microfiber( float NdotL, float NdotV, float roughness )
+{
+	MicrofiberGCurve g = G_MicrofiberInterpolate( roughness );
+	float dL = G1_Microfiber( g, NdotL );
+	float dV = G1_Microfiber( g, NdotV );
+	
+	//soften shadow terminator, see section 4
+	{
+		float f = saturate( 1.0 - NdotL );
+		f *= f; f *= f; f *= f; // f^8
+		dL = pow( dL, 1.0 + 2.0*f );
+	}
+	return rcp( 1.0 + dL + dV );
+}
+
+float NDF_Microfiber( float NdotH, float roughness )
+{
+	float invr = rcp( roughness );
+	float sinTheta2 = saturate( 1.0 - NdotH*NdotH );
+	return ( 2.0 + invr ) * pow( sinTheta2, invr * 0.5 ) * INVTWOPI;
+}
+
+void evaluateBRDF_Microfiber( inout SampleState s, vec3 albedo, vec3 sheen, float roughness )
+{
+	if( isReflection(s) )
+	{
+		float Tout = 1.0 - 0.5 * fresnelSchlick( s.NdotV );
+		float Tin  = 1.0 - 0.5 * fresnelSchlick( s.NdotL );
+
+		vec3 diffuse    = Tin * Tout * albedo * INVPI;
+		vec3 reflection = vec3( 0.0, 0.0, 0.0 );
+		//HINT_FLATTEN if( isUpperHemisphere(s) )
+		{
+			float NdotH = dot( s.basis.N, s.H );
+			float D		= NDF_Microfiber( NdotH, roughness );
+			float G     = G2_Microfiber( s.NdotL, abs(s.NdotV), roughness );
+			reflection  = sheen * D * G * ( 0.25 * rcp(s.NdotL * abs(s.NdotV)) );
+
+			//scale diffuse based on directional reflection albedo to ensure energy conservation
+			//see "A Microfacet Based Coupled Specular-Matte BRDF Model with Importance Sampling", Csaba Kelemen, László Szirmay-Kalos
+			vec3 albedoL = sheen * texture2DLod( tMicrofiberSheenAlbedoLUT, vec2(s.NdotL, roughness), 0.0 ).x;
+			vec3 albedoV = sheen * texture2DLod( tMicrofiberSheenAlbedoLUT, vec2(abs(s.NdotV), roughness), 0.0 ).x;
+			diffuse *= min( oneminus(albedoL), oneminus(albedoV) );
+		}
+
+		s.bsdf += ( diffuse + reflection ) * s.NdotL;
+		s.pdf  += s.NdotL * INVPI * s.diffusionWeight;
+	}
+}
+
+#endif

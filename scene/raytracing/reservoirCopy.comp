@@ -1,0 +1,35 @@
+#include "buffers.comp"
+
+uniform uint2 uScreenSize;
+
+USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tTemporalReservoir );
+#ifdef RESERVOIR_GI
+USE_TEXTURE2DARRAY_NOSAMPLER( tTemporalReservoirSamples );
+#endif
+
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tFinalReservoir, 0 );
+#ifdef RESERVOIR_GI
+USE_LOADSTORE_TEXTURE2DARRAY( float, tFinalReservoirSample, 1 );
+#endif
+
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+	const uint pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+	const uint4 reservoirData0 = imageLoadArray( tTemporalReservoir, outputCoord, 0 );
+	const uint4 reservoirData1 = imageLoadArray( tTemporalReservoir, outputCoord, 1 );
+	imageStoreArray( tFinalReservoir, outputCoord, 0, reservoirData0 );
+	imageStoreArray( tFinalReservoir, outputCoord, 1, reservoirData1 );
+
+#ifdef RESERVOIR_GI
+	const vec4 resampleData0 = imageLoadArray( tTemporalReservoirSamples, outputCoord, 0 );
+	imageStoreArray( tFinalReservoirSample, outputCoord, 0, resampleData0 );
+	const vec4 resampleData1 = imageLoadArray( tTemporalReservoirSamples, outputCoord, 1 );
+	imageStoreArray( tFinalReservoirSample, outputCoord, 1, resampleData1 );
+#endif
+}

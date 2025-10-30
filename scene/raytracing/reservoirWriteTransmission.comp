@@ -1,0 +1,90 @@
+#include "buffers.comp"
+#include "reservoir.comp"
+#include "data/shader/common/rng.comp"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/scene/raytracing/common.comp"
+
+uniform uint2 uTargetSize;
+uniform uint  uFrameNumber;
+uniform uint  uRandomSeed;
+uniform uint  uOutputChannel;
+uniform mat4  uInvViewMatrix;
+// initial raw reservoir
+USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tReservoir );
+USE_TEXTURE2DARRAY_NOSAMPLER( tSample );
+// output
+USE_LOADSTORE_TEXTURE2D( float, tRefractionRadiance, 0 );
+
+// only for GI/specular reservoir
+Reservoir loadReservoirData(
+	const uint2 coord )
+{
+	Reservoir res = newReservoir();
+	if( ( coord.x >= uTargetSize.x || coord.y >= uTargetSize.y ) )
+	{
+		return res;
+	}
+
+	// load data
+	uint4	   resData0;
+	uint4	   resData1;
+	resData0 = imageLoadArray( tReservoir, coord, 0 );
+	resData1 = imageLoadArray( tReservoir, coord, 1 );
+	// initialize reservoir
+	res.Lradiance = resData0.xyz;
+	res.indirectPDF = asfloat( resData0.w );
+	res.distance = -1;
+	res.pdfTarget = asfloat( resData1.x );
+	res.W = asfloat( resData1.y );
+	res.M = ushort( resData1.z >> 16 );
+	res.age = ushort( resData1.z & 0xFFFF );
+#if defined( RESERVOIR_GI )
+	res.pathFlagAndTransmissionWeight = resData1.w;
+#endif
+	return res;
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uTargetSize.x || outputCoord.y >= uTargetSize.y )
+	{
+		return;
+	}
+	RNG			rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, uRandomSeed );
+
+	// load from downsampled reservoir that is resampled
+	Reservoir	res;
+	// load reservoir
+	res = loadReservoirData( outputCoord );
+#if defined RESERVOIR_GI
+	// check if current has transmission
+	const bool currentHasTransmission = ( f16tof32( res.pathFlagAndTransmissionWeight & 0xffff ) ) > 1e-5f;
+	// early exit	
+		if (!currentHasTransmission)
+		{
+			return;
+		}
+#endif
+	// fill in the rest of the data
+	res.visiblePositionNormal = imageLoadArray( tSample, outputCoord, 0 );
+	res.samplePositionNormal = imageLoadArray( tSample, outputCoord, 1 );
+	// convert to total weight from average weight
+	res.W = res.W * res.M * calcReservoirTargetPDF( res );
+
+	// calculate new weight
+	const float newTargetFunc = calcReservoirTargetPDF( res );
+	const float weight = res.W * rcpSafe( res.M * newTargetFunc );
+	res.M = clamp( res.M, ushort( 0 ), ushort( 20 ) );
+
+	// load radiance
+	vec3		rayDir, radiance;
+	unpackVec2x3f( res.Lradiance, rayDir, radiance );
+	// multiply weight
+	vec3		result = radiance * weight;
+	// filters out any NaNs and +Infs that might have crept in
+	vec4	   currentResult = imageLoadRW( tRefractionRadiance, outputCoord );
+	currentResult += vec4( result, 0.0f );
+	currentResult.xyz = clamp( currentResult.xyz, vec3( 0, 0, 0 ), vec3( 65504, 65504, 65504 ) );
+	imageStore( tRefractionRadiance, outputCoord, currentResult );
+}

@@ -1,0 +1,131 @@
+#include "buffers.comp"
+#include "reservoir.comp"
+#include "data/shader/common/rng.comp"
+#include "data/shader/common/rngHybrid.comp"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/resampling.comp"
+
+uniform uint  uFrameNumber;
+uniform uint  uRandomSeed;
+uniform uint2 uTargetSize;
+
+USE_TEXTURE2DARRAY_NOSAMPLER( tReSTIRIndirectSample );
+
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tTargetReservoir, 0 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tTargetReSTIRIndirectSample, 1 );
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 2 );
+#endif
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uTargetSize.x || outputCoord.y >= uTargetSize.y )
+	{
+		return;
+	}
+
+	RNG			rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, uRandomSeed );
+	// use even pixels for even frame, odd pixels for odd frame when reading from source
+	const bool	isEvenFrame = ( ( uFrameNumber % 2 ) == 0 );
+
+	// stream new sample into our reservoir
+	float		r = rngNextFloat( rng );
+
+	// load starting sample
+	int2		sourceCoord = int2( ( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize ) ) * vec2( uScreenSize ) );
+	const int2 startOffsets[4] = { int2( -1, 0 ), int2( 1, 0 ), int2( 0, -1 ), int2( 0, 1 ) };
+	if (isEvenFrame && ((sourceCoord.x + sourceCoord.y) % 2) != 0)
+	{
+		sourceCoord += startOffsets[int( r * 4 )];
+	}
+	else if (!isEvenFrame && ((sourceCoord.x + sourceCoord.y) % 2) == 0)
+	{
+		sourceCoord += startOffsets[int( r * 4 )];
+	}
+	sourceCoord.x = clamp( sourceCoord.x, 0, int( uScreenSize.x ) - 1 );
+	sourceCoord.y = clamp( sourceCoord.y, 0, int( uScreenSize.y ) - 1 );
+
+	Reservoir  res = loadReservoirData<true>( uint2( sourceCoord ) );
+	initReservoirStats( res );
+	res.visiblePositionNormal = imageLoadArray( tReSTIRIndirectSample, uint2( sourceCoord ), 0 );
+	res.samplePositionNormal = imageLoadArray( tReSTIRIndirectSample, uint2( sourceCoord ), 1 );
+
+	// convert to total weight from average weight
+	res.W = res.W * res.M * calcReservoirTargetPDF( res );
+	// neighbor positions
+	const vec3	currentVisiblePos = res.visiblePositionNormal.xyz;
+	const vec3	currentVisibleNormal = unpackUnitVectorOct( asuint( res.visiblePositionNormal.w ) );
+	const vec3	currentSamplePos = res.samplePositionNormal.xyz;
+
+#if defined( RESERVOIR_GI )
+	const bool currentIsTransmission = ( f16tof32( res.pathFlagAndTransmissionWeight & 0xffff ) ) > 1e-5f;
+#endif
+	
+	// get another random number
+	r = rngNextFloat( rng );
+	const int2 offsets[3] = { int2( 1, 0 ), int2( 0, 1 ), int2( 1, 1 ) };
+	for( int i = 0; i < 3; ++i )
+	{
+		// load starting sample
+		int2	   sourceCoord = int2( ( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize ) ) * vec2( uScreenSize ) ) + offsets[i];
+		// check if we have rendered on this pixel
+		const bool continueResolve = isEvenFrame ? ( ( ( sourceCoord.x + sourceCoord.y ) % 2 ) == 0 ) : ( ( ( sourceCoord.x + sourceCoord.y ) % 2 ) == 1 );
+		const bool isInsideScreen = sourceCoord.x >= 0 && sourceCoord.y >= 0 && sourceCoord.x < uScreenSize.x && sourceCoord.y < uScreenSize.y;
+		if ( continueResolve && isInsideScreen )
+		{
+			Reservoir newSample = loadReservoirData<true>( uint2( sourceCoord ) );
+			bool similarMaterial = true;
+		#if defined( RESERVOIR_GI )
+			const bool neighborIsTransmission = ( f16tof32( newSample.pathFlagAndTransmissionWeight & 0xffff ) ) > 1e-5f;
+			similarMaterial = currentIsTransmission == neighborIsTransmission;
+		#endif
+			if( similarMaterial )
+			{
+				// new sample, make sure we initialize the statistic of the reservoir
+				initReservoirStats( newSample );
+				// get visible/sample pos/normal
+				newSample.visiblePositionNormal = imageLoadArray( tReSTIRIndirectSample, uint2( sourceCoord ), 0 );
+				newSample.samplePositionNormal = imageLoadArray( tReSTIRIndirectSample, uint2( sourceCoord ), 1 );
+				
+				// neighbor positions
+				const vec3	neighborVisiblePos = newSample.visiblePositionNormal.xyz;
+				const vec3	neighborSamplePos = newSample.samplePositionNormal.xyz;
+				// neighbor normal
+				const vec3	neighborVisibleNormal = unpackUnitVectorOct( asuint( newSample.visiblePositionNormal.w ) );
+				const vec3	neighborSampleNormal = unpackUnitVectorOct( asuint( newSample.samplePositionNormal.w ) );
+				// calculate target function.
+				vec3		offsetA = currentVisiblePos - neighborSamplePos;
+				vec3		offsetB = neighborVisiblePos - neighborSamplePos;
+
+				// calculate Jacobian determinant and weight using all the factors
+			#if defined( RESERVOIR_GI )
+				// relax constraint on SSS/diffuse transmission
+				const float jacobian = currentIsTransmission ? 1.0f : computeJacobian( offsetA, offsetB, res, newSample );
+			#else
+				const float jacobian = computeJacobian( offsetA, offsetB, res, newSample );
+			#endif
+				float		newTargetFunc = clamp( calcReservoirTargetPDF( newSample ) * jacobian, 0.0f, 1e20f );
+
+				combineReservoir( res, newSample, r, newTargetFunc );
+			}
+		}
+	}
+
+	// calculate new weight
+	const float weight = res.W * rcpSafe( res.M * clamp( calcReservoirTargetPDF( res ), 0.0f, 1e20f ) );
+	res.M = clamp( res.M, ushort( 0 ), ushort( 20 ) );
+	// current data
+	const uint pixelIdx = outputCoord.y * uTargetSize.x + outputCoord.x;
+	uint4 restirData0 = uint4( res.Lradiance, asuint( res.indirectPDF ) );
+	uint4 restirData1 = uint4( asuint( res.pdfTarget ), asuint( weight ), ( uint( res.M ) << 16 ) | uint( res.age ), 0 );
+#if defined( RESERVOIR_GI )
+	restirData1.w = res.pathFlagAndTransmissionWeight;
+#elif defined( RESERVOIR_SPECULAR )
+	restirData1.w = res.specularBitFlag;
+#endif
+	imageStoreArray( tTargetReservoir, outputCoord, 0, restirData0 );
+	imageStoreArray( tTargetReservoir, outputCoord, 1, restirData1 );
+	imageStoreArray( tTargetReSTIRIndirectSample, uint2( outputCoord ), 0, res.visiblePositionNormal );
+	imageStoreArray( tTargetReSTIRIndirectSample, uint2( outputCoord ), 1, res.samplePositionNormal );
+}

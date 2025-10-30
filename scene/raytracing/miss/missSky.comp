@@ -1,0 +1,9 @@
+USE_TEXTURECUBE(tSkyTexture);
+uniform float	uSkyBrightness;
+uniform mat4	uWorldToSkyTransform;
+
+vec3	missSky( vec3 dir )
+{
+	dir = mulVec( uWorldToSkyTransform, dir );
+	return textureCubeLod( tSkyTexture, dir, 0.0 ).rgb * uSkyBrightness;
+}

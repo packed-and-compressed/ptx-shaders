@@ -1,0 +1,22 @@
+#ifndef MSET_BSDF_PASSTHROUGH_H
+#define MSET_BSDF_PASSTHROUGH_H
+
+//evaluate passthrough transmission BTDF weight
+void evaluateBTDF_Passthrough(	inout SampleState s, vec3 transmissivity )
+{
+	if( isTransmission(s) )
+	{
+		s.bsdf += s.Tout * transmissivity;
+		s.pdf  += s.transmissionWeight;
+	}
+}
+
+//sample passthrough transmission BTDF direction
+void sampleBTDF_Passthrough( inout SampleState s )
+{
+	s.L		= -s.V;
+	s.H		= vec3( 0.0, 0.0, 0.0 );
+	s.NdotL = dot( s.basis.N, s.L );
+}
+
+#endif

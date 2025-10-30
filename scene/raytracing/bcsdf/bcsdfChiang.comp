@@ -1,0 +1,743 @@
+#ifndef MSET_BCSDF_CHIANG_COMP
+#define MSET_BCSDF_CHIANG_COMP
+
+// A Practical and Controllable Hair and Fur Model for Production Path Tracing.
+// Matt Jen-Yuan Chiang, Benedikt Bitterli, Chuck Tappan, and Brent Burley.
+// Computer Graphics Forum (Proceedings of Eurographics 2016).
+// Project page: http://benedikt-bitterli.me/pchfm/
+
+#include "data/shader/common/util.sh"
+#include "data/shader/common/tangentbasis.sh"
+#include "data/shader/mat/fresnel.frag"
+
+#define BCSDF_R_PATH_FLAG (1<<0)
+#define BCSDF_TT_PATH_FLAG (1<<1)
+#define BCSDF_TRT_PATH_FLAG (1<<2)
+#define BCSDF_TRRT_PATH_FLAG (1<<3)
+#define BCSDF_ALL_PATH_FLAGS (BCSDF_R_PATH_FLAG | BCSDF_TT_PATH_FLAG | BCSDF_TRT_PATH_FLAG | BCSDF_TRRT_PATH_FLAG)
+
+// R, TT, TRT lobes
+#define BCSDF_NUM_LOBES (3)
+// Constants
+#define BCSDF_LN_TWOPI (1.8378770664093454) // ln(2*pi)
+#define BCSDF_SQRT_PI_OVER_8 (0.626657069)
+
+// From "Probe-based Lighting, Strand-based Hair System, and Physical Hair Shading in Unity's 'Enemies'", SIGGRAPH 2022
+// Attenuation approximation for hair scattering lobes
+// For R, no h needed because no absorption occurs, it's only specular reflection.
+// For TT, the dominant contribution comes from light transmitted straight through the fiber (thus 0). However in a RT setting, setting H_TT to 0 is not ideal
+// for high bounces because the azimuthal scattering transmits directly through the card every bounce, it causes high attenuation, so here we separate the attenuation for primary hit and secondary hit
+// For TRT, a similar observation is made and sqrt(3)/2 is used to approximate.
+#if defined( MATERIAL_PASS_RT_PRIMARYHIT ) ||\
+	( defined( MATERIAL_PASS_RT_PRIMARYHIT_RASTER ) && defined( SHADER_COMPUTE ) ) ||\
+	defined( MATERIAL_PASS_HYBRID_LIGHT_SAMPLE ) ||\
+	defined( MATERIAL_PASS_HYBRID_PRIMARYHIT ) ||\
+	defined( MATERIAL_PASS_HYBRID_SPATIALHASHDEBUG )
+// Primary hits
+#define HAIR_H_TT  (0.0)
+#elif defined( MATERIAL_PASS_RT_SECONDARYHIT ) ||\
+	  defined( MATERIAL_PASS_HYBRID_INDIRECT )
+// Secondary hits
+#define HAIR_H_TT  (0.97)
+#else
+// Raster
+#define HAIR_H_TT  (0.0)
+#endif
+#define HAIR_H_TRT (0.86602540378)
+#define HAIR_H_TRRT (0.86602540378)
+
+float sqr(float x) { return x * x; }
+vec3 log3( vec3 v ) { return vec3( log( v.x ), log( v.y ), log( v.z ) ); }
+
+#ifndef NP_LUT
+#define NP_LUT
+USE_TEXTURE3D(tNpLUT);
+#endif
+
+vec3 loadNpLUT( float phi, float cosThetaO, float beta_n )
+{
+    const float x = (phi + TWOPI) / FOURPI;
+    const float y = cosThetaO;
+    const float z = beta_n;
+    return texture3DLod( tNpLUT, vec3(x, y, z), 0.0 ).rgb;
+}
+
+TangentBasis getHairBasis(vec3 tangent, vec3 v)
+{
+	vec3 bitangent = normalize( cross( tangent, v ) );
+	vec3 normal = normalize( cross( tangent, bitangent ) );
+	TangentBasis basis;
+	basis.T = tangent;
+	basis.B = bitangent;
+	basis.N = normal;
+	return basis;
+}
+
+vec3 sigmaAFromReflectance( vec3 albedo, float beta_n )
+{
+    const float beta_n2 = beta_n * beta_n;
+	const float beta_n3 = beta_n2 * beta_n;
+	const float beta_n4 = beta_n3 * beta_n;
+	const float beta_n5 = beta_n4 * beta_n;
+	const float d = 5.969 - 0.215 * beta_n + 2.532 * beta_n2 - 10.73 * beta_n3 + 5.574 * beta_n4 + 0.245 * beta_n5;
+    const vec3 c = log3( albedo ) / d;
+    return c * c;
+}
+
+vec4 longitudinalVariance( float beta_m )
+{
+	vec4 v;
+	v[0] = sqr( 0.726 * beta_m + 0.812 * sqr( beta_m ) + 3.7 * pow( beta_m, 20.0 ) );
+	v[1] = 0.25 * v[0];
+	v[2] = 4.0 * v[0];
+	v[3] = v[2];
+	return v;
+}
+
+float logisticScale( float beta_n )
+{
+	return BCSDF_SQRT_PI_OVER_8 * ( 0.265 * beta_n + 1.194 * sqr( beta_n ) + 5.372 * pow( beta_n, 22.0 ) );
+}
+
+// "An Energy-Conserving Hair Reflectance Model", d'Eon et al. (2011), Eq. (15)
+// Numerical approximation to the Bessel function of the first kind
+float besselI0( float x )
+{
+	const float factorialSquared[10] =
+	{
+		1.0, // (0!)^2
+		1.0, // (1!)^2
+		4.0, // (2!)^2
+		36.0, // (3!)^2
+		576.0, // (4!)^2
+		14400.0, // (5!)^2
+		518400.0, // (6!)^2
+		25401600.0, // (7!)^2
+		1625702400.0, // (8!)^2
+		131681894400.0 // (9!)^2
+	};
+	float x2i = 1.0;
+	int i4 = 1;
+    float b = 0;
+    for (int i = 0; i < 10; ++i)
+    {
+		// x^(2i) / (4^i (i!)^2)
+        b += x2i / (float(i4) * factorialSquared[i]);
+		x2i *= x * x;
+		i4 *= 4;
+    }
+    return b;
+}
+
+// Logarithm of the Bessel function of the first kind
+float logBesselI0( float x )
+{
+	if( x > 12.0 )
+	{ return x + 0.5 * ( -BCSDF_LN_TWOPI + log( 1.0 / x ) + 1.0 / ( 8.0 * x ) ); }
+	return log( besselI0( x ) );
+}
+
+// "Light Scattering from Human Hair Fibers" by Marschner et al. (2003), Eq. 3
+float deltaPhi( uint p, float gammaO, float gammaT )
+{
+	return 2.0 * float( p ) * gammaT - 2.0 * gammaO + float( p ) * PI;
+}
+
+void adjustHairCuticleTilts( uint p, vec3 sin2kAlpha, vec3 cos2kAlpha, float sinThetaO, float cosThetaO, inout float sinThetaOp, inout float cosThetaOp )
+{
+	// Compute terms accounting for hair tilt scales
+	sinThetaOp = sinThetaO;
+	cosThetaOp = cosThetaO;
+	if ( p == 0 )
+	{
+	    sinThetaOp = sinThetaO * cos2kAlpha[1] - cosThetaO * sin2kAlpha[1];
+	    cosThetaOp = cosThetaO * cos2kAlpha[1] + sinThetaO * sin2kAlpha[1];
+	}
+	else if ( p == 1 )
+	{
+	    sinThetaOp = sinThetaO * cos2kAlpha[0] + cosThetaO * sin2kAlpha[0];
+	    cosThetaOp = cosThetaO * cos2kAlpha[0] - sinThetaO * sin2kAlpha[0];
+	}
+	else if ( p == 2 )
+	{
+	    sinThetaOp = sinThetaO * cos2kAlpha[2] + cosThetaO * sin2kAlpha[2];
+	    cosThetaOp = cosThetaO * cos2kAlpha[2] - sinThetaO * sin2kAlpha[2];
+	}
+	cosThetaOp = abs( cosThetaOp );
+}
+
+// "Light Scattering from Human Hair Fibers" by Marschner et al. (2003), Section 4.3
+struct BCSDFAttenuation
+{
+	mat4 terms; // xyz: attenuation, w: pdf
+};
+
+template<uint flags>
+BCSDFAttenuation hairAttenuation( float cosThetaO, float ior, vec3 reflectivity, vec3 Fintensity, float h, vec3 T )
+{
+	const float		 cosGammaO = sqrtSafe( 1.0 - h * h );
+	const float		 cosTheta = cosThetaO * cosGammaO;
+	const vec3		 f = fresnelSchlick( reflectivity, Fintensity, cosTheta, rcp( ior ) );
+	const vec3		 oneminusf = vec3( 1.0, 1.0, 1.0 ) - f;
+
+	const vec3 attenuationR = f;
+	const vec3 attenuationTT = oneminusf * oneminusf * T;
+	const vec3 attenuationTRT = attenuationTT * T * f;
+	const vec3 attenuationTRRT = attenuationTRT * f * T * rcpSafe( vec3( 1.0, 1.0, 1.0 ) - T * f );
+
+	// Calculate pdfs
+	vec4 pdfs = vec4( luminance( attenuationR ), luminance( attenuationTT ), luminance( attenuationTRT ), luminance( attenuationTRRT ) );
+	// Normalize pdfs
+	float totalPdf = 0.0;
+	if ( (flags & BCSDF_R_PATH_FLAG) != 0 )
+	{ totalPdf += pdfs[0]; }
+	if ( (flags & BCSDF_TT_PATH_FLAG) != 0 )
+	{ totalPdf += pdfs[1]; }
+	if ( (flags & BCSDF_TRT_PATH_FLAG) != 0 )
+	{ totalPdf += pdfs[2]; }
+	if ( (flags & BCSDF_TRRT_PATH_FLAG) != 0 )
+	{ totalPdf += pdfs[3]; }
+
+	const float normalizedTotalPdf = 1.0 / totalPdf;
+	pdfs *= normalizedTotalPdf;
+
+	BCSDFAttenuation attenuation;
+	// Primary specular (p=0, R)
+	attenuation.terms[0] = vec4( attenuationR, pdfs[0] );
+	// Transmission (p=1, TT)
+	attenuation.terms[1] = vec4( attenuationTT, pdfs[1] );
+	// Secondary specular (p=2, TRT)
+	attenuation.terms[2] = vec4( attenuationTRT, pdfs[2] );
+	// Residual component (p=3, TRRT)
+	attenuation.terms[3] = vec4( attenuationTRRT, pdfs[3] );
+	return attenuation;
+}
+
+// Appendix A, Eq. (10)
+float logistic( float x, float s )
+{
+	const float e = exp( -abs( x ) / s );
+	const float onepluse = 1.0 + e;
+	return e / ( s * onepluse * onepluse );
+}
+
+float logisticCDF( float x, float s )
+{
+	return 1.0 / ( 1.0 + exp( -x / s ) );
+}
+
+// Appendix A, Eq. (11)
+float trimmedLogistic( float x, float s, float a, float b )
+{
+	return logistic( x, s ) / ( logisticCDF( b, s ) - logisticCDF( a, s ) );
+}
+
+float sampleTrimmedLogistic( float u, float s, float a, float b )
+{
+	float k = logisticCDF( b, s ) - logisticCDF( a, s );
+	float x = -s * log( 1.0 / ( u * k + logisticCDF( a, s ) ) - 1.0 );
+	return clamp( x, a, b );
+}
+
+// "Importance Sampling for Physically-Based Hair Fiber Models", d'Eon et al. (2013), Section 3.2
+vec2 sampleMp( float v, float sinThetaO, float cosThetaO, vec2 xi )
+{
+	xi[0] = max( xi[0], 1e-4 );
+	// Eq. (6)
+	const float cosTheta = 1.0 + v * log( xi[0] + ( 1.0 - xi[0] ) * exp( -2.0 / v ) );
+	const float sinTheta = sqrtSafe( 1.0 - cosTheta * cosTheta );
+	const float cosPhi = cos( TWOPI * xi[1] );
+	const float sinThetaI = -cosTheta * sinThetaO + sinTheta * cosPhi * cosThetaO;
+	const float cosThetaI = sqrtSafe( 1.0 - sinThetaI * sinThetaI );
+	return vec2( cosThetaI, sinThetaI );
+}
+
+// "Importance Sampling for Physically-Based Hair Fiber Models", d'Eon et al. (2013), Eq. (8)
+// instead of using the gaussian detector proposed by "An Energy-Conserving Hair Reflectance Model" by d'Eon et al. (2011), we use
+// the Logistic Azimuthal Angular Distribution proposed by "A Practical and Controllable Hair and Fur Model for Production Path Tracing"
+float sampleNp( uint p, float s, float phiO, float gammaO, float gammaT, float xi )
+{
+	const float dphi = ( p < BCSDF_NUM_LOBES ) ? deltaPhi( p, gammaO, gammaT ) + sampleTrimmedLogistic( xi, s, -PI, PI ) : TWOPI * xi;
+	return phiO + dphi;
+}
+
+// Longitudinal scattering function Mp
+float longitudinalScattering( float cosThetaI, float cosThetaO, float sinThetaI, float sinThetaO, float v )
+{
+	// Original longitudinal scattering function by d'Eon had numerically stability issues when v < 0.1
+	// they later on revisited the implementation in "Importance Sampling for Physically-Based Hair Fiber Models"
+	// and this is what we use here
+	const float inv_v = 1.0 / v;
+	const float a = cosThetaI * cosThetaO * inv_v;
+	const float b = sinThetaI * sinThetaO * inv_v;
+	if( v <= 0.1 )
+	{
+		const float i0 = logBesselI0( a );
+		return exp( i0 - b - inv_v + 0.6931 + log( 0.5 * inv_v ) );
+	}
+	return exp( -b ) * besselI0( a ) / ( sinh( inv_v ) * 2.0 * v );
+}
+
+// Azimuthal scattering function Np (This isn't the full scattering function, because it's missing the attenuation term, we apply the attenuation term later on)
+float azimuthalScattering( float phi, uint p, float s, float gammaO, float gammaT )
+{
+	float dphi = phi - deltaPhi( p, gammaO, gammaT );
+	// Remap dphi to [-PI, PI]
+	dphi = (dphi + PI) - TWOPI * floor((dphi + PI) / TWOPI) - PI;
+	return trimmedLogistic( dphi, s, -PI, PI );
+}
+
+vec3 sampleBCSDF_t(
+	float eta,	  		// 1/index of refraction of the hair
+	vec3  reflectivity, // reflectivity
+	vec3  Fintensity, 	// fresnel intensity
+	float h,	  		// strand's diameter where h = [-1,1] corresponds to the ray grazing the edge of the circle, h = 0 corresponds to hitting it edge on
+	vec3  sigma_a,		// absorption coefficient
+	vec4  v,	  		// roughness variance from beta_m
+	float s,	  		// azimuthal logistic scale factor from beta_n
+	vec3  sin2kAlpha, 	// precalculated data for shifting highlights
+	vec3  cos2kAlpha,	// precalculated data for shifting highlights
+	vec3  V_t,	  		// wo in tangent space
+	vec4  r		  		// random numbers
+)
+{
+	const float ior = rcp( eta );
+
+	// Compute hair coordinate system terms related to V_t
+	const float sinThetaO = V_t.x;
+	const float cosThetaO = sqrtSafe( 1.0 - sinThetaO * sinThetaO );
+	const float phiO = atan2( V_t.z, V_t.y );
+
+	const float	sinThetaT = sinThetaO / ior;
+	const float	cosThetaT = sqrtSafe( 1.0 - sinThetaT * sinThetaT );
+
+	const float etap = sqrt( ior * ior - sinThetaO * sinThetaO ) / cosThetaO;
+	const float sinGammaT = h / etap;
+	const float cosGammaT = sqrtSafe( 1.0 - sinGammaT * sinGammaT );
+	const float gammaT = asinSafe( sinGammaT );
+	const float gammaO = asinSafe( h );
+
+	const vec3 T = exp( -sigma_a * ( 2.0 * cosGammaT / cosThetaT ) );
+	BCSDFAttenuation attenuation = hairAttenuation<BCSDF_ALL_PATH_FLAGS>( cosThetaO, ior, reflectivity, Fintensity, h, T );
+
+	// Determine which term p (lobe) to sample for hair scattering, the last lobe (TRRT) uses a uniform distribution
+	// if none of the previous lobes were sampled
+	uint		p;
+	for( p = 0; p < BCSDF_NUM_LOBES; ++p )
+	{
+		if( r[0] < attenuation.terms[p].w )
+		{ break; }
+		r[0] -= attenuation.terms[p].w;
+	}
+
+	// Compute terms accounting for hair tilt scales
+	float sinThetaOp;
+	float cosThetaOp;
+	adjustHairCuticleTilts( p, sin2kAlpha, cos2kAlpha, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp );
+
+	// Sample Mp to compute thetaI
+	const vec2 thetaI = sampleMp( v[p], sinThetaOp, cosThetaOp, r.zw );
+	const float cosThetaI = thetaI[0];
+	const float sinThetaI = thetaI[1];
+	// Sample Np to compute phi
+	const float phiI = sampleNp( p, s, phiO, gammaO, gammaT, r[1] );
+	return vec3( sinThetaI, cosThetaI * cos( phiI ), cosThetaI * sin( phiI ) );
+}
+
+vec3 sampleBCSDFClearcoat_t(
+	float eta,	  		// 1/index of refraction of the hair
+	vec3  reflectivity, // reflectivity
+	vec3  Fintensity, 	// fresnel intensity
+	float h,	  		// strand's diameter where h = [-1,1] corresponds to the ray grazing the edge of the circle, h = 0 corresponds to hitting it edge on
+	vec3  sigma_a,		// absorption coefficient
+	vec4  v,	  		// roughness variance from beta_m
+	float s,	  		// azimuthal logistic scale factor from beta_n
+	vec3  sin2kAlpha, 	// precalculated data for shifting highlights
+	vec3  cos2kAlpha,	// precalculated data for shifting highlights
+	vec3  V_t,	  		// wo in tangent space
+	vec4  r		  		// random numbers
+)
+{
+	const float ior = rcp( eta );
+
+	// Compute hair coordinate system terms related to V_t
+	const float sinThetaO = V_t.x;
+	const float cosThetaO = sqrtSafe( 1.0 - sinThetaO * sinThetaO );
+	const float phiO = atan2( V_t.z, V_t.y );
+
+	const float	sinThetaT = sinThetaO / ior;
+	const float	cosThetaT = sqrtSafe( 1.0 - sinThetaT * sinThetaT );
+
+	const float etap = sqrt( ior * ior - sinThetaO * sinThetaO ) / cosThetaO;
+	const float sinGammaT = h / etap;
+	const float cosGammaT = sqrtSafe( 1.0 - sinGammaT * sinGammaT );
+	const float gammaT = asinSafe( sinGammaT );
+	const float gammaO = asinSafe( h );
+
+	const vec3 T = exp( -sigma_a * ( 2.0 * cosGammaT / cosThetaT ) );
+	BCSDFAttenuation attenuation = hairAttenuation<BCSDF_R_PATH_FLAG>( cosThetaO, ior, reflectivity, Fintensity, h, T );
+
+	// For clearcoat, we only have one lobe
+	uint p = 0;
+	// Compute terms accounting for hair tilt scales
+	float sinThetaOp;
+	float cosThetaOp;
+	adjustHairCuticleTilts( p, sin2kAlpha, cos2kAlpha, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp );
+
+	// Sample Mp to compute thetaI
+	const vec2 thetaI = sampleMp( v[p], sinThetaOp, cosThetaOp, r.zw );
+	const float cosThetaI = thetaI[0];
+	const float sinThetaI = thetaI[1];
+	// Sample Np to compute phi
+	const float phiI = sampleNp( p, s, phiO, gammaO, gammaT, r[1] );
+	return vec3( sinThetaI, cosThetaI * cos( phiI ), cosThetaI * sin( phiI ) );
+}
+
+vec3 evaluateBCSDF(
+	float					eta,			// 1/index of refraction of the hair
+	vec3 					reflectivity, 	// reflectivity
+	vec3 					Fintensity, 	// fresnel intensity
+	float					h,				// strand's diameter where h = [-1,1] corresponds to the ray grazing the edge of the circle, h = 0 corresponds to hitting it edge on
+	vec3					sigma_a,		// absorption coefficient
+	vec4					v,				// roughness variance from beta_m
+	float					s,				// azimuthal logistic scale factor from beta_n
+	vec3 					sin2kAlpha, 	// precalculated data for shifting highlights
+	vec3 					cos2kAlpha, 	// precalculated data for shifting highlights
+	vec3					V_t,			// wo in tangent space
+	vec3					L_t,			// wi in tangent space
+	inout BCSDFAttenuation 	attenuation, 	// attenuation terms
+	inout float 			pdf				// pdf of the sampled direction
+)
+{
+	const float ior = rcp( eta );
+
+	// Compute hair coordinate system terms related to V_t
+	const float sinThetaO = V_t.x;
+	const float cosThetaO = sqrtSafe( 1.0 - sinThetaO * sinThetaO );
+	const float phiO = atan2( V_t.z, V_t.y );
+
+	const float sinThetaT = sinThetaO / ior;
+	const float cosThetaT = sqrtSafe( 1.0 - sinThetaT * sinThetaT );
+
+	// Compute hair coordinate system terms related to L_t
+	const float sinThetaI = L_t.x;
+	const float cosThetaI = sqrtSafe( 1.0 - sinThetaI * sinThetaI );
+	const float phiI = atan2( L_t.z, L_t.y );
+
+	// Compute relative azimuthal angle phi
+	const float phi = phiI - phiO;
+
+	// Compute modified index of refraction
+	const float etap = sqrt( ior * ior - sinThetaO * sinThetaO ) / cosThetaO;
+	const float sinGammaT = h / etap;
+	const float cosGammaT = sqrtSafe( 1.0 - sinGammaT * sinGammaT );
+	const float gammaT = asinSafe( sinGammaT );
+	const float gammaO = asinSafe( h );
+
+	const vec3 T = exp( -sigma_a * ( 2.0 * cosGammaT / cosThetaT ) );
+	attenuation = hairAttenuation<BCSDF_ALL_PATH_FLAGS>( cosThetaO, ior, reflectivity, Fintensity, h, T );
+
+	vec4 result = vec4( 0.0, 0.0, 0.0, 0.0 ); // xyz is fsum, w is pdf
+	float mp = 0.0;
+	float np = 0.0;
+	for( uint p = 0; p < BCSDF_NUM_LOBES; ++p )
+	{
+		// Compute terms accounting for hair tilt scales
+		float sinThetaOp;
+		float cosThetaOp;
+		adjustHairCuticleTilts( p, sin2kAlpha, cos2kAlpha, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp );
+
+		// Compute and accumulate BCSDF/PDF for hair scattering lobes
+		mp = longitudinalScattering( cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, v[p] );
+		np = azimuthalScattering( phi, p, s, gammaO, gammaT );
+		result += mp * np * attenuation.terms[p];
+	}
+
+	// Account for the last lobe (TRRT)
+	mp = longitudinalScattering( cosThetaI, cosThetaO, sinThetaI, sinThetaO, v[3] );
+	np = INVTWOPI;
+	result += mp * np * attenuation.terms[3];
+
+	vec3 fsum = result.xyz;
+	pdf = result.w;
+
+	// Finally, divide by cos theta i
+	if( abs( L_t.z ) > 0 )
+	{ fsum /= abs( L_t.z ); }
+
+	return fsum;
+}
+
+vec3 evaluateBCSDFClearcoat(
+	float					eta,			// 1/index of refraction of the hair
+	vec3 					reflectivity, 	// reflectivity
+	vec3 					Fintensity, 	// fresnel intensity
+	float					h,				// strand's diameter where h = [-1,1] corresponds to the ray grazing the edge of the circle, h = 0 corresponds to hitting it edge on
+	vec3					sigma_a,		// absorption coefficient
+	vec4					v,				// roughness variance from beta_m
+	float					s,				// azimuthal logistic scale factor from beta_n
+	vec3 					sin2kAlpha, 	// precalculated data for shifting highlights
+	vec3 					cos2kAlpha, 	// precalculated data for shifting highlights
+	vec3					V_t,			// wo in tangent space
+	vec3					L_t,			// wi in tangent space
+	inout BCSDFAttenuation 	attenuation, 	// attenuation terms
+	inout float 			pdf				// pdf of the sampled direction
+)
+{
+	const float ior = rcp( eta );
+
+	// Compute hair coordinate system terms related to V_t
+	const float sinThetaO = V_t.x;
+	const float cosThetaO = sqrtSafe( 1.0 - sinThetaO * sinThetaO );
+	const float phiO = atan2( V_t.z, V_t.y );
+
+	const float sinThetaT = sinThetaO / ior;
+	const float cosThetaT = sqrtSafe( 1.0 - sinThetaT * sinThetaT );
+
+	// Compute hair coordinate system terms related to L_t
+	const float sinThetaI = L_t.x;
+	const float cosThetaI = sqrtSafe( 1.0 - sinThetaI * sinThetaI );
+	const float phiI = atan2( L_t.z, L_t.y );
+
+	// Compute relative azimuthal angle phi
+	const float phi = phiI - phiO;
+
+	// Compute modified index of refraction
+	const float etap = sqrt( ior * ior - sinThetaO * sinThetaO ) / cosThetaO;
+	const float sinGammaT = h / etap;
+	const float cosGammaT = sqrtSafe( 1.0 - sinGammaT * sinGammaT );
+	const float gammaT = asinSafe( sinGammaT );
+	const float gammaO = asinSafe( h );
+
+	const vec3 T = exp( -sigma_a * ( 2.0 * cosGammaT / cosThetaT ) );
+	attenuation = hairAttenuation<BCSDF_R_PATH_FLAG>( cosThetaO, ior, reflectivity, Fintensity, h, T );
+
+	uint p = 0;
+	// Compute terms accounting for hair tilt scales
+	float sinThetaOp;
+	float cosThetaOp;
+	adjustHairCuticleTilts( p, sin2kAlpha, cos2kAlpha, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp );
+
+	// Compute and accumulate BCSDF/PDF for hair scattering lobes
+	float mp = longitudinalScattering( cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, v[p] );
+	float np = azimuthalScattering( phi, p, s, gammaO, gammaT );
+	vec4 result = mp * np * attenuation.terms[p];
+
+	vec3 fsum = result.xyz;
+	pdf = result.w;
+
+	// Finally, divide by cos theta i
+	if( abs( L_t.z ) > 0 )
+	{ fsum /= abs( L_t.z ); }
+
+	return fsum;
+}
+
+vec3 evaluateBCSDFCards(
+	float					eta,			// 1/index of refraction of the hair
+	vec3 					reflectivity, 	// reflectivity
+	vec3 					Fintensity, 	// fresnel intensity
+	vec3					sigma_a,		// absorption coefficient
+	vec4					v,				// roughness variance from beta_m
+	float					s,				// azimuthal logistic scale factor from beta_n
+	vec3 					sin2kAlpha, 	// precalculated data for shifting highlights
+	vec3 					cos2kAlpha, 	// precalculated data for shifting highlights
+	vec3					V_t,			// wo in tangent space
+	vec3					L_t,			// wi in tangent space
+	float 					VoL,			// dot(V_t, L_t)
+	float 					beta_n,			// azimuthal roughness
+	inout BCSDFAttenuation 	attenuation, 	// attenuation terms
+	inout float 			pdf				// pdf of the sampled direction
+)
+{
+	const float ior = rcp( eta );
+
+	// Compute hair coordinate system terms related to V_t
+	const float sinThetaO = V_t.x;
+	const float cosThetaO = sqrtSafe( 1.0 - sinThetaO * sinThetaO );
+	const float phiO = atan2( V_t.z, V_t.y );
+
+	const float sinThetaT = sinThetaO / ior;
+	const float cosThetaT = sqrtSafe( 1.0 - sinThetaT * sinThetaT );
+
+	// Compute hair coordinate system terms related to L_t
+	const float sinThetaI = L_t.x;
+	const float cosThetaI = sqrtSafe( 1.0 - sinThetaI * sinThetaI );
+	const float phiI = atan2( L_t.z, L_t.y );
+
+	// Compute relative azimuthal angle phi
+	const float phi = phiI - phiO;
+
+	// Compute modified index of refraction
+	const float etap = sqrt( ior * ior - sinThetaO * sinThetaO ) / cosThetaO;
+
+	// Compute attenuation and pdf for each lobe
+	vec3 attenuationR, attenuationTT, attenuationTRT, attenuationTRRT;
+	vec4 pdfs = vec4( 0.0, 0.0, 0.0, 0.0 );
+
+	// Primary specular (p=0, R)
+	{
+		const float cosTheta = sqrt(0.5 + 0.5 * VoL);
+		const vec3 f = fresnelSchlick( reflectivity, Fintensity, cosTheta, rcp( ior ) );
+		attenuationR = f;
+		pdfs[0] = luminance( f );
+	}
+	// Transmission (p=1, TT)
+	{
+		const float cosGammaO = sqrtSafe( 1.0 - HAIR_H_TT * HAIR_H_TT );
+		const float cosTheta = cosThetaO * cosGammaO;
+		const float sinGammaT = HAIR_H_TT / etap;
+		const float cosGammaT = sqrtSafe( 1.0 - sinGammaT * sinGammaT );
+		const vec3 f = fresnelSchlick( reflectivity, Fintensity, cosTheta, rcp( ior ) );
+		const vec3 T = exp( -sigma_a * ( 2.0 * cosGammaT / cosThetaT ) );
+		attenuationTT = (1.0 - f) * (1.0 - f) * T;
+		pdfs[1] = luminance( attenuationTT );
+	}
+	// Secondary specular (p=2, TRT)
+	{
+		const float cosGammaO = sqrtSafe( 1.0 - HAIR_H_TRT * HAIR_H_TRT );
+		const float cosTheta = cosThetaO * cosGammaO;
+		const float sinGammaT = HAIR_H_TRT / etap;
+		const float cosGammaT = sqrtSafe( 1.0 - sinGammaT * sinGammaT );
+		const vec3 f = fresnelSchlick( reflectivity, Fintensity, cosTheta, rcp( ior ) );
+		const vec3 T = exp( -sigma_a * ( 2.0 * cosGammaT / cosThetaT ) );
+		attenuationTRT = (1.0 - f) * (1.0 - f) * f * T * T;
+		pdfs[2] = luminance( attenuationTRT );
+	}
+	// Residual component (p=3, TRRT)
+	{
+		const float cosGammaO = sqrtSafe( 1.0 - HAIR_H_TRRT * HAIR_H_TRRT );
+		const float cosTheta = cosThetaO * cosGammaO;
+		const float sinGammaT = HAIR_H_TRRT / etap;
+		const float cosGammaT = sqrtSafe( 1.0 - sinGammaT * sinGammaT );
+		const vec3 f = fresnelSchlick( reflectivity, Fintensity, cosTheta, rcp( ior ) );
+		const vec3 T = exp( -sigma_a * ( 2.0 * cosGammaT / cosThetaT ) );
+		attenuationTRRT = (1.0 - f) * (1.0 - f) * f * f * T * T * T / ( vec3( 1.0, 1.0, 1.0 ) - f * T );
+		pdfs[3] = luminance( attenuationTRRT );
+	}
+
+	// Normalize pdfs
+	const float totalPdf = pdfs[0] + pdfs[1] + pdfs[2] + pdfs[3];
+	const float normalizedTotalPdf = 1.0 / totalPdf;
+	pdfs *= normalizedTotalPdf;
+
+	attenuation.terms[0] = vec4( attenuationR, pdfs[0] );
+	attenuation.terms[1] = vec4( attenuationTT, pdfs[1] );
+	attenuation.terms[2] = vec4( attenuationTRT, pdfs[2] );
+	attenuation.terms[3] = vec4( attenuationTRRT, pdfs[3] );
+
+	// Load pre-integrated azimuthal scattering function N from the LUT
+	const vec3 N = loadNpLUT( phi, cosThetaO, beta_n );
+
+	vec4 result = vec4( 0.0, 0.0, 0.0, 0.0 ); // xyz is fsum, w is pdf
+	float mp = 0.0;
+	float np = 0.0;
+	for( uint p = 0; p < BCSDF_NUM_LOBES; ++p )
+	{
+		// Compute terms accounting for hair tilt scales
+		float sinThetaOp;
+		float cosThetaOp;
+		adjustHairCuticleTilts( p, sin2kAlpha, cos2kAlpha, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp );
+
+		// Compute and accumulate BCSDF/PDF for hair scattering lobes
+		mp = longitudinalScattering( cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, v[p] );
+		np = N[p];
+		result += mp * np * attenuation.terms[p];
+	}
+
+	// Account for the last lobe (TRRT)
+	mp = longitudinalScattering( cosThetaI, cosThetaO, sinThetaI, sinThetaO, v[3] );
+	np = INVTWOPI;
+	result += mp * np * attenuation.terms[3];
+
+	vec3 fsum = result.xyz;
+	pdf = result.w;
+
+	// Finally, divide by cos theta i
+	if( abs( L_t.z ) > 0 )
+	{ fsum /= abs( L_t.z ); }
+
+	return fsum;
+}
+
+vec3 evaluateBCSDFCardsClearcoat(
+	float					eta,			// 1/index of refraction of the hair
+	vec3 					reflectivity, 	// reflectivity
+	vec3 					Fintensity, 	// fresnel intensity
+	vec3					sigma_a,		// absorption coefficient
+	vec4					v,				// roughness variance from beta_m
+	float					s,				// azimuthal logistic scale factor from beta_n
+	vec3 					sin2kAlpha, 	// precalculated data for shifting highlights
+	vec3 					cos2kAlpha, 	// precalculated data for shifting highlights
+	vec3					V_t,			// wo in tangent space
+	vec3					L_t,			// wi in tangent space
+	float 					VoL,			// dot(V_t, L_t)
+	float 					beta_n,			// azimuthal roughness
+	inout BCSDFAttenuation 	attenuation, 	// attenuation terms
+	inout float 			pdf				// pdf of the sampled direction
+)
+{
+	const float ior = rcp( eta );
+
+	// Compute hair coordinate system terms related to V_t
+	const float sinThetaO = V_t.x;
+	const float cosThetaO = sqrtSafe( 1.0 - sinThetaO * sinThetaO );
+	const float phiO = atan2( V_t.z, V_t.y );
+
+	const float sinThetaT = sinThetaO / ior;
+	const float cosThetaT = sqrtSafe( 1.0 - sinThetaT * sinThetaT );
+
+	// Compute hair coordinate system terms related to L_t
+	const float sinThetaI = L_t.x;
+	const float cosThetaI = sqrtSafe( 1.0 - sinThetaI * sinThetaI );
+	const float phiI = atan2( L_t.z, L_t.y );
+
+	// Compute relative azimuthal angle phi
+	const float phi = phiI - phiO;
+
+	// Compute modified index of refraction
+	const float etap = sqrt( ior * ior - sinThetaO * sinThetaO ) / cosThetaO;
+
+	// Compute attenuation and pdf for each lobe
+	// Primary specular (p=0, R)
+	const float cosTheta = sqrt(0.5 + 0.5 * VoL);
+	const vec3 f = fresnelSchlick( reflectivity, Fintensity, cosTheta, rcp( ior ) );
+	vec3 attenuationR = f;
+	float pdfR = luminance( f );
+	attenuation.terms[0] = vec4( attenuationR, pdfR );
+	attenuation.terms[1] = vec4( vec3(1.0, 1.0, 1.0), 0.0 );
+	attenuation.terms[2] = vec4( vec3(1.0, 1.0, 1.0), 0.0 );
+	attenuation.terms[3] = vec4( vec3(1.0, 1.0, 1.0), 0.0 );
+
+	// Load pre-integrated azimuthal scattering function N from the LUT
+	const vec3 N = loadNpLUT( phi, cosThetaO, beta_n );
+
+	// Compute terms accounting for hair tilt scales
+	uint p = 0;
+	float sinThetaOp;
+	float cosThetaOp;
+	adjustHairCuticleTilts( p, sin2kAlpha, cos2kAlpha, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp );
+
+	// Compute and accumulate BCSDF/PDF for hair scattering lobes
+	float mp = longitudinalScattering( cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, v[p] );
+	float np = N[p];
+	vec4 result = mp * np * attenuation.terms[p];
+
+	vec3 fsum = result.xyz;
+	pdf = result.w;
+
+	// Finally, divide by cos theta i
+	if( abs( L_t.z ) > 0 )
+	{ fsum /= abs( L_t.z ); }
+
+	return fsum;
+}
+
+#undef HAIR_H_TRRT
+#undef HAIR_H_TRT
+#undef HAIR_H_TT
+#undef BCSDF_SQRT_PI_OVER_8
+#undef BCSDF_LN_TWOPI
+#undef BCSDF_NUM_LOBES
+
+#endif // MSET_BCSDF_CHIANG_COMP

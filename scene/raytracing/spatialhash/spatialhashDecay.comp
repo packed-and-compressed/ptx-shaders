@@ -1,0 +1,38 @@
+#include "data/shader/common/rng.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/spatialhash/spatialhash.comp"
+
+USE_LOADSTORE_BUFFER( uint, bSpatialHashCheckSum, 0 );
+USE_LOADSTORE_BUFFER( uint, bSpatialHashAge, 1 );
+USE_LOADSTORE_BUFFER( uint, bSpatialRadianceCache, 2 );
+
+uniform uint uSpatialHashLength;
+uniform uint uRandomSeed;
+
+COMPUTE( 64, 1, 1 )
+{
+	if( DISPATCH_THREAD_ID.x >= uSpatialHashLength )
+	{
+		return;
+	}
+
+	RNG rng = rngInit( DISPATCH_THREAD_ID.x, uRandomSeed );
+
+	// get pixel index
+	const uint checkSum = bSpatialHashCheckSum[DISPATCH_THREAD_ID.x];
+	if( checkSum != 0 )
+	{
+		const uint currentAge = bSpatialHashAge[DISPATCH_THREAD_ID.x];
+		bSpatialHashAge[DISPATCH_THREAD_ID.x] = currentAge + 1;
+
+		if( bSpatialHashAge[DISPATCH_THREAD_ID.x] >= uSpatialHashDecayThreshold && rngNextFloat( rng ) > 0.5f )
+		{
+			bSpatialHashAge[DISPATCH_THREAD_ID.x] = 0;
+			bSpatialHashCheckSum[DISPATCH_THREAD_ID.x] = 0;
+			bSpatialRadianceCache[DISPATCH_THREAD_ID.x * 4 + 0 ] = 0;
+			bSpatialRadianceCache[DISPATCH_THREAD_ID.x * 4 + 1 ] = 0;
+			bSpatialRadianceCache[DISPATCH_THREAD_ID.x * 4 + 2 ] = 0;
+			bSpatialRadianceCache[DISPATCH_THREAD_ID.x * 4 + 3 ] = 0;
+		}
+	}
+}

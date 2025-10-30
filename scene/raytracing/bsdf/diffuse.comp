@@ -1,0 +1,96 @@
+#ifndef MSET_BSDF_DIFFUSE_H
+#define MSET_BSDF_DIFFUSE_H
+
+#include "data/shader/mat/fresnel.frag"
+
+//diffuse BSDF with roughness & retro-reflection
+//based on "Extending the Disney BRDF to a BSDF with Integrated Subsurface Scattering", B. Burley.
+
+//sample direction from cosine-weighted hemispherical distribution
+vec3 sampleHemisphereCosine_t( vec2 r )
+{
+	float cos_theta = sqrt( r.x );
+	float sin_theta = sqrt( 1.0 - r.x );
+	float cos_phi = cos( TWOPI * r.y );
+	float sin_phi = sin( TWOPI * r.y );
+	return vec3( cos_phi * sin_theta, sin_phi * sin_theta, cos_theta );
+}
+
+//evaluate diffuse BRDF weight
+void evaluateBRDF_Diffuse( inout SampleState s, vec3 albedo, float roughness )
+{
+	if( isReflection(s) )
+	{
+		float Fout = fresnelSchlick( s.NdotV );
+		float Fin  = fresnelSchlick( s.NdotL );
+		
+		//diffuse retro reflection
+		float LdotH = dot( s.L, s.H );
+		float Fd90  = 2.0 * roughness * (LdotH * LdotH);
+		float Rr	= Fd90 * ( Fin + Fout + Fin*Fout * (Fd90 - 1.0) );
+
+		float Tout = 1.0 - 0.5 * Fout;
+		float Tin  = 1.0 - 0.5 * Fin;
+		s.bsdf += ( (Tin * Tout + Rr) * (albedo * INVPI) ) * s.NdotL;
+		s.pdf  += s.NdotL * INVPI * s.diffusionWeight;
+	}
+}
+
+//importance sample diffuse BRDF direction
+void sampleBRDF_Diffuse( inout SampleState s )
+{
+	vec3 L_t = sampleHemisphereCosine_t( s.r.xy );
+
+	s.NdotL	= L_t.z; //shading space cos theta
+	s.L		= normalize( transformVecFrom( s.basis, L_t ) );
+	s.H		= normalize( s.V + s.L );
+}
+
+//evaluate diffuse BTDF at scattering exit point (includes retro reflection)
+//TODO: doesn't exactly match diffuse BRDF when scatter depth is near zero ~ms
+void evaluateBTDF_DiffuseOut( inout SampleState s, vec3 transmissivity, vec3 fuzz, float roughness )
+{
+	if( isTransmission(s) )
+	{
+		float Fout = fresnelSchlick( s.NdotV );
+		float Fin  = fresnelSchlick( abs(s.NdotL) );
+		float T    = 1.0 - 0.5 * Fout;
+
+		//diffuse retro reflection
+		float LdotH = clamp( dot( s.L, s.H ), -1.0, 1.0 ); //TODO: clamp here mitigates issues when fresnel=1; fix properly ~ms
+		float Fd90  = 2.0 * roughness * (LdotH * LdotH);
+		vec3  Fdout = Fout * fuzz;
+		vec3  Fdin  = Fin * fuzz;
+		vec3  Rr    = Fd90 * ( Fdin + Fdout + Fdin*Fdout * (Fd90 - 1.0) );
+
+		float pdf = abs(s.NdotL) * INVPI;
+		s.bsdf += ( T + Rr ) * transmissivity * pdf;
+		s.pdf  += pdf * s.transmissionWeight;
+	}
+}
+
+//evaluate diffuse BTDF at scattering entry point
+void evaluateBTDF_DiffuseIn( inout SampleState s, vec3 transmissivity )
+{
+	if( isTransmission(s) )
+	{
+		float Fin = fresnelSchlick( abs(s.NdotL) );
+		float T   = 1.0 - 0.5 * Fin;
+
+		float pdf = abs(s.NdotL) * INVPI;
+		s.bsdf += T * transmissivity * pdf;
+		s.pdf  += pdf * s.transmissionWeight;
+	}
+}
+
+//importance sample diffuse BTDF direction (inverted diffuse BRDF lobe)
+void sampleBTDF_Diffuse( inout SampleState s )
+{
+	vec3 L_t = sampleHemisphereCosine_t( s.r.xy );
+
+	s.NdotL	 = -L_t.z; //shading space cos theta
+	s.L		 = normalize( transformVecFrom( s.basis, -L_t ) );
+	s.H		 = normalize( s.V + s.L );
+}
+
+#endif

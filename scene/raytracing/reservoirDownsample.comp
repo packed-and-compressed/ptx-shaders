@@ -1,0 +1,94 @@
+#include "buffers.comp"
+#include "reservoir.comp"
+#include "data/shader/common/rng.comp"
+
+uniform uint2 uScreenSize;
+uniform uint2 uTargetSize;
+uniform int	  uMultiplyWeight;
+
+USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tReservoir );
+USE_TEXTURE2DARRAY_NOSAMPLER( tReSTIRIndirectSample );
+
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tTargetReservoir, 0 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tTargetReSTIRIndirectSample, 1 );
+
+Reservoir loadReservoirData(
+	const uint2 coord )
+{
+	Reservoir  reservoir;
+	const uint pixelIdx = coord.y * uScreenSize.x + coord.x;
+	uint4	   resData0;
+	uint4	   resData1;
+	resData0 = imageLoadArray( tReservoir, coord, 0 );
+	resData1 = imageLoadArray( tReservoir, coord, 1 );
+
+#if defined( RESERVOIR_GI ) || defined( RESERVOIR_SPECULAR )
+	reservoir.Lradiance = resData0.xyz;
+	reservoir.indirectPDF = asfloat( resData0.w );
+	reservoir.distance = -1;
+	reservoir.pdfTarget = asfloat( resData1.x );
+	reservoir.W = asfloat( resData1.y );
+#else
+	reservoir.Lradiance = resData0.xyz;
+	reservoir.distance = asfloat( resData0.w );
+	reservoir.pdfTarget = asfloat( resData1.x );
+	reservoir.lightIdx = asint( resData1.w );
+	reservoir.W = asfloat( resData1.y );
+#endif
+	reservoir.M = ushort( resData1.z >> 16 );
+	reservoir.age = ushort( resData1.z & 0xFFFF );
+
+#if defined( RESERVOIR_SPECULAR )
+	reservoir.specularBitFlag = resData1.w;
+#elif defined( RESERVOIR_GI )
+	reservoir.pathFlagAndTransmissionWeight = resData1.w;
+#endif
+	return reservoir;
+}
+
+// initialize weight, pdfTarget, M, and age when we just finish
+// PT and do not have any resampling statistic
+void initReservoirStats(
+	inout Reservoir res)
+{
+	vec3 radiance, L;
+	unpackVec2x3f( res.Lradiance, L, radiance );
+		
+	if( luminance( radiance ) > 0.0f && length( L ) > 0.0f )
+	{
+		res.W = 1.0f;
+		res.pdfTarget = luminance( radiance );
+		res.M = ushort( 1 );
+		res.age = 0;
+	}
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uTargetSize.x || outputCoord.y >= uTargetSize.y )
+	{
+		return;
+	}
+	
+	// screen coord is 2 times the output coord (irradiance texture)
+	const uint2 inputCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize ) * vec2( uScreenSize ) );
+
+	Reservoir res = loadReservoirData( inputCoord );
+	// new sample, make sure we initialize the statistic of the reservoir
+	initReservoirStats( res );
+	// store reservoir
+	const uint4 restirData0 = uint4( res.Lradiance, asuint( res.indirectPDF ) );
+	uint4 restirData1 = uint4( asuint( res.pdfTarget ), asuint( res.W ), ( uint( res.M ) << 16 ) | uint( res.age ), 0 );
+#if defined( RESERVOIR_GI )
+	restirData1.w = res.pathFlagAndTransmissionWeight;
+#elif defined( RESERVOIR_SPECULAR )
+	restirData1.w = res.specularBitFlag;
+#endif
+	imageStoreArray( tTargetReservoir, outputCoord, 0, restirData0 );
+	imageStoreArray( tTargetReservoir, outputCoord, 1, restirData1 );
+
+	// the visible position and normal in full resolution
+	imageStoreArray( tTargetReSTIRIndirectSample, outputCoord, 0, imageLoadArray( tReSTIRIndirectSample, inputCoord, 0 ) );
+	imageStoreArray( tTargetReSTIRIndirectSample, outputCoord, 1, imageLoadArray( tReSTIRIndirectSample, inputCoord, 1 ) );
+}

@@ -1,0 +1,308 @@
+#define RESERVOIR_SPECULAR
+
+#include "data/shader/common/ldsamplerHybrid.comp"
+#include "data/shader/common/rngHybrid.comp"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/packed.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/mat/hybridConstants.comp"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/resampling.comp"
+#include "data/shader/scene/raytracing/bsdf/beckmann.comp"
+#include "data/shader/scene/raytracing/bsdf/microfacet.comp"
+
+uniform vec4 uLightSpaceCameraPosition;
+uniform uint uFrameNumber;
+uniform uint uReservoirDownscaleFactor;
+
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tReSTIRBSDFData );
+// initial samples
+USE_TEXTURE2DARRAY_NOSAMPLER( tInitialSamples );
+USE_TEXTURE2DARRAY_NOSAMPLER( tTemporalSamples );
+// albedo
+USE_TEXTURE2DARRAY_NOSAMPLER( tAlbedo );
+// resampled samples
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tResampledReservoir, 0 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tResampledSample, 1 );
+#ifdef HYBRID_DEBUG
+USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 2 );
+#endif
+
+float loadRoughness(
+	const uint2 coord )
+{
+	return max( 0.0f, 1.0f - imageLoadArray( tAlbedo, coord, HybridAlbedoChannel::HYBRID_ALBEDO_SPECULAR_GLOSSINESS ).w );
+}
+
+float calcReservoirSpecularTargetPDF( const Reservoir res, const vec3 P, const vec3 N )
+{
+	return calcReservoirTargetPDF( res );
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	const uint2 currentGBufferCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize ) );
+	// rng
+	const uint4 rngData = rngLoadHybrid( currentGBufferCoord );
+	RNG			rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, rngData.x );
+	// current data
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	// get current geometric attributes
+	const vec3	currentNormal = sampleNormal( true, currentGBufferCoord );
+	const float currentDepth = abs( imageLoadLod( tDepth, currentGBufferCoord / ( uGBufferMipLevel + 1), uGBufferMipLevel ).x );
+	const uint	currentObjectID = imageLoad( tObjectID, currentGBufferCoord ).x - 1;
+	float		currentRoughness = loadRoughness( currentGBufferCoord );
+	
+#ifdef SPATIAL_RESAMPLE_2
+	bool readFromDownsampledRes = false;
+	Reservoir res;
+	uint4 resData0;
+	uint4 resData1;
+	#ifdef CHECKERBOARD
+		const bool isEvenFrame = ( ( uFrameNumber % 2 ) == 0 );
+		const bool isRendered = isEvenFrame ? ( ( ( outputCoord.x + outputCoord.y ) % 2 ) == 0 ) : ( ( ( outputCoord.x + outputCoord.y ) % 2 ) == 1 );
+		if( !isRendered )
+		{
+			readFromDownsampledRes = true;
+		}
+		
+		if( readFromDownsampledRes )
+		{
+			resData0 = imageLoadArray( tTemporalReservoir, outputCoord / uReservoirDownscaleFactor, 0 );
+			resData1 = imageLoadArray( tTemporalReservoir, outputCoord / uReservoirDownscaleFactor, 1 );
+			res.visiblePositionNormal = imageLoadArray( tTemporalSamples, outputCoord / uReservoirDownscaleFactor, 0 );
+			res.samplePositionNormal = imageLoadArray( tTemporalSamples, outputCoord / uReservoirDownscaleFactor, 1 );
+		}
+		else
+		{
+			resData0 = imageLoadRWArray( tResampledReservoir, outputCoord, 0 );
+			resData1 = imageLoadRWArray( tResampledReservoir, outputCoord, 1 );
+			res.visiblePositionNormal = imageLoadRWArray( tResampledSample, outputCoord, 0 );
+			res.samplePositionNormal = imageLoadRWArray( tResampledSample, outputCoord, 1 );
+		}
+	#else
+		resData0 = imageLoadRWArray( tResampledReservoir, outputCoord, 0 );
+		resData1 = imageLoadRWArray( tResampledReservoir, outputCoord, 1 );
+		res.visiblePositionNormal = imageLoadRWArray( tResampledSample, outputCoord, 0 );
+		res.samplePositionNormal = imageLoadRWArray( tResampledSample, outputCoord, 1 );
+	#endif
+	res.Lradiance = resData0.xyz;
+	res.indirectPDF = asfloat( resData0.w );
+	res.distance = -1;
+	res.pdfTarget = asfloat( resData1.x );
+	res.W = asfloat( resData1.y );
+	res.M = ushort( resData1.z >> 16 );
+	res.age = ushort( resData1.z & 0xFFFF );
+	res.specularBitFlag = resData1.w;
+	
+	if(!readFromDownsampledRes)
+	{
+		initReservoirStats( res );
+	}
+
+#else
+	// get current reservoir
+	Reservoir	res = loadReservoirData<true>( outputCoord );
+	res.visiblePositionNormal = imageLoadArray( tInitialSamples, outputCoord, 0 );
+	res.samplePositionNormal = imageLoadArray( tInitialSamples, outputCoord, 1 );
+#endif
+	// current pos
+	const vec3 currentVisiblePos = res.visiblePositionNormal.xyz;
+	const vec3 currentVisibleNormal = unpackUnitVectorOct( asuint( res.visiblePositionNormal.w ) );
+
+	// convert to total weight from average weight
+	res.W = res.W * res.M * calcReservoirTargetPDF( res );
+
+	if(uEnabled)
+	{
+		// initial search radius and random number
+		float		searchRadius = 32.0f;
+		float		r = rngNextFloat( rng );
+
+		float		aX = 0.0f;
+		float		aY = 0.0f;
+		vec3		microfacetTangent = vec3( 1, 0, 0 );
+		vec3		microfacetBitangent = vec3( 0, 1, 0 );
+		const uint2 bsdfData = imageLoad(tReSTIRBSDFData, outputCoord).xy;
+		if( res.specularBitFlag & HYBRID_ANISOTROPIC_FLAG )
+		{
+			const uint packedAnisotropy = bsdfData.x & 0xFFFF;
+			aX = ( ( packedAnisotropy >> 8 ) / 255.0f ) * 2.0f - 1.0f;
+			aY = ( ( packedAnisotropy & 0xFF ) / 255.0f ) * 2.0f - 1.0f;
+			microfacetTangent = unpackUnitVectorOct16bit( bsdfData.y >> 16 );
+			microfacetBitangent = unpackUnitVectorOct16bit( bsdfData.y & 0xFFFF );
+		}
+		else if( res.specularBitFlag & HYBRID_GLINTS_FLAG )
+		{
+			currentRoughness = asfloat( bsdfData.y );
+		}
+
+		for( int i = 0; i < uIteration && ( res.specularBitFlag > 0 ) && currentRoughness > 1e-3f; ++i )
+		{
+			const vec2	neighborCoord = vec2( outputCoord ) + neighborOffset( rngNextFloat( rng ), i, uIteration, searchRadius );
+			const uint2 neighborGBufferCoord = uint2( ( vec2( neighborCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize ) );
+
+			if( isNeighborValid( currentObjectID, currentDepth, currentNormal, vec2( neighborGBufferCoord ) ) )
+			{
+				Reservoir neighbor;
+
+				if(res.M < 4)
+				{
+				#ifdef SPATIAL_RESAMPLE_2
+					neighbor = loadReservoirData<false>( uint2( neighborCoord / uReservoirDownscaleFactor ) );
+				#else
+					neighbor = loadReservoirData<false>( uint2( neighborCoord ) );
+				#endif
+				}
+				else
+				{
+				#ifdef SPATIAL_RESAMPLE_2
+					neighbor = loadReservoirData<true>( uint2( neighborCoord / uReservoirDownscaleFactor ) );
+				#else
+					neighbor = loadReservoirData<true>( uint2( neighborCoord ) );
+				#endif
+				}
+
+				if( neighbor.age > uReSTIRAgeThreshold )
+				{
+					continue;
+				}
+				
+				if(res.M < 4)
+				{
+				#ifdef SPATIAL_RESAMPLE_2
+					neighbor.visiblePositionNormal = imageLoadArray( tTemporalSamples, uint2( neighborCoord / uReservoirDownscaleFactor ), 0 );
+					neighbor.samplePositionNormal = imageLoadArray( tTemporalSamples, uint2( neighborCoord / uReservoirDownscaleFactor ), 1 );
+				#else
+					neighbor.visiblePositionNormal = imageLoadArray( tTemporalSamples, uint2( neighborCoord ), 0 );
+					neighbor.samplePositionNormal = imageLoadArray( tTemporalSamples, uint2( neighborCoord ), 1 );
+				#endif
+				}
+				else
+				{
+				#ifdef SPATIAL_RESAMPLE_2
+					neighbor.visiblePositionNormal = imageLoadArray( tInitialSamples, uint2( neighborCoord / uReservoirDownscaleFactor ), 0 );
+					neighbor.samplePositionNormal = imageLoadArray( tInitialSamples, uint2( neighborCoord / uReservoirDownscaleFactor ), 1 );
+				#else
+					neighbor.visiblePositionNormal = imageLoadArray( tInitialSamples, uint2( neighborCoord ), 0 );
+					neighbor.samplePositionNormal = imageLoadArray( tInitialSamples, uint2( neighborCoord ), 1 );
+				#endif
+				}
+
+				// neighbor positions
+				const vec3	neighborVisiblePos = neighbor.visiblePositionNormal.xyz;
+				const vec3	neighborSamplePos = neighbor.samplePositionNormal.xyz;
+				// neighbor normal
+				const vec3	neighborSampleNormal = unpackUnitVectorOct( asuint( neighbor.samplePositionNormal.w ) );
+
+				// calculate target function.
+				vec3		offsetA = currentVisiblePos - neighborSamplePos;
+				vec3		offsetB = neighborVisiblePos - neighborSamplePos;
+
+				// check for directionality
+				if (dot(currentVisibleNormal, normalize(-offsetA)) > 0 &&
+					dot(neighborSampleNormal, normalize(offsetA)) > 0 &&
+					length(neighborSampleNormal) > 0)
+				{
+					// trace validation ray for bias correction (in reality not using this can lead to all sorts of
+					// light leaking, depending on how scene geometry is laid out)
+					Ray ray;
+					ray.direction = ( neighborSamplePos - currentVisiblePos );
+					ray.origin = currentVisiblePos + currentVisibleNormal * uRayOriginBias;
+					ray.minT = 0.0f;
+					ray.maxT = length( ray.direction ) * 0.99f;
+					ray.direction = normalize( ray.direction );
+
+					const vec3	rayEye = uLightSpaceCameraPosition.xyz - uLightSpaceCameraPosition.w * currentVisiblePos;
+
+					// construct sample state for pdf evaluation
+					SampleState sampleState;
+					sampleState.basis = createTangentBasis( currentNormal );
+					sampleState.V = normalize( rayEye );
+					sampleState.L = ray.direction;
+					sampleState.H = normalize( sampleState.L + sampleState.V );
+					sampleState.NdotL = dot( sampleState.basis.N, sampleState.L );
+					sampleState.NdotV = dot( sampleState.basis.N, sampleState.V );
+					sampleState.Tin = vec3( 1, 1, 1 );
+					sampleState.Tout = vec3( 1, 1, 1 );
+					sampleState.bsdf = vec3( 0, 0, 0 );
+					sampleState.pdf = 0.0f;
+
+					// check brdf pdf, the fresnel inputs are bogus as we do not care about it because we assume the specular
+					// reflection is fully reflective and in hybrid we apply fresnel at the end (embedded inside specular albedo)
+					// so here we assume very high reflectivity uniformly at all viewing angles (i.e. metallic) for discarding
+					// neighborhood samples
+					const float HdotV = dot( sampleState.H, sampleState.V );
+					const float alpha = max( currentRoughness * currentRoughness, 1e-5f );
+					if( res.specularBitFlag & HYBRID_ANISOTROPIC_FLAG )
+					{
+						evaluateBRDF_AnisoGGX( sampleState, vec3( 1, 1, 1 ), vec3( 1, 1, 1 ), 1.0f / 8.0f, alpha, aX, aY, HdotV, microfacetTangent, microfacetBitangent, 1.0f, 1.0f );
+					}
+					else if( res.specularBitFlag & HYBRID_GLINTS_FLAG )
+					{
+						// calculate ray directions for tangent space
+						const vec3 H_t = normalize( transformVecTo( sampleState.basis, sampleState.H ) );
+						const vec3 V_t = normalize( transformVecTo( sampleState.basis, sampleState.V ) );
+						const vec3 L_t = normalize( transformVecTo( sampleState.basis, sampleState.L ) );
+						// we use beckmann distribution to discard samples because glints is way too complicated and glints roughly fit into the beckmann distribution
+						sampleState.bsdf = vec3( 1, 1, 1 ) * evaluateBeckmann( V_t, L_t, H_t, alpha, sampleState.pdf );
+					}
+					else
+					{
+						evaluateBRDF_GGX( sampleState, vec3( 1, 1, 1 ), 1.0f, alpha, HdotV, 1.0f, 1.0f, 1.0f / 8.0f );
+					}
+
+					const float pdf = sampleState.pdf;
+					const float threshold = mix( 0.1f, 1e-3f, alpha );
+
+					// discard samples that do not fit within the lobe
+					if( pdf > threshold && luminance( sampleState.bsdf ) > threshold )
+					{
+						// calculate Jacobian determinant and weight using all the factors
+						const float jacobian = computeJacobian( offsetA, offsetB, res, neighbor );
+						// calculate neighbor's target pdf
+						float		newTargetFunc = clamp( calcReservoirTargetPDF( neighbor ) * jacobian, 0.0f, 1e20f );
+						// check ray
+						RayHit	   hit;
+						RayPayload payload;
+					#if defined( TraceTransparencyDither )
+						payload.rng = rng;
+					#endif
+					
+						// shoot ray
+						bool	   isOccluded = traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+						if( isOccluded )
+						{
+							newTargetFunc = 0;
+						}
+						// combine
+						if( combineReservoir( res, neighbor, r, newTargetFunc ) )
+						{
+							searchRadius *= 3.0f;
+						}
+					}
+				}
+			}
+		}
+
+	}
+	// calculate new weight
+	const float newTargetFunc = calcReservoirTargetPDF( res );
+	const float weight = res.W * rcpSafe( res.M * newTargetFunc );
+	res.M = clamp( res.M, ushort( 0 ), ushort( 20 ) );
+
+	const uint4 restirData0 = uint4( res.Lradiance, asuint( res.indirectPDF ) );
+	const uint4 restirData1 = uint4( asuint( res.pdfTarget ), asuint( weight ), ( uint( res.M ) << 16 ) | uint( res.age ), res.specularBitFlag );
+	imageStoreArray( tResampledReservoir, uint2( outputCoord ), 0, restirData0 );
+	imageStoreArray( tResampledReservoir, uint2( outputCoord ), 1, restirData1 );
+
+	imageStoreArray( tResampledSample, uint2( outputCoord ), 0, res.visiblePositionNormal );
+	imageStoreArray( tResampledSample, uint2( outputCoord ), 1, res.samplePositionNormal );
+}

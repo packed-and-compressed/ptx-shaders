@@ -1,0 +1,140 @@
+#ifndef MSET_LIGHTS_DISTANT_COMP
+#define MSET_LIGHTS_DISTANT_COMP
+
+#include "data/shader/mat/light.comp"
+#include "data/shader/mat/state.comp"
+
+void evaluateLight_Distant( LightParamsRT lp, inout LightSampleState s )
+{
+	s.radiance = lp.color;
+	s.pdf = 0.0;
+
+	float LdotZ = dot( s.L, lp.direction );
+	if( LdotZ > 0.0 )
+	{
+		float t = rcp( LdotZ );
+		vec3 p0 = t * s.L;
+		vec3 r  = p0 - lp.direction;
+		
+		float radius = lp.size.z;
+		if( radius > 0.0 )
+		{
+		#ifdef SceneHasDistantLights_Disk
+			//disk area light
+			float r2 = radius * radius;
+			if( dot( r, r ) < r2 )
+			{ 
+				float area = PI * r2;
+				s.pdf = rcp( LdotZ*LdotZ*LdotZ * area ); //d2 = 1/(LdotZ*LdotZ)
+			}
+		#endif
+		}
+		else
+		{
+		#ifdef SceneHasDistantLights_Rectangular
+			//rectangular area light
+			vec2 uv = vec2( dot( r, lp.axisX ), dot( r, lp.axisY ) );
+			if( abs( uv.x ) < 0.5*lp.size.x && abs( uv.y ) < 0.5*lp.size.y )
+			{
+				float area = lp.size.x * lp.size.y;
+				s.pdf = rcp( LdotZ*LdotZ*LdotZ * area ); //d2 = 1/(LdotZ*LdotZ)
+			}
+		#endif
+		}
+	}
+}
+
+void evaluateDirectLight_Distant( LightParamsRT lp, inout LightSampleState s )
+{
+	s.radiance = lp.color;
+	s.pdf = 0.0;
+
+	float LdotZ = dot( s.L, lp.direction );
+	if( LdotZ > 0.0 )
+	{
+		float t = rcp( LdotZ );
+		vec3 p0 = t * s.L;
+		vec3 r  = p0 - lp.direction;
+		
+		float radius = lp.size.z;
+		float area = lp.size.x * lp.size.y;
+		if( radius > 0.0 )
+		{
+		#ifdef SceneHasDistantLights_Disk
+			//disk area light
+			float r2 = radius * radius;
+			if( dot( r, r ) < r2 )
+			{ 
+				float area = PI * r2;
+				s.pdf = rcp( LdotZ*LdotZ*LdotZ * area ); //d2 = 1/(LdotZ*LdotZ)
+			}
+		#endif
+		}
+		else if( area > 0.0f )
+		{
+		#ifdef SceneHasDistantLights_Rectangular
+			//rectangular area light
+			vec2 uv = vec2( dot( r, lp.axisX ), dot( r, lp.axisY ) );
+			if( abs( uv.x ) < 0.5*lp.size.x && abs( uv.y ) < 0.5*lp.size.y )
+			{
+				float area = lp.size.x * lp.size.y;
+				s.pdf = rcp( LdotZ*LdotZ*LdotZ * area ); //d2 = 1/(LdotZ*LdotZ)
+			}
+		#endif
+		}
+		else
+		{
+			// directional light
+			s.L = lp.direction;
+			s.pdf = -1.0;// delta distribution light
+		}
+	}
+}
+
+void sampleLight_Distant( LightParamsRT lp, vec2 r, inout LightSampleState s )
+{
+	s.radiance = lp.color;
+	s.distance = lp.castShadows ? INFINITY : 0.0;
+
+	float area   = lp.size.x * lp.size.y;
+	float radius = lp.size.z;
+	if( radius > 0.0 )
+	{
+	#ifdef SceneHasDistantLights_Disk
+		//disk area light
+		float sqrtR = radius * sqrt( r.x );
+		float theta = r.y * TWOPI;
+		vec2  uv = vec2( sqrtR * cos(theta), sqrtR * sin(theta) );
+		vec3  Lp = lp.direction + uv.x * lp.axisX + uv.y * lp.axisY;
+		s.L = normalize( Lp );
+		
+		//pdf with respect to area converted to solid angle measure
+		area = PI * radius * radius;
+		float LdotZ = saturate( dot( s.L, lp.axisZ ) );
+		//since disk is always 1 unit away from shading point d2 = 1/(LdotZ*LdotZ)
+		s.pdf = LdotZ > 0.0 ? rcp( LdotZ*LdotZ*LdotZ * area ) : 0.0;
+	#endif
+	}
+	else if( area > 0.0 )
+	{
+	#ifdef SceneHasDistantLights_Rectangular
+		//rectangular area light
+		vec2  uv = vec2( r.x - 0.5, r.y - 0.5 ) * lp.size.xy;
+		vec3  Lp = lp.direction + uv.x * lp.axisX + uv.y * lp.axisY;
+		float d2 = dot( Lp, Lp );
+		s.L = Lp * rsqrt( d2 );
+
+		//pdf with respect to area converted to solid angle measure
+		float LdotZ = saturate( dot( s.L, lp.axisZ ) );
+		s.pdf = LdotZ > 0.0 ? d2 * rcp( LdotZ * area ) : 0.0;
+	#endif
+	}
+	else
+	{
+		//directional light
+		s.L   = lp.direction;
+		s.pdf = -1.0; //delta distribution light
+	}
+}
+
+#endif

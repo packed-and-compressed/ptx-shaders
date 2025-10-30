@@ -1,0 +1,149 @@
+#ifndef MSET_BUFFERS_COMP
+#define MSET_BUFFERS_COMP
+
+#include "data/shader/common/packed.sh"
+// RT flags
+
+#define RT_COUNTER_LIGHTRAYS        0
+#define RT_COUNTER_SCATTERINGRAYS   4
+#define RT_COUNTER_INDIRECTRAYS     8
+#define RT_COUNTER_INDIRECTHITS     12
+
+#define RT_RAYFLAG_MEDIUM			            0x80000000
+#define RT_RAYFLAG_MEDIUMSCATTER	            0x40000000
+#define RT_RAYFLAG_SUBSURFACE		            0x20000000
+#define RT_RAYFLAG_SHADOWCATCHER	            0x00008000
+#define RT_RAYFLAG_CHANNEL                      0x00006000
+#define RT_RAYFLAG_MASK				            0xE000E000
+#define RT_OUTPUTCOORD_MASK                     (~uint(RT_RAYFLAG_MASK))
+
+// path flags inside path states
+#define RT_PATHFLAG_DIFFUSE                     0x80000000
+#define RT_PATHFLAG_NONSPECULAR                 0x40000000
+#define RT_PATHFLAG_TRANSMISSION                0x20000000
+#define RT_PATHFLAG_SUBSURFACE_AXIS             0x00030000
+
+// instead of RT_RAYFLAG_CHANNEL, we store output type in hybrid with outputcoord
+#define HYBRID_OUTPUT_TYPE         0x00006000
+#define HYBRID_DIFFUSE_GI          0x01
+#define HYBRID_SPECULAR            0x02
+#define HYBRID_REFRACTION          0x03
+#define HYBRID_INDIRECT_PASS_COUNT 3        // diffuse gi, specular, refraction 
+
+// stored in pathFlags in pathState.w (in addition to above path flags in the same uint32_t)
+// Note (highest bit to lowest bit):
+// 3 bits rt path flag 
+// 6 bits hybrid path
+// 5 bits empty 
+// 2 bits subsurface axis 
+// 16 bit subsurface radius
+
+// hybrid path
+#define HYBRID_PATH_ALLOW_SKY_SAMPLE             0x10000000
+#define HYBRID_PATH_REFRACTION_VISIBLE_POINT     0x08000000
+#define HYBRID_PATH_REFRACTION_SAMPLE_POINT      0x04000000
+#define HYBRID_PATH_REFRACTION_NON_SHADOW_CAST   0x02000000
+#define HYBRID_PATH_REFRACTION_SECONDARY_GBUFFER 0x01000000
+#define HYBRID_PATH_HAIR                         0x00800000
+
+// hybrid counter for indirect dispatch
+#define HYBRID_COUNTER_LIGHT_RAYS		0
+#define HYBRID_COUNTER_GI_RAYS			4
+#define HYBRID_COUNTER_GI_HITS			8
+#define HYBRID_COUNTER_MISS_DIFFUSE     12
+
+// buffer related macros
+#if defined(TypedObjectIndexLoad8)
+    #define USE_OBJECTINDEXBUFFER(name)		USE_TYPEDBUFFER(CPR_UINT8,name)
+#elif defined(TypedObjectIndexLoad16)
+    #define USE_OBJECTINDEXBUFFER(name) 	USE_TYPEDBUFFER(CPR_UINT16,name)
+#else
+    #define USE_OBJECTINDEXBUFFER(name) 	USE_BUFFER(uint,name)
+#endif
+
+#if defined(TypedObjectIndexStore8)
+    #define USE_LOADSTORE_OBJECTINDEXBUFFER(name,id) USE_LOADSTORE_TYPEDBUFFER(CPR_UINT8,name,id)
+#elif defined(TypedObjectIndexStore16)
+    #define USE_LOADSTORE_OBJECTINDEXBUFFER(name,id) USE_LOADSTORE_TYPEDBUFFER(CPR_UINT16,name,id)
+#else
+    #define USE_LOADSTORE_OBJECTINDEXBUFFER(name,id) USE_LOADSTORE_BUFFER(uint,name,id)
+#endif
+
+uniform uint uRTBufferStride;
+#define RT_BUFFER0(buf,index) buf[index]
+#define RT_BUFFER1(buf,index) buf[uRTBufferStride+index]
+#define RT_BUFFER2(buf,index) buf[mad(2,uRTBufferStride,index)]
+
+/*
+    PAYLOAD FORMATS
+    - Radiance [16b]
+        0: vec4( radiance.rgba )
+	- PathState [2x32b]
+		0 : vec4( packVec4f(throughput.rgb, 0.0), packVec2f(dO, dD), pathFlags | subsurfaceAxis | f32tof16(subsurfaceRadius) )
+		1a: vec4( packVec2x3f(mediumExtinction.rgb, mediumScatter.rgb).xyz, asfloat(mediumAnisotropy) )
+		1b: vec4( subsurfaceOrigin.xyz, packUnitVectorOct(subsurfaceNormal) )
+    - DirectRay [32b]
+        0: vec4( origin.xyz, flags|outputDesc )
+        1: vec4( packVec2x3f(direction.xyz, rayRadiance.rgb).xyz, maxT )
+    - IndirectRay [32b]
+        0: vec4( origin.xyz, flags|outputDesc )
+        1: vec4( packVec2x3f(direction.xyz, rayRadiance.rgb).xyz, misLightDistance )
+    - IndirectRayVolumetric [32b]
+        0: vec4( origin.xyz, flags|outputDesc )
+        1: vec4( direction.xyz, rayObjectIndex )
+    - IndirectRaySubsurfaceDiffusion [32b]
+        0: vec4( origin.xyz, flags|outputDesc )
+        1: vec4( packVec3f(direction.xyz).xy, rayMaxT, rayObjectIndex )
+    - IndirectHit [32b]
+        0: vec4( flags|outputDesc, asfloat(pathIndex), asfloat(triangleIndex), packUnitVec2f(triangleCoord.xy) )
+		1: vec4( packVec2x3f(direction.xyz, rayThroughput.rgb), hitT/invHitCount )
+ */
+ 
+// x: path state stride (we separate path state by diffuse gi and specular rays)
+// y: ray stride (we combine diffuse gi + refraction + specular rays, batch them and process together)
+uniform uint2 uHybridBufferStrides;
+#define HYBRID_PATHSTATE_BUFFER(buf,index)          buf[index]
+#define HYBRID_RAY_BUFFER0(buf,index)               buf[index]
+#define HYBRID_RAY_BUFFER1(buf,index)               buf[uHybridBufferStrides.y+index]
+#define HYBRID_INTERSECTION_BUFFER0(buf,index)      buf[index]
+#define HYBRID_MISS_BUFFER(buf,index)               buf[index]
+
+/*
+	PAYLOAD FORMATS (hybrid)
+	- Diffuse PathState [32b]
+		0: vec4( packVec4f(throughput.rgb, skyOcclusion), packVec2f(dO, dD), pathFlags | subsurfaceAxis | f32tof16(subsurfaceRadius) )
+		1a: vec4( origin.xyz, 0 )
+		1b: vec4( subsurfaceOrigin.xyz, packUnitVectorOct(subsurfaceNormal) )
+	- Specular PathState [32b]
+		0: vec4( packVec4f(throughput.rgb, skyOcclusion), packVec2f(dO, dD), pathFlags )
+		1: vec4( origin.xyz, 0 )
+    - Diffuse GI Intersection [16b]
+        0: vec4( hitT, flags|outputDesc, triangleIndex, packUnitVec2f(triangleCoord.xy) ) // diffuse GI
+    - Specular Intersection [16b]
+        1: vec4( hitT, flags|outputDesc, triangleIndex, packUnitVec2f(triangleCoord.xy) ) // specular
+    - ReSTIR [3x32b]
+		0: vec4( uint3( Lradiance ), distance )
+		1: vec4( pdfTarget, W, M & age, lightIdx )
+    - ReSTIRGI [3x32b]
+		0: vec4( uint3( Lradiance ), indirect pdf (diffuse) )
+		1: vec4( pdfTarget, W, M & age, - )
+    - ReSTIRGISample [3x32b]
+		0: vec4( visiblePos.xyz, packUnitVectorOct( visibleNormal.xyz ) )
+		1: vec4( samplePos.xyz, packUnitVectorOct( sampleNormal.xyz ) )
+    - ReSTIRSpecular [3x32b]
+		0: vec4( uint3( Lradiance ), indirect pdf )
+		1: vec4( pdfTarget, W, M & age, specularBitFlag )
+    - ReSTIRSpecularSample [3x32b]
+		0: vec4( visiblePos.xyz, packUnitVectorOct( visibleNormal.xyz ) )
+		1: vec4( samplePos.xyz, packUnitVectorOct( sampleNormal.xyz ) )
+    - ReSTIRBSDFData (additional buffer) [32b]
+		0: vec4( aX, aY, packUnitVectorOct( basisX ), packUnitVectorOct( basisY ) )
+	- SVGF [2x16b]
+		0: vec4( sppSum, first moment, second moment, variance )
+    - IndirectRaySubsurfaceDiffusion [32b]
+        0: vec4( origin.xyz, flags|outputDesc )
+        1: vec4( packVec3f(direction.xyz).xy, rayMaxT, rayObjectIndex )
+ */
+
+
+#endif

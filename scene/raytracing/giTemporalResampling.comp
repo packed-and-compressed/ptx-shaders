@@ -1,0 +1,166 @@
+#define RESERVOIR_GI
+
+#include "data/shader/common/ldsamplerHybrid.comp"
+#include "data/shader/common/rngHybrid.comp"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/resampling.comp"
+
+USE_TEXTURE2DARRAY( tAlbedo );
+// initial samples (sample pos and normal), GI only
+USE_TEXTURE2DARRAY_NOSAMPLER( tInitialSamples );
+USE_TEXTURE2DARRAY_NOSAMPLER( tTemporalSamples );
+// resampled samples
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tScratchReservoir, 0 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tScratchSample, 1 );
+#ifdef HYBRID_DEBUG
+USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 2 );
+#endif
+
+
+float sampleMetallic( uint2 outputCoord )
+{
+	return imageLoadArrayLod( tAlbedo, outputCoord / ( uGBufferMipLevel + 1), HybridAlbedoChannel::HYBRID_ALBEDO_DIFFUSE_METALNESS , uGBufferMipLevel ).w;
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+	const uint2 gBufferCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize ) );
+
+	// rng
+	const uint4 rngData = rngLoadHybrid( gBufferCoord );
+	RNG			rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, rngData.x );
+	// current data
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	// get current reservoir
+	Reservoir res = loadReservoirData<true>( outputCoord );
+	res.visiblePositionNormal = imageLoadArray( tInitialSamples, outputCoord, 0 );
+	res.samplePositionNormal = imageLoadArray( tInitialSamples, outputCoord, 1 );
+	// convert to total weight from average weight
+	res.W = res.W * res.M * calcReservoirTargetPDF( res );
+	// current pos
+	const vec3 currentVisiblePos = res.visiblePositionNormal.xyz;
+	const vec3 currentVisibleNormal = unpackUnitVectorOct( asuint( res.visiblePositionNormal.w ) );
+
+	// random number
+	float r = rngNextFloat( rng );
+    
+	// calculate previous uv
+	const vec4 motionVectorData = imageLoad( tMotionVector, gBufferCoord );
+	const vec2 motionVector = motionVectorData.xy;
+	vec2	   prevCoord = ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) * uInvScreenSize;
+	prevCoord -= motionVector;
+	prevCoord *= vec2( uScreenSize.xy );
+	
+	bool		isValid = false;
+	const vec2 prevGBufferCoord = ( ( vec2( prevCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) ) * vec2( uGBufferSize );
+	if( isReprojectionValid( vec2( gBufferCoord ), vec2( prevGBufferCoord ) ) )
+	{
+		isValid = true;
+	}
+
+	// check if current has transmission
+	const bool currentHasTransmission = ( f16tof32( res.pathFlagAndTransmissionWeight & 0xffff ) ) > 1e-5f;
+	const bool currentHasDiffuseTransmission = 
+		currentHasTransmission && 
+		( ( res.pathFlagAndTransmissionWeight & RT_PATHFLAG_DIFFUSE ) > 0 ) && 
+		( ( res.pathFlagAndTransmissionWeight & RT_PATHFLAG_TRANSMISSION ) > 0 );
+		
+	const float metallic = sampleMetallic( gBufferCoord );
+	isValid = isValid && ( metallic < 1.0f );
+
+	bool  foundValidSample = false;
+	if( isValid && uEnabled )
+	{
+		foundValidSample = true;
+
+		const uint prevPixelIdx = prevCoord.y * uScreenSize.x + prevCoord.x;
+		Reservoir  prevRes = loadReservoirData<false>( uint2( prevCoord ) );
+		prevRes.visiblePositionNormal = imageLoadArray( tTemporalSamples, uint2( prevCoord ), 0 );
+		prevRes.samplePositionNormal = imageLoadArray( tTemporalSamples, uint2( prevCoord ), 1 );
+
+        const bool isValidRes =
+            ( prevRes.visiblePositionNormal.x +
+              prevRes.visiblePositionNormal.y +
+              prevRes.visiblePositionNormal.z +
+              prevRes.visiblePositionNormal.w ) != 0;
+            
+		// prev sample normal
+		if( prevRes.age <= uReSTIRAgeThreshold && prevRes.M > 0 && isValidRes )
+		{
+			// neighbor positions
+			const vec3 prevVisiblePos = prevRes.visiblePositionNormal.xyz;
+			const vec3 prevSamplePos = prevRes.samplePositionNormal.xyz;
+			// neighbor normal
+			const vec3 prevVisibleNormal = unpackUnitVectorOct( asuint( prevRes.visiblePositionNormal.w ) );
+			const vec3 prevSampleNormal = unpackUnitVectorOct( asuint( prevRes.samplePositionNormal.w ) );
+			// calculate target function.
+			vec3		offsetA = currentVisiblePos - prevSamplePos;
+			vec3		offsetB = prevVisiblePos - prevSamplePos;
+			
+			// calculate Jacobian determinant and weight using all the factors
+			const float jacobian = currentHasTransmission ? 1.0f : computeJacobian( offsetA, offsetB, res, prevRes );
+			float		newTargetFunc = clamp( calcReservoirTargetPDF( prevRes ) * jacobian, 0.0f, 1e20f );
+
+			// check if prev has transmission
+			const bool	prevHasTransmission = ( f16tof32( prevRes.pathFlagAndTransmissionWeight & 0xffff ) ) > 1e-5f;
+
+			// check for directionality
+			const bool	reservoirsAreTransmissive = ( currentHasTransmission && prevHasTransmission );
+			const bool	reservoirsAreReflective = ( !currentHasTransmission && !prevHasTransmission );
+			const bool	validDirection = ( reservoirsAreTransmissive ) ||
+										( ( dot( currentVisibleNormal, normalize( -offsetA ) ) > 0 &&
+											dot( prevSampleNormal, normalize( offsetA ) ) > 0 ) &&
+										  ( length( prevSampleNormal ) > 0 ) &&
+										  reservoirsAreReflective );
+
+			// trace validation ray for reflection but not transmission
+			const bool traceValidationRay = reservoirsAreReflective;
+			bool isOccluded = false;
+			if ( validDirection )
+			{
+				// trace validation ray for bias correction (in reality not using this can lead to all sorts of
+				// light leaking, depending on how scene geometry is laid out)
+				if (traceValidationRay)
+				{
+					Ray ray;
+					ray.direction = prevSamplePos - currentVisiblePos;
+					ray.origin = currentVisiblePos + currentVisibleNormal * uRayOriginBias;
+					ray.minT = 0.0f;
+					ray.maxT = length( ray.direction ) * 0.99f;
+					ray.direction = normalize( ray.direction );
+
+					RayHit	   hit;
+					RayPayload payload;
+				#if defined( TraceTransparencyDither )
+					payload.rng = rng;
+				#endif
+					isOccluded = traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+					if (isOccluded)
+					{
+						newTargetFunc = 0;
+					}
+				}
+				combineReservoir( res, prevRes, r, newTargetFunc );
+			}
+		}
+	}
+	
+    // calculate new weight
+	const float newTargetFunc = calcReservoirTargetPDF( res );
+	const float weight = res.W * rcpSafe( res.M * newTargetFunc );
+	res.M = clamp( res.M, ushort( 0 ), ushort( 20 ) );
+	res.age++;
+	const uint4 restirData0 = uint4( res.Lradiance, asuint( res.indirectPDF ) );
+	const uint4 restirData1 = uint4( asuint( res.pdfTarget ), asuint( weight ), ( uint( res.M ) << 16 ) | uint( res.age ), res.pathFlagAndTransmissionWeight );
+	imageStoreArray( tScratchReservoir, uint2( outputCoord ), 0, restirData0 );
+	imageStoreArray( tScratchReservoir, uint2( outputCoord ), 1, restirData1 );
+	imageStoreArray( tScratchSample, uint2( outputCoord ), 0, res.visiblePositionNormal );
+	imageStoreArray( tScratchSample, uint2( outputCoord ), 1, res.samplePositionNormal );
+}

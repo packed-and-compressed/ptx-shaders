@@ -1,0 +1,55 @@
+#ifndef MSET_BSDF_ANISOTROPIC_H
+#define MSET_BSDF_ANISOTROPIC_H
+
+#include "data/shader/mat/state.frag"
+#include "data/shader/common/tangentbasis.sh"
+
+vec2    anisoScaleRotateAndBias( vec2 value, uint swapXY, uint scaleBias, vec2 xrot, vec2 yrot)
+{
+	value = scaleAndBias( value, scaleBias );
+	value = swapXY
+		? value.x * yrot + value.y * xrot
+		: value.x * xrot + value.y * yrot;
+	return value;
+}
+
+void	anisoGetBasis( TangentBasis basis, vec3 direction, out vec3 anisoX, out vec3 anisoY )
+{
+	// The direction is in tangent space
+	anisoX = normalize( basis.T * direction.x + basis.B * direction.y );
+	anisoY = cross( basis.N, anisoX );
+}
+
+void	anisoGetBasis( FragmentState s, vec3 direction, out vec3 anisoX, out vec3 anisoY )
+{
+	TangentBasis basis;
+	basis.T = s.vertexTangent;
+	basis.B = s.vertexBitangent;
+	basis.N = s.normal;
+	anisoGetBasis( basis, direction, anisoX, anisoY );
+}
+
+void	anisoGetBasis( TangentBasis basis, mat3x3 transform, vec3 direction, out vec3 anisoX, out vec3 anisoY )
+{
+	// The direction is in object space
+	anisoX = normalize( mulVec( transform, direction ) );
+	anisoY = cross( basis.N, anisoX );
+}
+
+void	anisoGetBasis( FragmentState s, mat3x3 transform, vec3 direction, out vec3 anisoX, out vec3 anisoY )
+{
+	TangentBasis basis;
+	basis.T = s.vertexTangent;
+	basis.B = s.vertexBitangent;
+	basis.N = s.normal;
+	anisoGetBasis( basis, transform, direction, anisoX, anisoY );
+}
+
+vec3	anisoRoughnessToA( float roughness, float aspect )
+{
+	//convert roughness value to 'a' values needed by BRDF
+	float r2 = roughness * roughness;
+	return vec3( r2 * aspect, r2 * rcp(aspect), r2 );
+}
+
+#endif

@@ -1,0 +1,278 @@
+#ifndef RESAMPLING_COMP
+#define RESAMPLING_COMP
+
+#include "buffers.comp"
+#include "reservoir.comp"
+#include "data/shader/scene/raytracing/reservoir.comp"
+
+USE_TEXTURE2D( tDepth );
+USE_TEXTURE2D_NOSAMPLER( tNormal );
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tObjectID );
+USE_TEXTURE2D( tPrevDepth );
+USE_TEXTURE2D_NOSAMPLER( tPrevNormal );
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tPrevObjectID );
+USE_TEXTURE2D_NOSAMPLER( tMotionVector );
+
+uniform uint2 uScreenSize;
+uniform vec2  uInvScreenSize;
+uniform uint2 uGBufferSize;
+uniform uint  uGBufferMipLevel;
+uniform uint  uReSTIRAgeThreshold;
+
+uniform vec4 uUnproject;	// { -2/proj[0][0], -2/proj[1][1], (1-proj[2][0])/proj[0][0], (1-proj[2][1])/proj[1][1] }
+uniform vec4 uPrevUnproject;// { -2/proj[0][0], -2/proj[1][1], (1-proj[2][0])/proj[0][0], (1-proj[2][1])/proj[1][1] }
+
+uniform mat4  uInvViewMatrix;
+uniform mat4  uPrevInvViewMatrix;
+
+uniform uint  uEnabled;
+
+#if defined( TEMPORAL_RESAMPLE )
+	// initial reservoir from tracing
+	USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tInitialReservoir );
+	// temporal reservoir from previous frame
+	USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tTemporalReservoir );
+#elif defined( SPATIAL_RESAMPLE )
+	// initial reservoir from tracing
+	USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tInitialReservoir );
+	// temporal reservoir from current frame (the pass before spatial resampling pass)
+	USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tTemporalReservoir );
+	// number of iterations to sample spatially
+	uniform int	 uIteration;
+#endif
+
+
+vec3 sampleNormal( bool isCurrent, uint2 outputCoord )
+{
+	vec3 n;
+	if( isCurrent )
+	{
+		n = imageLoadLod( tNormal, outputCoord / ( uGBufferMipLevel + 1), uGBufferMipLevel ).xyz;
+		n = mulVec( uInvViewMatrix, n ).xyz;
+	}
+	else
+	{
+		n = imageLoadLod( tPrevNormal, outputCoord / ( uGBufferMipLevel + 1), uGBufferMipLevel ).xyz;
+		n = mulVec( uPrevInvViewMatrix, n ).xyz;
+	}
+	return n;
+}
+
+template<bool isGBuffer>
+bool isInScreen(const vec2 screenCoord)
+{
+	vec2 bufferSize = vec2( uScreenSize );
+	if( isGBuffer )
+	{
+		bufferSize = vec2( uGBufferSize );
+	}
+
+	return screenCoord.x >= 0 &&
+		   screenCoord.x < bufferSize.x &&
+		   screenCoord.y >= 0 &&
+		   screenCoord.y < bufferSize.y;
+}
+
+
+Reservoir loadReservoir(
+	const uint4 resData0,
+	const uint4 resData1 )
+{
+	Reservoir  reservoir;
+#if defined( RESERVOIR_GI ) || defined( RESERVOIR_SPECULAR )
+	reservoir.Lradiance = resData0.xyz;
+	reservoir.indirectPDF = asfloat( resData0.w );
+	reservoir.distance = -1;
+	reservoir.pdfTarget = asfloat( resData1.x );
+	reservoir.W = asfloat( resData1.y );
+#else
+	reservoir.Lradiance = resData0.xyz;
+	reservoir.distance = asfloat( resData0.w );
+	reservoir.pdfTarget = asfloat( resData1.x );
+	reservoir.lightIdx = asint( resData1.w );
+	reservoir.W = asfloat( resData1.y );
+#endif
+	reservoir.M = ushort( resData1.z >> 16 );
+	reservoir.age = ushort( resData1.z & 0xFFFF );
+
+#if defined( RESERVOIR_SPECULAR )
+	reservoir.specularBitFlag = resData1.w;
+#elif defined( RESERVOIR_GI )
+	reservoir.pathFlagAndTransmissionWeight = resData1.w;
+#endif
+	return reservoir;
+}
+
+
+template <bool isInitial>
+Reservoir loadReservoirData(
+	const uint2 coord )
+{
+	Reservoir  reservoir;
+	uint4	   resData0;
+	uint4	   resData1;
+#if defined( TEMPORAL_RESAMPLE )
+	if( isInitial )
+	{
+		resData0 = imageLoadArray( tInitialReservoir, coord, 0 );
+		resData1 = imageLoadArray( tInitialReservoir, coord, 1 );
+	}
+	else
+	{
+		// previous frame's temporal reservoir
+		resData0 = imageLoadArray( tTemporalReservoir, coord, 0 );
+		resData1 = imageLoadArray( tTemporalReservoir, coord, 1 );
+	}
+#elif defined( SPATIAL_RESAMPLE )
+	if( isInitial )
+	{
+		resData0 = imageLoadArray( tInitialReservoir, coord, 0 );
+		resData1 = imageLoadArray( tInitialReservoir, coord, 1 );
+	}
+	else
+	{
+		// current frame's temporal reservoir
+		resData0 = imageLoadArray( tTemporalReservoir, coord, 0 );
+		resData1 = imageLoadArray( tTemporalReservoir, coord, 1 );
+	}
+#endif
+	return loadReservoir( resData0, resData1 );
+}
+
+// initialize weight, pdfTarget, M, and age when we just finish
+// PT and do not have any resampling statistic
+void initReservoirStats(
+	inout Reservoir res)
+{
+	vec3 radiance, L;
+	unpackVec2x3f( res.Lradiance, L, radiance );
+		
+	if( luminance( radiance ) > 0.0f && length( L ) > 0.0f )
+	{
+		res.W = 1.0f;
+		res.pdfTarget = luminance( radiance );
+		res.M = ushort( 1 );
+		res.age = 0;
+	}
+}
+
+#ifdef TEMPORAL_RESAMPLE
+bool isReprojectionValid(
+	const vec2 currentCoord,
+	const vec2 prevCoord)
+{
+	if( !isInScreen<true>( prevCoord ) )
+	{
+		return false;
+	}
+
+	bool	   isValid = true;
+	// check normal similarity
+	const vec3 currentNormal = sampleNormal( true, uint2( currentCoord ) ).xyz;
+	const vec3 prevNormal = sampleNormal( false, uint2( prevCoord ) ).xyz;
+	isValid = dot( currentNormal, prevNormal ) > 0.9030779018f;	// check position
+	const float currentDepth = abs( imageLoadLod( tDepth, uint2( currentCoord / ( uGBufferMipLevel + 1) ), uGBufferMipLevel ).x );
+	const float prevDepth = abs( imageLoadLod( tPrevDepth, uint2( prevCoord  / ( uGBufferMipLevel + 1)), uGBufferMipLevel ).x );
+	const bool	depthValid = abs( currentDepth - prevDepth ) < ( max( currentDepth, prevDepth ) * 0.1f );
+	isValid = isValid && depthValid;
+	return isValid;
+}
+
+#endif
+
+bool isNeighborValid(
+	const uint	currentObjectID,
+	const float currentDepth,
+	const vec3	currentNormal,
+	const vec2	neighborCoord )
+{
+	if( !isInScreen<true>( neighborCoord ) )
+	{
+		return false;
+	}
+	const float neighborDepth = abs( imageLoadLod( tDepth, uint2( neighborCoord  / ( uGBufferMipLevel + 1)), uGBufferMipLevel ).x );
+	const vec3	neighborNormal = sampleNormal( true, uint2( neighborCoord ) ).xyz;
+	const uint	neighborObjectID = imageLoad( tObjectID, uint2( neighborCoord ) ).x - 1;
+	bool		isValid = ( currentObjectID == neighborObjectID );
+	isValid = isValid && ( dot( neighborNormal, currentNormal ) > 0.9030779018f );
+	isValid = isValid && ( ( abs( neighborDepth - currentDepth ) ) < ( max( neighborDepth, currentDepth ) * 0.1f ) );
+	return isValid;
+}
+
+bool isNeighborValid(
+	const float currentDepth,
+	const vec3	currentNormal,
+	const uint2	neighborCoord )
+{
+	if( !isInScreen<true>( vec2( neighborCoord ) ) )
+	{
+		return false;
+	}
+	const float neighborDepth = abs( imageLoadLod( tDepth, neighborCoord / ( uGBufferMipLevel + 1), uGBufferMipLevel ).x );
+	const vec3	neighborNormal = sampleNormal( true, neighborCoord ).xyz;
+	bool		isValid = true;
+	isValid = isValid && ( dot( neighborNormal, currentNormal ) > 0.9030779018f );
+	isValid = isValid && ( ( abs( neighborDepth - currentDepth ) ) < ( max( neighborDepth, currentDepth ) * 0.1f ) );
+	return isValid;
+}
+
+vec2 neighborOffset(
+	const float u,
+	const int i,
+	const int iterationCount,
+	inout float searchRadius )
+{
+	// we keep shrinking the radius if there is no good sample, and when we do have good
+	// sample we expand again at the end
+	const float radiusShrinkRatio = 0.667f;
+	const float minSearchRadius = 8.0f;
+	searchRadius = max( searchRadius * radiusShrinkRatio, minSearchRadius );
+
+	const float h = float( i + 1 ) / float( iterationCount );
+	const float a = 6.2831f * ( sqrt( h ) * 13.0f + u );
+	const vec2	offset = vec2( cos( a ), sin( a ) ) * searchRadius;
+	return offset;
+}
+
+#if defined( RESERVOIR_GI ) || defined( RESERVOIR_SPECULAR )
+float computeJacobian(
+	vec3			offsetA,
+	vec3			offsetB,
+	const Reservoir currentReservoir,
+	const Reservoir candidateReservoir )
+{
+	// now calculate factors for jacobian, which is really just a bunch of vectors going between
+	// visible/sample pos from current reservoir to neighbor reservoir to make sure everything connects
+	const float RB2 = dot( offsetB, offsetB );
+	const float RA2 = dot( offsetA, offsetA );
+	offsetB = normalize( offsetB );
+	offsetA = normalize( offsetA );
+
+	const vec3 sampleNormal = normalize( unpackUnitVectorOct( asuint( candidateReservoir.samplePositionNormal.w ) ) );
+
+	const float cosPhiA = abs( dot( sampleNormal, offsetA ) );
+	const float cosPhiB = abs( dot( sampleNormal, offsetB ) );
+
+	// this is actually rcp Jacobian
+	float jacobian = ( RB2 * cosPhiA ) <= 0.0f ? 0.0f : RA2 * cosPhiB / ( RB2 * cosPhiA );
+
+	// sample normal can have error due to compression
+	if( cosPhiA < 0.05f )
+	{
+		jacobian = 0.0f;
+	}
+
+	if( cosPhiA <= 0.0f || RA2 <= 0.0f || RB2 <= 0.0f )
+	{
+		jacobian = 0.0f;
+	}
+	if( jacobian < 1.0f / 3.0f )
+	{
+		jacobian = 0.0f;
+	}
+	return min( jacobian, 3.0f );
+}
+#endif
+
+
+#endif

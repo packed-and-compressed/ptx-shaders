@@ -1,0 +1,155 @@
+#include "buffers.comp"
+#include "reservoir.comp"
+#include "data/shader/common/rng.comp"
+#include "data/shader/common/rngHybrid.comp"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/resampling.comp"
+
+uniform uint  uFrameNumber;
+uniform uint  uRandomSeed;
+
+USE_TEXTURE2DARRAY( tReSTIRSample );// temp texture with position and shadow catcher flag
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tTargetReservoir, 0 );
+
+// only for GI/specular reservoir
+Reservoir loadReservoirData(
+	const uint2 coord )
+{
+	Reservoir res = newReservoir();
+	if( ( coord.x >= uScreenSize.x || coord.y >= uScreenSize.y ) )
+	{
+		return res;
+	}
+
+	// load data
+	uint4	   resData0;
+	uint4	   resData1;
+	const uint pixelIdx = coord.y * uScreenSize.x + coord.x;
+	resData0 = imageLoadRWArray( tTargetReservoir, coord, 0 );
+	resData1 = imageLoadRWArray( tTargetReservoir, coord, 1 );
+
+	res.Lradiance = resData0.xyz;
+	res.distance = asfloat( resData0.w );
+	res.pdfTarget = asfloat( resData1.x );
+	res.lightIdx = asint( resData1.w );
+	res.W = asfloat( resData1.y );
+	res.M = ushort( resData1.z >> 16 );
+	res.age = ushort( resData1.z & 0xFFFF );
+
+	return res;
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	// rng
+	const uint4 rngData = rngLoadHybrid( outputCoord );
+	RNG			rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, rngData.x );
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	// get some current pixel data
+	const vec4 restirSampleData = imageLoadArray( tReSTIRSample, outputCoord, 0 );
+	const vec3 currentPos = restirSampleData.xyz;
+	const bool isShadowCatcher = ( asuint( restirSampleData.w ) & RT_RAYFLAG_SHADOWCATCHER ) > 0;
+	const bool allowSkySampling = ( asuint( restirSampleData.w ) & HYBRID_PATH_ALLOW_SKY_SAMPLE ) > 0;
+
+	// if using checkerboard for specular, fill in the holes in the checkerboard
+	const bool isEvenFrame = ( ( uFrameNumber % 2 ) == 0 );
+	bool	   requireResolve = isEvenFrame ? ( ( ( outputCoord.x + outputCoord.y ) % 2 ) == 1 ) : ( ( ( outputCoord.x + outputCoord.y ) % 2 ) == 0 );
+	if( isShadowCatcher )
+	{
+		// shadow catcher is never rendererd in checkerboard, this is because it is ridiculously difficult to resample it,
+		// I have spent a long time trying and its convergence is either wrong or much much slower than full res
+		requireResolve = false;
+	}
+
+	// for pixels don't require resolving, we load their data for temporal resampling
+	Reservoir res;
+	if (!requireResolve)
+	{
+		res = loadReservoirData( outputCoord );
+		// convert to total weight from average weight
+		res.W = res.W * res.M * res.pdfTarget;
+	}
+	else
+	{
+		res = newReservoir();
+	}
+
+	const vec3 currentNormal = sampleNormal( true, uint2( outputCoord ) ).xyz;
+
+	const int2 offsets[4] = { int2( -1, 0 ),
+							  int2( 1, 0 ),
+							  int2( 0, -1 ),
+							  int2( 0, 1 ) };
+
+	float r = rngNextFloat( rng );
+	if( requireResolve && !isShadowCatcher )
+	{
+		// current frame data
+		const float currentDepth = abs( imageLoad( tDepth, outputCoord ).x );
+		uint		currentObjectID = imageLoad( tObjectID, outputCoord ).x - 1;
+
+		for( int i = 0; i < 4 ; ++ i )
+		{
+			const int offsetIdx = i;
+			const uint2 neighborCoord = uint2( ( vec2( outputCoord ) + vec2( offsets[offsetIdx] ) ) );
+
+			if( isNeighborValid( currentDepth, currentNormal, neighborCoord ) )
+			{
+				Reservoir  neighbor = loadReservoirData( neighborCoord );
+				// current data
+				const uint neighborIdx = uint( neighborCoord.y ) * uScreenSize.x + neighborCoord.x;
+
+				const vec4 restirSampleData = imageLoadArray( tReSTIRSample, neighborCoord, 0 );
+				const vec3 neighborPos = restirSampleData.xyz;
+
+				float	   newTargetPdf = calcReservoirTargetPDF( neighbor );
+				if( neighbor.M > 0 )
+				{
+					vec3 rayDir, radiance;
+					unpackVec2x3f( neighbor.Lradiance, rayDir, radiance );
+					Ray ray;
+					ray.origin = currentPos + currentNormal * max( 1e-2f, uRayOriginBias );
+					ray.maxT = neighbor.distance;
+					ray.direction = normalize( rayDir );
+					if( ray.maxT != INFINITY && neighbor.distance > 0.0f )
+					{
+						// point sampling on light source, we need to correct the ray direction
+						ray.direction = neighbor.distance > 0.0f ? ( neighborPos + normalize( rayDir ) * neighbor.distance ) - ray.origin : ray.direction;
+						ray.maxT = neighbor.distance == 0.0f ? 0.0f : length( ray.direction ) * 0.99f;
+						ray.direction = normalize( ray.direction );
+						neighbor.Lradiance = packVec2x3f( ray.direction, radiance );
+					}
+					ray.minT = 0.0f;
+
+					RayHit	   hit;
+					RayPayload payload;
+#if defined( TraceTransparencyDither )
+					payload.rng = rng;
+#endif
+					bool isOccluded = ray.maxT > 0.0f ? traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit ) : false;
+					if( isOccluded )
+					{
+						newTargetPdf = 0.0f;
+					}
+					combineReservoir( res, neighbor, r, newTargetPdf );
+				}
+			}
+		}
+
+		const float newTargetFunc = calcReservoirTargetPDF( res );
+		const float weight = res.W * rcpSafe( newTargetFunc * res.M );
+		res.M = clamp( res.M, ushort( 0 ), ushort( 20 ) );
+
+		const uint4 restirData0 = uint4( res.Lradiance, asuint( res.distance ) );
+		const uint4 restirData1 = uint4( asuint( res.pdfTarget ), asuint( weight ), ( uint( res.M ) << 16 ) | uint( res.age ), asuint( res.lightIdx ) );
+		imageStoreArray( tTargetReservoir, outputCoord, 0, restirData0 );
+		imageStoreArray( tTargetReservoir, outputCoord, 1, restirData1 );
+	}
+}

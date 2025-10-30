@@ -1,0 +1,145 @@
+#include "buffers.comp"
+#include "reservoir.comp"
+#include "data/shader/common/rng.comp"
+#include "data/shader/scene/raytracing/common.comp"
+
+uniform uint uFrameNumber;
+uniform uint uRandomSeed;
+uniform uint2 uScreenSize;
+
+#if defined( RESOLVE_SPECULAR )
+USE_LOADSTORE_TEXTURE2D( uint, tReflectionSecondaryHitNormalObjID, 0 );
+USE_LOADSTORE_TEXTURE2D( uint, tReSTIRBSDFData, 1 );
+
+#elif defined( RESOLVE_REFRACTION )
+uniform int uCheckerboardEnabled;
+uniform uint2 uInputSize;
+// output
+USE_LOADSTORE_TEXTURE2D( float, tNormal, 0 );
+USE_LOADSTORE_TEXTURE2D( uint, tRefractionFeature, 1 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tAlbedo, 2 );
+USE_LOADSTORE_TEXTURE2D( float, tRefractionRadiance, 3 );
+#define RT_RADIANCE_ATTACHMENT 4
+#include "data/shader/scene/raytracing/output.comp"
+#endif
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	const bool	isEvenFrame = ( ( uFrameNumber % 2 ) == 0 );
+
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+#if defined( RESOLVE_REFRACTION )
+	vec4 currentRadiance = imageLoadRW( tRefractionRadiance, uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uInputSize ) ) );
+	if( uCheckerboardEnabled )
+#endif
+	{
+		const bool continueResolve = isEvenFrame ? ( ( ( outputCoord.x + outputCoord.y ) % 2 ) == 1 ) : ( ( ( outputCoord.x + outputCoord.y ) % 2 ) == 0 );
+		if (continueResolve )
+		{
+			const int2 offsets[4] = 
+			{ 
+				int2( -1, 0 ), 
+				int2( 1, 0 ), 
+				int2( 0, -1 ), 
+				int2( 0, 1 ),
+			};
+
+			bool	   foundNeighbor = false;
+			int2	   neighborCoord = int2( outputCoord );
+			int2	   neighborObjectIdCoord = int2( outputCoord );
+
+			bool	   continueResolve = true;
+		#if defined( RESOLVE_REFRACTION )
+			vec4	   totalRefractionAlbedo = vec4( 0, 0, 0, 0 );
+			vec4	   totalRefractionRadiance = vec4( 0, 0, 0, 0 );
+		#endif
+			RNG		   rng = rngInit( ( outputCoord.x << 16 ) | outputCoord.y, uRandomSeed );
+			for( int i = 0; i < 4 && continueResolve; ++i )
+			{
+				const float r = rngNextFloat( rng );
+				neighborCoord = int2( outputCoord ) + offsets[int( r * 4 )];
+				if( neighborCoord.x >= 0 && 
+					neighborCoord.y >= 0 && 
+					neighborCoord.x < uScreenSize.x && 
+					neighborCoord.y < uScreenSize.y )
+				{
+					if( !foundNeighbor )
+					{
+						// TODO_Wallace: this provides substantial improvement in verifying the correct object id we should up sample with
+						// but we may wanna use groupshared memory to improve performance here
+					#if defined( RESOLVE_REFRACTION )
+						const uint refractionObjId = imageLoadRW( tRefractionFeature, uint2( neighborCoord ) ).z - 1;
+						if( refractionObjId != ~uint( 0 ) )
+					#endif
+						{
+							foundNeighbor = true;
+							neighborObjectIdCoord = neighborCoord;
+						}
+					}
+				#if defined( RESOLVE_REFRACTION )
+					totalRefractionAlbedo += imageLoadRWArray( tAlbedo, ushort2( neighborCoord ), 2 );
+					totalRefractionRadiance += imageLoadRW( tRefractionRadiance, ushort2( ( vec2( neighborCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uInputSize ) ) );
+				#endif
+				}
+			}
+
+			if( foundNeighbor )
+			{
+			#if defined( RESOLVE_SPECULAR )
+				const uint2 reflectionData = imageLoadRW( tReflectionSecondaryHitNormalObjID, ushort2( neighborObjectIdCoord ) ).xy;
+				imageStore( tReflectionSecondaryHitNormalObjID, uint2( outputCoord ), uint4( reflectionData, 0, 0 ) );
+				const uint2 bsdfData = imageLoadRW( tReSTIRBSDFData, ushort2( neighborObjectIdCoord ) ).xy;
+				imageStore( tReSTIRBSDFData, uint2( outputCoord ), uint4( bsdfData, 0, 0 ) );
+			#elif defined( RESOLVE_REFRACTION )
+				const uint4 refractionData = imageLoadRW( tRefractionFeature, ushort2( neighborObjectIdCoord ) );
+				const uint refractionObjId = refractionData.z - 1;
+				if ( refractionObjId != ~uint( 0 ) )
+				{
+					imageStore( tNormal, uint2( outputCoord ), vec4( unpackUnitVectorOct( refractionData.y ), 1.0f ) );
+				}
+				imageStore( tRefractionFeature, uint2( outputCoord ), refractionData );
+				imageStoreArray( tAlbedo, uint2( outputCoord ), 2, totalRefractionAlbedo / 4.0f );
+			#endif
+			}
+
+		#if defined( RESOLVE_REFRACTION )
+			currentRadiance = totalRefractionRadiance / 4.0f;
+		#endif
+		}
+		else
+		{
+		#if defined( RESOLVE_REFRACTION )
+			const uint3 refractionData = imageLoadRW( tRefractionFeature, ushort2( outputCoord ) ).xyz;
+			const uint refractionObjId = refractionData.z - 1;
+			if ( refractionObjId != ~uint( 0 ) )
+			{
+				imageStore( tNormal, uint2( outputCoord ), vec4( unpackUnitVectorOct( refractionData.y ), 1.0f ) );
+			}
+		#endif
+		}
+
+	#if defined( RESOLVE_REFRACTION )
+		radianceAdd( ushort( 0 ), ushort2( outputCoord ), half3( currentRadiance.xyz ) );
+	#endif
+	}
+#if defined( RESOLVE_REFRACTION )
+	else
+	{
+		vec4 currentRadiance = imageLoadRW( tRefractionRadiance, ushort2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uInputSize ) ) );
+		
+		const uint3 refractionData = imageLoadRW( tRefractionFeature, uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uInputSize ) ) ).xyz;
+		const uint refractionObjId = refractionData.z - 1;
+		if ( refractionObjId != ~uint( 0 ) )
+		{
+			imageStore( tNormal, uint2( outputCoord ), vec4( unpackUnitVectorOct( refractionData.y ), 1.0f ) );
+		}
+	#if defined( RESOLVE_REFRACTION )
+		radianceAdd( ushort( 0 ), ushort2( outputCoord ), half3( currentRadiance.xyz ) );
+	#endif
+	}
+#endif
+}
