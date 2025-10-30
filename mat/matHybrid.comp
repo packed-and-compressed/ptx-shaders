@@ -1,0 +1,757 @@
+#include "data/shader/mat/hybrid.comp"
+#include "data/shader/mat/fresnel.frag"
+#include "data/shader/scene/raytracing/raydifferential.sh"
+
+USE_TYPEDTEXTURE2DARRAY_NOSAMPLER( uint, tReSTIR );
+
+uniform vec3 uOcclusionColor;
+uniform uint uOcclusionComposite;
+uniform int3 uLightingChannels;
+uniform float uSceneRadius;
+uniform int	  uFrameNumber;
+
+USE_INTERLOCKED_BUFFER( bCounters, 0 );
+USE_LOADSTORE_BUFFER( uint, bIndirectRaysIdx, 1 );
+USE_LOADSTORE_BUFFER( uint4, bSSSProbeRay, 2 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates0, 3 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates1, 4 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRGI, 5 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tReSTIRGISample, 6 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRSpecular, 7 );
+USE_LOADSTORE_TEXTURE2D( uint, tReSTIRSpecularBSDFAuxData, 8 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tReSTIRSpecularSample, 9 );
+USE_LOADSTORE_BUFFER( uint4, bSpatialHashIndirectBuffer0, 10 );
+USE_INTERLOCKED_BUFFER( bSpatialHashCheckSum, 11 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tAlbedo, 12 );
+#define RT_RADIANCE_ATTACHMENT 13
+#include "../scene/raytracing/output.comp"
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 14 );
+#endif
+
+#if defined(HybridRadianceCache)
+	#define INTERLOCKED_SPATIAL_HASH_CHECKSUM bSpatialHashCheckSum
+	#include "data/shader/scene/raytracing/spatialhash/spatialhash.comp"
+	#undef INTERLOCKED_SPATIAL_HASH_CHECKSUM 
+#endif
+
+void writePathStates(
+	const uint		index,
+	inout uint4		pathState0, 
+	inout uint4		pathState1 )
+{
+	HYBRID_PATHSTATE_BUFFER( bPathStates0, index ) = pathState0;
+	HYBRID_PATHSTATE_BUFFER( bPathStates1, index ) = pathState1;
+}
+
+float sampleReflection(
+	inout PathState		path, 
+	inout FragmentState fragmentState, 
+	inout SampleState	sampleState, 
+	const vec3			specularAlbedo, 
+	out uint			pathBits )
+{
+	// path bits
+	pathBits = 0;
+	float	 maxT = -1.0f;
+	// initialize sample state
+	sampleState.L = vec3( 0.0, 0.0, 0.0 );
+	sampleState.H = vec3( 0.0, 0.0, 0.0 );
+	sampleState.NdotL = 0.0;
+	sampleState.Tin = vec3( 1.0, 1.0, 1.0 );
+	sampleState.Tout = vec3( 1.0, 1.0, 1.0 );
+	sampleState.bsdf = vec3( 0.0, 0.0, 0.0 );
+	sampleState.pdf = 0.0;
+
+	// initialize path throughput for reflection pass
+	path.throughput = vec3( 1, 1, 1 );
+
+	// compute throughput for secondary bounce
+	sampleState.r = ldsRandHybridVec4( fragmentState.rng, fragmentState.screenCoord, HYBRID_PRIMARY_SAMPLE_DIM_REFLECTION, 0, 0, fragmentState.ldsParams );
+
+	bool hasSpecularReflection = false;
+#if( defined( ReflectionSample ) || defined( ReflectionSampleSecondary ) )
+	hasSpecularReflection = true;
+#endif
+	// mark if there is specular reflection at the current pixel, this is to prevent resampling from happening for non-specular pixels
+	const uint reflectionPixelIdx = ( fragmentState.screenCoord.y ) * ( uScreenSize.x ) + ( fragmentState.screenCoord.x );
+	uint32_t   specularLobes = 0;
+#if defined( ReflectionSample ) || defined( ReflectionSampleSecondary )
+	specularLobes |= HYBRID_HAS_SPECULAR_FLAG;
+#endif
+	vec3  origin = sampleState.origin;
+	// result gloss we sampled
+	fragmentState.sampledGloss = fragmentState.gloss;
+	// sample and evaluate either the base reflection lobe or the coating lobe
+	vec4  defaultSamplePosNormal = vec4( 0, 0, 0, 0 );
+	bool sampleCoating = false;
+	bool sampleReflection = false;
+
+	bool  continueSpecularPath = true;
+	uint2 specularAuxData = uint2( 0, 0 );
+#if defined( HybridSpecularCheckerboard )
+	continueSpecularPath = ( ( uFrameNumber % 2 ) == 0 ) ? ( ( ( fragmentState.screenCoord.x + fragmentState.screenCoord.y ) % 2 ) == 0 ) : ( ( ( fragmentState.screenCoord.x + fragmentState.screenCoord.y ) % 2 ) == 1 );
+#else
+	continueSpecularPath = true;
+#endif
+	if( continueSpecularPath )
+	{
+	#if !defined( ShadowCatcher )
+		// sample a reflection lobe
+		#if defined( ReflectionSampleSecondary ) && defined( ReflectionSample )
+			if( sampleState.r.w < sampleState.reflectionWeightSecondary )
+			{
+				sampleCoating = true;
+			}
+			else
+			{
+				sampleReflection = true;
+				sampleState.r.w = ( sampleState.r.w - sampleState.reflectionWeightSecondary ) / ( 1.0f - sampleState.reflectionWeightSecondary );
+			}
+		#elif defined( ReflectionSampleSecondary )
+			if( sampleState.r.w < sampleState.reflectionWeightSecondary )
+			{
+				sampleCoating = true;
+			}
+			else
+			{
+				sampleState.r.w = ( sampleState.r.w - sampleState.reflectionWeightSecondary ) / ( 1.0f - sampleState.reflectionWeightSecondary );
+			}
+		#elif defined(ReflectionSample)
+			if( sampleState.r.w < sampleState.reflectionWeight )
+			{
+				sampleReflection = true;
+			}
+			else
+			{
+				sampleState.r.w = ( sampleState.r.w - sampleState.reflectionWeight ) / ( 1.0f - sampleState.reflectionWeight );
+			}
+		#endif
+		// evaluate BSDF
+		#if defined( ReflectionSampleSecondary )
+			if( sampleCoating )
+			{
+				// we have to sample a ray and trace it for secondary g-buffer for filtering
+				specularAuxData = ReflectionSampleSecondary( path, fragmentState, sampleState, specularLobes );
+				maxT = INFINITY;
+				// make sure the sampled ray is actually reflection ray
+				if( ( sampleState.NdotV * sampleState.NdotL ) >= 0.0f )
+				{
+					ReflectionEvaluateSecondary( path, fragmentState, sampleState );
+					path.throughput = sampleState.bsdf * rcpSafe( specularAlbedo ) * rcpSafe( sampleState.pdf );
+					path.isNonSpecular = path.isNonSpecular || !sampleState.flagSpecular;
+				}
+				else
+				{
+					// invalid sampled ray
+					continueSpecularPath = false;
+					sampleState.L = reflect( sampleState.V, fragmentState.normal );
+				}
+			}
+		#endif
+		#if defined( ReflectionSample )
+			if( sampleReflection )
+			{
+				// we have to sample a ray and trace it for secondary g-buffer for filtering
+				specularAuxData = ReflectionSample( path, fragmentState, sampleState, specularLobes );
+				maxT = INFINITY;
+				// make sure the sampled ray is actually reflection ray
+				const bool isReflectionRay = ( sampleState.NdotV * sampleState.NdotL ) >= 0.0f || sampleState.flagHairBCSDF;
+				if( isReflectionRay )
+				{
+					ReflectionEvaluate( path, fragmentState, sampleState );
+					path.throughput = sampleState.bsdf * rcpSafe( specularAlbedo ) * rcpSafe( sampleState.pdf );
+					path.isNonSpecular = path.isNonSpecular || !sampleState.flagSpecular;
+				}
+				else
+				{
+					// invalid sampled ray
+					continueSpecularPath = false;
+					sampleState.L = reflect( sampleState.V, fragmentState.normal );
+				}
+			}
+		#endif
+		// shoot reflection ray
+		#if( defined( ReflectionSample ) || defined( ReflectionSampleSecondary ) )
+			if( ( sampleCoating || sampleReflection ) && continueSpecularPath )
+			{
+				// reflection rays
+				uint index;
+				interlockedAdd( bCounters, HYBRID_COUNTER_GI_RAYS, 1, index );
+				// half res, make new output desc
+				HYBRID_RAY_BUFFER0( bIndirectRaysIdx, index ) = makeOutputDesc( ushort2( fragmentState.screenCoord ), HYBRID_SPECULAR );
+				// specular reflection ray direction and ray length
+				imageStoreArray( tReSTIRSpecular, fragmentState.screenCoord, 0, uint4( packVec2x3f( normalize( sampleState.L ), vec3( 0, 0, 0 ) ), asuint( sampleState.pdf ) ) );
+				
+				// path states
+				uint4 pathState0 = uint4( 0, 0, 0 , 0 );
+				uint4 pathState1 = uint4( 0, 0, 0 , 0 );
+				// update path state 0
+				pathState0.xyz = uint3( packVec4f( vec4( path.throughput, fragmentState.skyOcclusion ) ), packVec2f( vec2( fragmentState.dP, fragmentState.dD ) ) );
+				pathState0.w = pathBits;
+				pathState0.w |= fragmentState.allowSkySampling ? HYBRID_PATH_ALLOW_SKY_SAMPLE : 0;
+				pathState0.w |= path.isNonSpecular ? RT_PATHFLAG_NONSPECULAR : 0;
+				pathState0.w |= sampleState.flagHairBCSDF ? HYBRID_PATH_HAIR : 0;
+			#if defined( ShadowCatcher )
+				pathState0.w |= RT_RAYFLAG_SHADOWCATCHER;
+			#endif
+				// update origin and path state 1
+				origin = rayOriginAdjust( sampleState, fragmentState.rayOffset );
+				pathState1.xyz = asuint( origin );
+				writePathStates( index, pathState0, pathState1 );
+				// set default sample position and sample normal for ReSTIR Specular
+				defaultSamplePosNormal = vec4( origin + sampleState.L * 1000.0f * uSceneRadius, asfloat( packUnitVectorOct( -normalize( sampleState.L ) ) ) );
+				// Note: make sure this is the end of reflection
+				// extra sampling for perfectly specular ray for feature buffer, we are ready to discard sampleState.L and 
+				// reflection fragment state so just overwrite it
+				if( sampleCoating )
+				{
+				#if defined( ReflectionSampleSecondary )
+					fragmentState.glossSecondary = 1.0f;
+					// we have to sample a ray and trace it for secondary g-buffer for filtering
+					ReflectionSampleSecondary( path, fragmentState, sampleState );
+				#endif
+				}
+				else
+				{
+				#if defined( ReflectionSample )
+					fragmentState.gloss = 1.0f;
+					// we have to sample a ray and trace it for secondary g-buffer for filtering
+					ReflectionSample( path, fragmentState, sampleState );
+				#endif
+				}
+				
+				// write specular lobe to our specular restir buffer
+				imageStoreArray( tReSTIRSpecular, fragmentState.screenCoord, 1, uint4( 0, 0, ( uint( 1 ) << 16 ) | uint( 0.0f ), specularLobes ) );
+			}
+		#endif
+	#endif
+	}
+	
+	imageStore( tReSTIRSpecularBSDFAuxData, fragmentState.screenCoord, uint4( specularAuxData, 0, 0 ) );
+	imageStoreArray( tReSTIRSpecularSample, fragmentState.screenCoord, 0, vec4( origin, asfloat( packUnitVectorOct( fragmentState.normal ) ) ) );
+	imageStoreArray( tReSTIRSpecularSample, fragmentState.screenCoord, 1, defaultSamplePosNormal );
+	
+	// return randomly sampled gloss value we have picked to scatter
+	return fragmentState.sampledGloss;
+}
+
+
+void sampleDiffuseGI(
+	inout PathState		path, 
+	inout FragmentState fragmentState, 
+	inout SampleState	sampleState, 
+	const bool			castShadow, 
+	const vec3			albedo, 
+	inout vec4			transmissionAlbedo, 
+	inout uint			pathBits )
+{
+	float maxT = -1.0f;
+	sampleState.L = vec3( 0, 0, 0 );
+	sampleState.bsdf = vec3( 0, 0, 0 );
+	sampleState.pdf = 0.0f;
+	sampleState.flagDiffuse = false;
+	sampleState.flagSpecular = false;
+	sampleState.flagHairBCSDF = false;
+	path.throughput = vec3( 1, 1, 1 );
+
+	// set ray origin
+	sampleState.H = normalize( sampleState.L + sampleState.V );
+	sampleState.NdotL = dot( sampleState.L, sampleState.basis.N );
+
+	vec3 origin = sampleState.origin;
+	vec4 defaultSamplePosNormal = vec4( 0, 0, 0, 0 );
+	
+	uint4 restirGIData0 = uint4( 0, 0, 0, 0 );
+	uint4 restirGIData1 = uint4( 0, 0, 0, 0 );
+#if ( ( defined( DiffusionSample ) && defined( DiffusionEvaluate ) ) || ( defined( TransmissionSample ) && defined( TransmissionEvaluate ) ) ) && !defined( ShadowCatcher )
+	bool	   isRefraction = false;
+	#if defined( HybridDiffuseGICheckerboard )
+		bool continueDiffusePath = 
+			( ( uFrameNumber % 2 ) == 0 ) ? 
+			( ( ( fragmentState.screenCoord.x + fragmentState.screenCoord.y ) % 2 ) == 0 ) : 
+			( ( ( fragmentState.screenCoord.x + fragmentState.screenCoord.y ) % 2 ) == 1 );
+	#else
+		const bool continueDiffusePath = true;
+	#endif
+	const bool sampledDiffusePath = ( ( sampleState.diffusionWeight > 0 ) || ( sampleState.transmissionWeight > 0 ) );
+	// calculate diffuse pixel index (scaled)
+	const uint diffusePixelIdx = fragmentState.screenCoord.y * uScreenSize.x + fragmentState.screenCoord.x;
+	// path states
+	uint4	   pathState0 = uint4( 0, 0, 0, 0 );
+	uint4	   pathState1 = uint4( 0, 0, 0, 0 );
+	// sample bsdf
+	sampleState.r = ldsRandHybridVec4( fragmentState.rng, fragmentState.screenCoord, HYBRID_PRIMARY_SAMPLE_DIM_DIFFUSE, 0, 0, fragmentState.ldsParams );
+	sampleState.bsdf = sampleDiffuseGI( path, fragmentState, sampleState );
+	// check for refraction, if yes set transmission albedo to some default
+	if( isTransmission( sampleState ) )
+	{
+	#if !defined( TransmissionSubsurfaceDiffusion )
+		transmissionAlbedo = vec4( 1, 1, 1, 1 );
+	#endif
+	}
+	// if we are rendering low resolution, we only do 1 pixel out of a 4 pixel quadrant
+	#if defined( HybridLowResGI )
+		continueDiffusePath = continueDiffusePath && 
+			( ( ( isReflection( sampleState ) ) &&
+			  ( ( uFrameNumber % 4 ) < 2 ) ? 
+			  ( ( fragmentState.screenCoord.y % 2 ) == 0 ) : 
+			  ( ( fragmentState.screenCoord.y % 2 ) == 1 ) ) ||
+			  isTransmission(sampleState) );
+	#endif
+	
+	// ReSTIR GI sample (visible point)
+	origin = rayOriginAdjust( sampleState, fragmentState.rayOffset );
+
+	if( sampledDiffusePath && continueDiffusePath )
+	{
+		pathState1 = uint4( asuint( origin ), 0 );
+		// set BSDF ray distance
+		maxT = INFINITY;
+		// update sample point and normal (set default)
+		defaultSamplePosNormal = vec4( origin + normalize( sampleState.L ) * 10.0f * uSceneRadius, asfloat( packUnitVectorOct( -normalize( sampleState.L ) ) ) );
+		// demodulate path throughput
+		path.throughput = sampleState.bsdf * rcpSafe( albedo ) * rcpSafe( sampleState.pdf );
+		// update common path states
+		pathState0.xyz = uint3( packVec4f( vec4( path.throughput, fragmentState.skyOcclusion ) ), packVec2f( vec2( fragmentState.dP, fragmentState.dD ) ) );
+		// setup ray type for setting up the next ray
+		bool sampleBSSRDF = false;
+		bool sampleBSDF = false;
+		if( isReflection( sampleState ) || sampleState.flagHairBCSDF )
+		{
+			sampleBSDF = true;
+		}
+		else if( isTransmission( sampleState ) )
+		{
+		#if defined( TransmissionSubsurfaceDiffusion )
+			sampleBSSRDF = true;
+		#elif ( defined( TransmissionSample ) && defined( TransmissionEvaluate ) )
+			sampleBSDF = true;
+		#endif
+		}
+		
+        bool writePathStateData = false;
+		uint index = ~uint( 0 );
+		if( sampleBSDF )
+		{
+			// GI rays
+			interlockedAdd( bCounters, HYBRID_COUNTER_GI_RAYS, 1, index );
+			uint	   pass = HYBRID_DIFFUSE_GI;
+			// we check for reflection
+			const bool reflectionRay = isReflection( sampleState );
+			const bool transmissionRay = isTransmission( sampleState );
+			if( reflectionRay )
+			{
+				// update path type
+				path.isDiffuse = path.isDiffuse || sampleState.flagDiffuse;
+			}
+			else
+			{
+			#if defined( TransmissionSample ) && defined( TransmissionEvaluate )
+				// update path type
+				path.isTransmission = true;
+				// update specular flag for path from sampled transmission ray
+				path.isNonSpecular = path.isNonSpecular || !sampleState.flagSpecular;
+				// is refraction
+				isRefraction = true;
+				// set pass
+				pass = HYBRID_REFRACTION;
+			#endif
+			}
+			// half res, make new output desc
+			HYBRID_RAY_BUFFER0( bIndirectRaysIdx, index ) = makeOutputDesc( ushort2( fragmentState.screenCoord ), pass );
+			// set path states
+			pathState0.w = pathBits;
+			pathState0.w |= fragmentState.allowSkySampling ? HYBRID_PATH_ALLOW_SKY_SAMPLE : 0;
+			pathState0.w |= path.isNonSpecular ? RT_PATHFLAG_NONSPECULAR : 0;
+			pathState0.w |= ( reflectionRay && path.isDiffuse ) ? RT_PATHFLAG_DIFFUSE : 0;
+		#if defined( ShadowCatcher )
+			pathState0.w |= ( reflectionRay && path.isDiffuse ) ? RT_RAYFLAG_SHADOWCATCHER : 0;
+		#endif
+		#if defined( TransmissionSample ) && defined( TransmissionEvaluate )
+			pathState0.w |= ( transmissionRay && path.isTransmission ) ? RT_PATHFLAG_TRANSMISSION : 0;
+			pathState0.w |= ( transmissionRay && path.isNonSpecular ) ? RT_PATHFLAG_NONSPECULAR : 0;
+		#endif
+			pathState0.w |= ( castShadow ? 0 : HYBRID_PATH_REFRACTION_NON_SHADOW_CAST );
+            writePathStateData = true;
+		}
+		else if( sampleBSSRDF )
+		{
+		#if defined( TransmissionSubsurfaceDiffusion )
+			// update path type
+			path.isTransmission = true;
+			// update specular flag for path from sampled transmission ray
+			path.isNonSpecular = path.isNonSpecular || !sampleState.flagSpecular;
+			// random numbers
+			sampleState.r = ldsRandHybridVec4( fragmentState.rng, fragmentState.screenCoord, HYBRID_PRIMARY_SAMPLE_DIM_SSS, 0, 0, fragmentState.ldsParams );
+			// sample SSS position
+			uint  rayAxis;
+			float rayMaxT;
+			const vec3  subsurfaceOrigin = sampleState.origin;
+			const uint	subsurfaceNormal = packUnitVectorOct( sampleState.Ng );
+			const float subsurfaceRadius = sampleBSSRDF_BurleyDiffusionPosition( sampleState, fragmentState.scatterDepth, rayAxis, rayMaxT );
+			if( any( path.throughput ) && subsurfaceRadius > 0.0 )
+			{
+				// SSS rays
+				interlockedAdd( bCounters, HYBRID_COUNTER_GI_RAYS, 1, index );
+				// half res, make new output desc
+				HYBRID_RAY_BUFFER0( bIndirectRaysIdx, index ) = makeOutputDesc( ushort2( fragmentState.screenCoord ), HYBRID_DIFFUSE_GI ) | RT_RAYFLAG_SUBSURFACE;
+				// half res, make new output desc
+				HYBRID_RAY_BUFFER0( bSSSProbeRay, index ) = uint4( asuint( sampleState.origin ), 0 );
+				HYBRID_RAY_BUFFER1( bSSSProbeRay, index ) = uint4( packVec3f( sampleState.L ), asuint( rayMaxT ), fragmentState.objectID );
+				// encode path state
+				pathState0.w = f32tof16( subsurfaceRadius ) | ( rayAxis << 16 );
+				pathState0.w |= RT_PATHFLAG_DIFFUSE | RT_PATHFLAG_NONSPECULAR | RT_PATHFLAG_TRANSMISSION;
+				pathState0.w |= ( castShadow ? 0 : HYBRID_PATH_REFRACTION_NON_SHADOW_CAST );
+				// only write path state when we are continuing the path
+				writePathStateData = true;
+			}
+			pathState1 = uint4( asuint( subsurfaceOrigin ), subsurfaceNormal );
+		#endif
+		}
+        
+		// update path state
+        if(writePathStateData)
+        {
+            writePathStates( index, pathState0, pathState1 );
+        }
+		// set default ReSTIR GI sample position and normal
+		imageStoreArray( tReSTIRGISample, fragmentState.screenCoord, 1, defaultSamplePosNormal );
+		// ReSTIR ray direction and ray length
+		restirGIData0 = uint4( packVec2x3f( normalize( sampleState.L ), vec3( 0, 0, 0 ) ), asuint( sampleState.pdf ) );
+		restirGIData1.xyz = uint3( asuint( 0.0f ), asuint( 0.0f ), ( uint( 1 ) << 16 ) | uint( 0.0f ) );
+		// we store the first bounce path flag (diffuse/nonspecular/transmission) and transmission weight 
+		// (no need to bit shift because we only use the higher bits for path flags)
+		restirGIData1.w = 
+			( pathState0.w & ( RT_PATHFLAG_DIFFUSE | RT_PATHFLAG_NONSPECULAR | RT_PATHFLAG_TRANSMISSION | RT_PATHFLAG_SUBSURFACE_AXIS ) ) | 
+			( f32tof16( sampleState.transmissionWeight ) );
+		imageStoreArray( tReSTIRGI, fragmentState.screenCoord, 0, restirGIData0 );
+		imageStoreArray( tReSTIRGI, fragmentState.screenCoord, 1, restirGIData1 );
+	}
+
+	// store restir gi sample (visible position and normal in original resolution)
+	if (!isRefraction)
+	{
+		imageStoreArray( tReSTIRGISample, fragmentState.screenCoord, 0, vec4( origin, asfloat( packUnitVectorOct( fragmentState.normal ) ) ) );
+	}
+#elif defined( ShadowCatcher )
+	// set shadow catcher to some default values for restir gi buffers, we do not want it to resample
+	restirGIData1.w = 0;
+	imageStoreArray( tReSTIRGISample, fragmentState.screenCoord, 0, vec4( 0, 0, 0, 0 ) );
+#endif
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	MATERIAL_DEBUG_CHECK_PARAMS();
+	
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	PathState path;
+	path.outputDesc = makeOutputDesc( ushort2( outputCoord ), 0 );
+
+	const uint objectIndex = imageLoad( tPrepassObjectID, outputCoord ).x - 1;
+	if( objectIndex == ~uint( 0 ) )
+	{
+		return;
+	}
+
+	uint materialIndex;
+	if( !getMaterialBinding( objectIndex, materialIndex ) )
+	{
+		return;
+	}
+
+	// initialize path fragmentState
+	path.radiance = half3( 1.0, 0.0, 0.0 );
+	path.throughput = vec3( 1.0, 1.0, 1.0 );
+	path.isDiffuse = false;
+	path.isNonSpecular = false;
+	path.isTransmission = false;
+	path.isSubsurface = false;
+	path.mediumExtinction = vec3( 0.0, 0.0, 0.0 );// uSceneMediumExtinction;
+	path.mediumScatter = vec3( 0.0, 0.0, 0.0 );	  // uSceneMediumScatter;
+	path.mediumAnisotropy = 0.0;				  // uSceneMediumAnisotropy;
+
+	// fetch renderable instance
+	Renderable renderable = bRenderables[objectIndex];
+
+	// load vertex data
+	uint2		   gbuffer = asuint( imageLoad( tPrepassGeometry, outputCoord ).xy );
+	uint3		   tri = loadTriangle( renderable.mesh, gbuffer.x );
+	Vertex		   v0 = loadVertex( renderable.mesh, tri.x );
+	Vertex		   v1 = loadVertex( renderable.mesh, tri.y );
+	Vertex		   v2 = loadVertex( renderable.mesh, tri.z );
+
+	vec2		   triangleBarycentrics = unpackUnitVec2f( gbuffer.y );
+	precise vec3   triangleEdge01, triangleEdge02;
+	Vertex		   input = interpolateVertexPrecise( triangleBarycentrics, v0, v1, v2, triangleEdge01, triangleEdge02 );
+
+	vec3		   triangleNormal = cross( triangleEdge01, triangleEdge02 );
+	float		   triangleNormalScale;
+	// make sure triangle normal and interpolated normal have consistent orientation
+	HINT_FLATTEN
+	if( dot( triangleNormal, input.normal ) < 0.0 )
+	{
+		input.normal = -input.normal;
+	}
+
+	FragmentState fragmentState = newFragmentState();
+	const uint4	  rngData = rngLoadHybrid( outputCoord );
+	fragmentState.rng = rngInit( path.outputDesc & RT_OUTPUTCOORD_MASK, rngData.x );
+	fragmentState.ldsParams = rngData.yzw;
+	fragmentState.primitiveID = gbuffer.x;
+	fragmentState.triangleBarycentrics = vec3( saturate( 1 - triangleBarycentrics.x - triangleBarycentrics.y ), triangleBarycentrics.xy );
+	fragmentState.objectID = objectIndex;
+	fragmentState.transform = unpack( renderable.transform );
+	fragmentState.transformInverse = unpack( renderable.transformInverse );
+	fragmentState.transformInverseTranspose = transpose3x3( fragmentState.transformInverse );
+	fragmentState.vertexPosition = mulPoint( fragmentState.transform, input.position );
+	fragmentState.vertexEye = uLightSpaceCameraPosition.xyz - uLightSpaceCameraPosition.w * fragmentState.vertexPosition;
+	fragmentState.vertexEyeDistance = length( fragmentState.vertexEye );
+	fragmentState.vertexEye *= rcp( fragmentState.vertexEyeDistance );
+	fragmentState.vertexColor = input.color;
+	fragmentState.vertexNormal = normalize( mulVec( fragmentState.transformInverseTranspose, input.normal ) );
+	fragmentState.vertexTangent = normalize( mulVec( fragmentState.transformInverseTranspose, input.tangent ) );
+	fragmentState.vertexBitangent = normalize( mulVec( fragmentState.transformInverseTranspose, input.bitangent ) );
+	fragmentState.geometricNormal = normalizeAndGetScale( mulVec( fragmentState.transformInverseTranspose, triangleNormal ), triangleNormalScale );
+	fragmentState.normal = fragmentState.vertexNormal;
+	fragmentState.screenCoord = outputCoord;
+	fragmentState.screenTexCoord = vec2( fragmentState.screenCoord.x + 0.5, fragmentState.screenCoord.y + 0.5 );
+	fragmentState.screenTexCoord = fragmentState.screenTexCoord * uScreenTexCoordScaleBias.xy + uScreenTexCoordScaleBias.zw;
+	fragmentState.screenDepth = 0.0;
+	fragmentState.rayOffset = computeRayOffset( fragmentState, input.position, v0.position, triangleEdge01, triangleEdge02, triangleNormal, triangleNormalScale );
+	fragmentState.frontFacing = dot( fragmentState.vertexEye, fragmentState.geometricNormal ) >= 0.0;
+#ifdef TransmissionSubsurfaceDiffusion
+	// assume front facing when exiting via subsurface diffusion since in this case we don't have a meaningful view direction
+	fragmentState.frontFacing = fragmentState.frontFacing || path.isSubsurface;
+	// transmitting via subsurface diffusion multiple times has little benefit and causes variance spikes
+	// disallow sampling it after first diffuse bounce to avoid firefly noise
+	fragmentState.allowSubsurfaceDiffusion = !path.isDiffuse;
+#endif
+
+	vec4			textureGrads = vec4( 0.0, 0.0, 0.0, 0.0 );
+	RayDifferential rd = newRayDifferential();
+	#ifdef Differentials
+	{
+		rd = getRayDifferentialPrecise( fragmentState );
+		
+		//calculate barycentric coordinate derivatives
+		diff3 dPobj = mulDifferential( fragmentState.transformInverse, rd.dP );
+		diff2 dBarycentric = makeBarycentricDifferential( dPobj, triangleEdge01, triangleEdge02, triangleNormal );
+
+		//store compact differentials
+		fragmentState.dP = compactDifferential( rd.dP );
+		fragmentState.dD = compactDifferential( rd.dD );
+	
+		#ifdef DifferentialTexture
+		{
+			//now we use the barycentric coordinate derivatives to interpolate the vertex texture coordinates and find its derivatives
+			const diff2 dUV  = interpolateDifferential( dBarycentric, v0.texcoord, v1.texcoord, v2.texcoord );
+			textureGrads.xy  = packTextureGrads( dUV );
+			const diff2 dUV2 = interpolateDifferential( dBarycentric, v0.texcoord2, v1.texcoord2, v2.texcoord2 );
+			textureGrads.zw  = packTextureGrads( dUV2 );
+		}
+		#endif
+		#ifdef DifferentialNormal
+		{
+			//calculate normal derivatives
+			const vec3 nScale = vec3( fragmentState.transform[0][0], fragmentState.transform[1][1], fragmentState.transform[2][2] );
+			diff3 dN = interpolateDifferential( dBarycentric, v0.normal, v1.normal, v2.normal );
+			fragmentState.dN = compactDifferential( mulDifferential( nScale, dN ) );
+		}
+		#endif
+	}
+	#endif
+
+	fragmentState.scatterColor = fragmentState.baseColor;
+	fragmentState.sampleCoverage = 0xFFFFFFFF;
+	fragmentState.allowSkySampling = true;
+	fragmentState.anisoDirection = vec3( 0.0, 0.0, 0.0 );
+	fragmentState.anisoDirectionSecondary = vec3( 0.0, 0.0, 0.0 );
+	fragmentState.anisoAspect = 1.0;
+	fragmentState.anisoAspectSecondary = 1.0;
+	fragmentState.diffuseLight = vec3( 0, 0, 0 );
+	fragmentState.specularLight = vec3( 0, 0, 0 );
+
+	fragmentState.vertexTexCoordBase = vec4( input.texcoord, textureGrads.xy );
+	fragmentState.vertexTexCoordSecondary = vec4( input.texcoord2, textureGrads.zw );
+
+	#ifdef TextureInitialize
+		TextureInitialize( renderable, fragmentState );
+	#endif
+
+	// fetch material
+	fetchMaterialChannels( materialIndex, rd, path, fragmentState );
+
+	SampleState sampleState;
+	sampleState.origin = fragmentState.vertexPosition;
+	sampleState.basis = createTangentBasis( fragmentState.normal, fragmentState.vertexTangent );
+	sampleState.V = fragmentState.vertexEye;
+	sampleState.Ng = fragmentState.geometricNormal;
+	sampleState.NdotV = dot( fragmentState.normal, fragmentState.vertexEye );
+	sampleState.strictNormals = fragmentState.normalStrict;
+	sampleState.flagDiffuse = false;
+	sampleState.flagSpecular = false;
+	sampleState.flagHairBCSDF = false;
+	sampleState.shadow = 1.0;
+
+	const uint4 restirData0 = imageLoadArray( tReSTIR, outputCoord, 0 );
+	const uint4 restirData1 = imageLoadArray( tReSTIR, outputCoord, 1 );
+
+	vec3	   dummy = vec3( 0, 0, 0 );
+	const uint pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+	unpackVec2x3f( restirData0.xyz, sampleState.L, dummy );
+
+#ifndef TransmissionThinSurface
+	HINT_FLATTEN
+	if( isTransmission( sampleState ) )
+	{
+		sampleState.H = -normalize( sampleState.L + fragmentState.eta * sampleState.V );
+		HINT_FLATTEN if( dot( sampleState.basis.N, sampleState.H ) < 0.0 )
+		{
+			sampleState.H = -sampleState.H;
+		}
+	}
+	else
+#endif
+	{
+		sampleState.H = normalize( sampleState.L + sampleState.V );
+	}
+
+	sampleState.NdotL = dot( fragmentState.normal, sampleState.L );
+	sampleState.Tin = vec3( 1.0, 1.0, 1.0 );
+	sampleState.Tout = vec3( 1.0, 1.0, 1.0 );
+	sampleState.bsdf = vec3( 0.0, 0.0, 0.0 );
+	sampleState.pdf = 0.0;
+	sampleState.reflectionWeightSecondary = 0.0f;
+	sampleState.reflectionWeight = 0.0f;
+	sampleState.diffusionWeight = 0.0f;
+	sampleState.transmissionWeight = 0.0f;
+
+	// compute BSDF weighting for sampling
+	vec3 fresnel = vec3( 0, 0, 0 ), fresnelCoat = vec3( 0, 0, 0 );
+	computeBSDFWeights<true>( false, path, fragmentState, sampleState, fresnel, fresnelCoat );
+
+	// ***************************************** Direct Light Evaluation ******************************************
+	
+	const int lightIndex = asint( restirData1.w );
+	const float reservoirWeight = asfloat( restirData1.y );
+	evaluateDirectLight( lightIndex, reservoirWeight, path, fragmentState, sampleState );
+
+#if defined(TransmissionSubsurfaceDiffusion) || defined(TransmissionPassthrough)
+	//skip direct light shadow ray if transmitting via diffusion BSSRDF or via passthrough
+	HINT_FLATTEN
+	if( isTransmission( sampleState ) )
+	{
+		// invalidate sample
+		fragmentState.diffuseLight = vec3( 0.0, 0.0, 0.0 );
+		fragmentState.specularLight = vec3( 0.0, 0.0, 0.0 );
+	}
+#endif
+
+	const int specularChannel = uLightingChannels[HYBRID_CHANNEL_SPECULAR];
+	vec3	  albedo, specularAlbedo;
+	float	  specularReflectance;
+	{
+		// get albedo and specular albedo
+		// 1. if specular channel is being rendered to the direct light channel then we have to combine the albedo (for single filter)
+		// 2. if specular channel is separated, then we split the specular albedo 
+		albedo = fragmentState.emission;
+		// single filter case
+		albedo += getDiffuseAlbedo( fragmentState );
+		specularAlbedo = getSpecularAlbedo( fragmentState, sampleState, fresnel, fresnelCoat );
+		specularReflectance = clamp( luminance( specularAlbedo ), 0.0f, 1.0f );
+		albedo += specularAlbedo;
+		if( specularChannel == HYBRID_CHANNEL_DIRECT_LIGHT )
+		{
+			// set specular albedo to be the same as albedo as we have a single filter only
+			specularAlbedo = albedo;
+		}
+	}
+
+    vec3       totalDirectLight = vec3( 0, 0, 0 );
+	half3	   radianceEntryValue;
+	{
+		// radiance clamping - ensure accumulated radiance is non-negative and at most largest half-float normal number
+		// filters out any NaNs and +Infs that might have crept in
+		fragmentState.diffuseLight = clamp( fragmentState.diffuseLight, vec3( 0, 0, 0 ), vec3( uDirectClamp, uDirectClamp, uDirectClamp ) );
+		fragmentState.specularLight = clamp( fragmentState.specularLight, vec3( 0, 0, 0 ), vec3( uDirectClamp, uDirectClamp, uDirectClamp ) );
+
+		radianceEntryValue = clamp( half3( fragmentState.diffuseLight ), half3( 0, 0, 0 ), half3( 65504, 65504, 65504 ) );
+		// demodulate path throughput
+		fragmentState.diffuseLight *= rcpSafe( albedo );
+		fragmentState.specularLight *= rcpSafe( specularAlbedo );
+#ifndef ShadowCatcher
+		// get albedo and specular albedo
+        totalDirectLight = fragmentState.diffuseLight;
+		if( specularChannel == HYBRID_CHANNEL_DIRECT_LIGHT )
+		{
+			totalDirectLight += fragmentState.specularLight;
+		}
+		if( specularChannel != HYBRID_CHANNEL_DIRECT_LIGHT && specularChannel >= 0)
+		{
+			// ensure accumulated radiance is non-negative and at most largest half-float normal number
+			// filters out any NaNs and +Infs that might have crept in
+			// if specular channel is not disabled, i.e. less than 0, then we want to make sure we store the direct specular radiance to specular channel
+			const uint2 reflectionOutputCoord = outputCoord;
+            fragmentState.specularLight = clamp( fragmentState.specularLight, vec3( 0, 0, 0 ), vec3( 65504, 65504, 65504 ) );
+			radianceStore( ushort( specularChannel ), ushort2( reflectionOutputCoord ), half4( half3( fragmentState.specularLight ), 1.0f ) );
+		}
+#endif
+	}
+
+#ifndef ShadowCatcher
+	// emission stored into the radiance buffer, which goes into filtering.
+	// Note: shadow catcher already added to the radiance buffer in traceHybridShadow.comp, the hybrid flow is slight different as we have already 
+	// traced our shadow ray before primary hit shading, so we simply have to ignore contribution here
+	vec3 emission = fragmentState.emission;
+	#ifdef DiffusionUnlit
+		//accumulate unlit albedo into emission
+		emission += fragmentState.albedo.rgb;
+	#endif
+    if ( luminance(emission) > 0.0f )
+    {
+        totalDirectLight += ( emission * rcpSafe( albedo ) );
+    }
+    // finally store direct light
+    totalDirectLight = clamp( totalDirectLight, vec3( 0, 0, 0 ), vec3( 65504, 65504, 65504 ) );
+    radianceStore( ushort( HYBRID_CHANNEL_DIRECT_LIGHT ), ushort2( outputCoord ), half4( half3( totalDirectLight ), 1.0f ) );
+#endif
+            
+	// ********************************** reflection sample and evaluate ************************************
+	
+	uint32_t pathBits = 0;
+	const float sampledGloss = sampleReflection( path, fragmentState, sampleState, specularAlbedo, pathBits );
+	
+	// write to albedo texture
+	imageStoreArray( tAlbedo, fragmentState.screenCoord, HybridAlbedoChannel::HYBRID_ALBEDO_DIFFUSE_METALNESS, vec4( albedo, lerp( specularReflectance, 1.0f, fragmentState.metalness ) ) );
+	imageStoreArray( tAlbedo, fragmentState.screenCoord, HybridAlbedoChannel::HYBRID_ALBEDO_SPECULAR_GLOSSINESS, vec4( specularAlbedo, sampledGloss ) );
+
+	// ********************************** diffuse sample and evaluate ************************************
+	
+	vec4 transmissionAlbedo = vec4( 0, 0, 0, 0 );
+	const bool castShadow = ( renderable.flags & RENDERABLE_FLAG_CAST_SHADOWS ) != 0 ;
+	sampleDiffuseGI( path, fragmentState, sampleState, castShadow, albedo, transmissionAlbedo, pathBits );
+
+#if defined( HybridRayTracedRefraction )
+	// write transmissin albedo
+	imageStoreArray( tAlbedo, outputCoord, HybridAlbedoChannel::HYBRID_ALBEDO_REFRACTION, transmissionAlbedo );
+#endif
+
+	// store in radiance cache
+#if defined(HybridRadianceCache)
+	uint cellIdx = ~uint( 0 );
+	{
+		const bool fromCurve = ( renderable.mesh.triangleOffsetAndFlags & MESH_FLAG_FROMCURVES ) != 0;
+		if( !fromCurve && ( bSpatialHashIndirectBuffer0[pixelIdx].w != ~uint( 0 ) ) )
+		{
+			bSpatialHashIndirectBuffer0[pixelIdx].xyz = packVec2x3f( vec3( radianceEntryValue ), sampleState.bsdf * rcpSafe( sampleState.pdf ) );
+		}
+	}
+#endif
+} 

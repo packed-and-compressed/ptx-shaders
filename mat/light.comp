@@ -1,0 +1,213 @@
+#ifndef LIGHT_COMP
+#define LIGHT_COMP
+
+#include "other/lightData.sh"
+#include "data/shader/common/globalTextures.sh"
+#define tLightGels tGlobalTextures
+
+uniform uint2	uLightAreaMask;
+uniform vec3	uLightChoosePDF; // { pdfChooseSky, pdfChooseDynamic, pdfChooseDynammicNoSky }
+
+USE_BUFFER(mat4,bLightProjections);
+
+USE_SAMPLER(sLightGelSampler);
+
+struct	LightParamsRT
+{
+	//all light types
+	vec3	color;			// "colour"
+	vec3	direction;		// normalized direction vector
+	vec3	size;			// width, height, radius
+	vec3	axisX, axisY;	// 2D area axes
+	vec3	axisZ;			// front orientation axis
+	bool	castShadows;	// should this light cast shadows?
+	//point lights only
+	vec3	position;		// world space position
+	vec3	toSource;		// vector from shading point to light
+	float	distance;		// distance to light
+	float	invDistance2;	// 1/distance^2 to light
+	float	fade;			// fade due to spot or side check
+};
+
+float		pointLightFade( LightParamsRT p, float spotSinAngle, float spotSharpness )
+{
+	float LdotZ	= saturate( dot( p.direction, p.axisZ ) );
+	float fade  = 1.0;
+	if( spotSinAngle > 0.0 )
+	{
+		//spot light
+		float spotSinDirection = sqrt( saturate(1.0 - LdotZ*LdotZ) );
+		fade = saturate( spotSharpness - spotSharpness*spotSinDirection/spotSinAngle );
+	}
+	else if( spotSharpness > 0.0 )
+	{
+		//single-sided omni light
+		fade = LdotZ > 0.0 ? 1.0 : 0.0;
+	}
+	return fade;
+}
+
+LightParamsRT computePointLightParams( uint i, vec3 origin )
+{
+	LightData data = bLightData[i];
+
+	LightParamsRT p;
+	p.position = data.positionTileRadius.xyz;
+	
+	uint sizeWH = data.sizeAxisXY.x;
+	p.size.y = f16tof32( sizeWH );
+	p.size.x = f16tof32( sizeWH>>16 );
+	
+	uint tileRadius = asuint( data.positionTileRadius.w );
+	p.size.z = f16tof32( tileRadius );
+
+	uint axisXY0 = data.sizeAxisXY.y;
+	uint axisXY1 = data.sizeAxisXY.z;
+	uint axisZZ  = data.sizeAxisXY.w;
+	p.axisX.x = f16tof32( axisXY0 );
+	p.axisX.y = f16tof32( axisXY0>>16 );
+	p.axisY.x = f16tof32( axisXY1 );
+	p.axisY.y = f16tof32( axisXY1>>16 );
+	p.axisX.z = f16tof32( axisZZ );
+	p.axisY.z = f16tof32( axisZZ>>16 );
+	p.axisZ   = cross( p.axisX, p.axisY );
+
+	uint  colorFlags = data.colorFlagsBright.x;
+	float brightness = asfloat( data.colorFlagsBright.y );
+	p.color.b = ( (colorFlags    ) & 0xFF );
+	p.color.g = ( (colorFlags>>8 ) & 0xFF );
+	p.color.r = ( (colorFlags>>16) & 0xFF );
+	p.color  *= brightness;
+	p.castShadows = colorFlags & LIGHT_FLAG_CAST_SHADOWS;
+
+	p.toSource = p.position - origin;
+	float d2 = dot( p.toSource, p.toSource );
+	float invDistance = rsqrt( d2 );
+	p.distance = sqrt( d2 );
+	p.direction = p.toSource * invDistance;
+	p.invDistance2 = invDistance * invDistance;
+		
+	//spot params & fade
+	uint  spotParams    = data.spotGelTexture.x;
+	float spotSinAngle  = f16tof32( spotParams );
+	float spotSharpness = f16tof32( spotParams>>16 );
+	p.fade   = pointLightFade( p, spotSinAngle, spotSharpness );
+
+#ifdef SceneHasPointLights_WithGels
+	//gel
+	uint gelTextureIndex = data.spotGelTexture.y;
+	if( gelTextureIndex != uint(~0) )
+	{
+		//projective texture coordinates
+		mat4 projMatrix = bLightProjections[i];
+		float spotVignette = col0( projMatrix ).z;
+		if ( spotSinAngle >= 0.0 )
+		{ col0( projMatrix ).z = 0.0; }
+
+		vec4  projOrigin = mulPoint( projMatrix, origin );
+		float projDepth  = length( projOrigin.xyz );
+		vec2  projCoord	 = projOrigin.xy / ( spotSinAngle >= 0.0 ? projOrigin.w : projDepth );
+		if( spotSinAngle < 0.0 ) // Omni
+		{
+			projCoord.y = 1.0f - projCoord.y;
+		}
+
+		if ( spotSinAngle >= 0.0 )
+		{
+			const vec2 vignette = 2.0 * spotVignette * projCoord.xy - vec2(spotVignette, spotVignette);
+			p.fade = saturate( spotSharpness - spotSharpness * dot( vignette, vignette ) );
+			if( projCoord.x < 0.0 || projCoord.x > 1.0 || projCoord.y < 0.0 || projCoord.y > 1.0 )
+			{ p.fade = 0.0; }
+		}
+
+		//gel params
+		float gelTile = f16tof32( tileRadius>>16 );
+		bool  gelGrayscale = colorFlags & LIGHT_FLAG_GEL_GRAYSCALE;
+	#ifdef RENDERTARGET_Y_DOWN
+		vec4  gelTileCoord = vec4( gelTile, -gelTile, gelTile, 0.0 );
+	#else
+		vec4  gelTileCoord = vec4( gelTile, gelTile, 0.0, 0.0 );
+	#endif
+
+		//gel sample
+		vec2 uv  = projCoord * gelTileCoord.xy + gelTileCoord.zw;
+		vec3 gel = textureWithSamplerLod( resourceByIndex(tLightGels,gelTextureIndex), sLightGelSampler, uv, 0.0 ).rgb;
+		gel = gelGrayscale ? gel.rrr : gel;
+		p.color *= gel;
+	}
+#endif
+
+	p.color *= p.fade;
+
+	return p;
+}
+
+LightParamsRT computeDistantLightParams( uint i, vec3 origin )
+{
+	LightData data = bLightData[i];
+
+	LightParamsRT p;
+	p.direction = data.positionTileRadius.xyz;
+	
+	uint sizeWH = data.sizeAxisXY.x;
+	p.size.y = f16tof32( sizeWH );
+	p.size.x = f16tof32( sizeWH>>16 );
+
+	uint tileRadius = asuint( data.positionTileRadius.w );
+	p.size.z = f16tof32( tileRadius );
+	
+	uint axisXY0 = data.sizeAxisXY.y;
+	uint axisXY1 = data.sizeAxisXY.z;
+	uint axisZZ  = data.sizeAxisXY.w;
+	p.axisX.x = f16tof32( axisXY0 );
+	p.axisX.y = f16tof32( axisXY0>>16 );
+	p.axisY.x = f16tof32( axisXY1 );
+	p.axisY.y = f16tof32( axisXY1>>16 );
+	p.axisX.z = f16tof32( axisZZ );
+	p.axisY.z = f16tof32( axisZZ>>16 );
+	p.axisZ   = cross( p.axisX, p.axisY );
+	
+	uint  colorFlags = data.colorFlagsBright.x;
+	float brightness = asfloat( data.colorFlagsBright.y );
+	p.color.b = ( (colorFlags    ) & 0xFF );
+	p.color.g = ( (colorFlags>>8 ) & 0xFF );
+	p.color.r = ( (colorFlags>>16) & 0xFF );
+	p.color  *= brightness;
+	p.castShadows = colorFlags & LIGHT_FLAG_CAST_SHADOWS;
+
+	p.toSource = p.direction;
+	p.position = vec3(0.0, 0.0, 0.0);
+	p.distance = INFINITY;
+	p.invDistance2 = 0.0;
+	p.fade = 1.0;
+
+#ifdef SceneHasDistantLights_WithGels
+	//gel
+	uint gelTextureIndex = data.spotGelTexture.y;
+	if( gelTextureIndex != uint(~0) )
+	{
+		//projective texture coordinates
+		vec4 projOrigin	= mulPoint( bLightProjections[i], origin );
+		vec2 projCoord  = projOrigin.xy / projOrigin.w;
+	
+		//gel params
+		float gelTile = f16tof32( tileRadius>>16 );
+		bool  gelGrayscale = colorFlags & LIGHT_FLAG_GEL_GRAYSCALE;
+	#ifdef RENDERTARGET_Y_DOWN
+		vec4  gelTileCoord = vec4( gelTile, -gelTile, gelTile, 0.0 );
+	#else
+		vec4  gelTileCoord = vec4( gelTile, gelTile, 0.0, 0.0 );
+	#endif
+
+		//gel sample
+		vec2 uv  = projCoord * gelTileCoord.xy + gelTileCoord.zw;
+		vec3 gel = textureWithSamplerLod( resourceByIndex(tLightGels,gelTextureIndex), sLightGelSampler, uv, 0.0 ).rgb;
+		gel = gelGrayscale ? gel.rrr : gel;
+		p.color *= gel;
+	}
+#endif
+
+	return p;
+}
+
+#endif

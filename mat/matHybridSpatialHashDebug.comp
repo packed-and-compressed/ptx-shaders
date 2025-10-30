@@ -1,0 +1,179 @@
+#include "data/shader/mat/hybrid.comp"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/raydifferential.sh"
+#include "data/shader/scene/raytracing/reservoir.comp"
+
+USE_BUFFER( uint, bSpatialHashRadianceCache );
+USE_TEXTURE2D( tRandomColor );
+
+USE_LOADSTORE_TEXTURE2D( float, tResult, 0 );
+USE_INTERLOCKED_BUFFER( bSpatialHashCheckSum, 1 );
+USE_INTERLOCKED_BUFFER( bSpatialHashAge, 2 );
+#define RT_RADIANCE_ATTACHMENT 3
+#include "../scene/raytracing/output.comp"
+
+#define INTERLOCKED_SPATIAL_HASH_CHECKSUM bSpatialHashCheckSum
+#define SPATIAL_HASH_RADIANCE_CACHE bSpatialHashRadianceCache
+#include "data/shader/scene/raytracing/spatialhash/spatialhash.comp"
+#undef INTERLOCKED_SPATIAL_HASH_CHECKSUM
+
+
+COMPUTE( 8, 8, 1 )
+{
+	MATERIAL_DEBUG_CHECK_PARAMS();
+	
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	PathState path;
+	// path output initializes with uOutputChannel.x, direct light by default
+	path.outputDesc = makeOutputDesc( ushort2( outputCoord ), uOutputChannel.x );
+
+	const uint objectIndex = imageLoad( tPrepassObjectID, outputCoord ).x - 1;
+	if( objectIndex == ~uint( 0 ) )
+	{
+		return;
+	}
+
+	uint materialIndex;
+	if( !getMaterialBinding( objectIndex, materialIndex ) )
+	{
+		return;
+	}
+
+	// initialize path fragmentState
+	path.radiance = half3( 1.0, 0.0, 0.0 );
+	path.throughput = vec3( 1.0, 1.0, 1.0 );
+	path.isDiffuse = false;
+	path.isNonSpecular = false;
+	path.isTransmission = false;
+	path.isSubsurface = false;
+	path.mediumExtinction = vec3( 0.0, 0.0, 0.0 );// uSceneMediumExtinction;
+	path.mediumScatter = vec3( 0.0, 0.0, 0.0 );	  // uSceneMediumScatter;
+	path.mediumAnisotropy = 0.0;				  // uSceneMediumAnisotropy;
+
+	// fetch renderable instance & material params
+	Renderable renderable = bRenderables[objectIndex];
+	MaterialParams params = bMaterialParams[materialIndex];
+
+	uint2		   gbuffer = asuint( imageLoad( tPrepassGeometry, outputCoord ).xy );
+	uint3		   tri = loadTriangle( renderable.mesh, gbuffer.x );
+	Vertex		   v0 = loadVertex( renderable.mesh, tri.x );
+	Vertex		   v1 = loadVertex( renderable.mesh, tri.y );
+	Vertex		   v2 = loadVertex( renderable.mesh, tri.z );
+
+	vec4		   uvScaleBias = unpackVec4f( params.texCoordTransform.xy );
+	vec2		   uvRotation = unpackVec2f( params.texCoordTransform.z );
+	v0.texcoord = transformUV( v0.texcoord, uvScaleBias, uvRotation );
+	v1.texcoord = transformUV( v1.texcoord, uvScaleBias, uvRotation );
+	v2.texcoord = transformUV( v2.texcoord, uvScaleBias, uvRotation );
+
+	vec2		  triangleBarycentrics = unpackUnitVec2f( gbuffer.y );
+	precise vec3  triangleEdge01, triangleEdge02;
+	Vertex		  input = interpolateVertexPrecise( triangleBarycentrics, v0, v1, v2, triangleEdge01, triangleEdge02 );
+
+	vec3		  triangleNormal = cross( triangleEdge01, triangleEdge02 );
+
+	FragmentState fragmentState = newFragmentState();
+	fragmentState.rng = rngInit( path.outputDesc & RT_OUTPUTCOORD_MASK, uRandomSeed );
+	fragmentState.primitiveID = gbuffer.x;
+	fragmentState.triangleBarycentrics = vec3( saturate( 1 - triangleBarycentrics.x - triangleBarycentrics.y ), triangleBarycentrics.xy );
+	fragmentState.objectID = objectIndex;
+	fragmentState.transform = unpack( renderable.transform );
+	fragmentState.transformInverse = unpack( renderable.transformInverse );
+	fragmentState.transformInverseTranspose = transpose3x3( fragmentState.transformInverse );
+	fragmentState.vertexPosition = mulPoint( fragmentState.transform, input.position );
+	fragmentState.vertexEye = uLightSpaceCameraPosition.xyz - uLightSpaceCameraPosition.w * fragmentState.vertexPosition;
+	fragmentState.vertexEyeDistance = length( fragmentState.vertexEye );
+	fragmentState.vertexEye *= rcp( fragmentState.vertexEyeDistance );
+	fragmentState.vertexColor = input.color;
+	fragmentState.vertexNormal = normalize( mulVec( fragmentState.transformInverseTranspose, input.normal ) );
+	fragmentState.vertexTangent = normalize( mulVec( fragmentState.transformInverseTranspose, input.tangent ) );
+	fragmentState.vertexBitangent = normalize( mulVec( fragmentState.transformInverseTranspose, input.bitangent ) );
+	fragmentState.geometricNormal = normalize( mulVec( fragmentState.transformInverseTranspose, triangleNormal ) );
+	fragmentState.normal = fragmentState.vertexNormal;
+	fragmentState.screenCoord = outputCoord;
+	fragmentState.screenTexCoord = vec2( fragmentState.screenCoord.x + 0.5, fragmentState.screenCoord.y + 0.5 );
+	fragmentState.screenTexCoord = fragmentState.screenTexCoord * uScreenTexCoordScaleBias.xy + uScreenTexCoordScaleBias.zw;
+	fragmentState.screenDepth = 0.0;
+	
+	vec4			textureGrads = vec4( 0.0, 0.0, 0.0, 0.0 );
+	RayDifferential rd = newRayDifferential();
+	#ifdef Differentials
+	{
+		rd = getRayDifferentialPrecise( fragmentState );
+
+		//calculate barycentric coordinate derivatives
+		diff3 dPobj = mulDifferential( fragmentState.transformInverse, rd.dP );
+		diff2 dBarycentric = makeBarycentricDifferential( dPobj, triangleEdge01, triangleEdge02, triangleNormal );
+
+		//store compact differentials
+		fragmentState.dP = compactDifferential( rd.dP );
+		fragmentState.dD = compactDifferential( rd.dD );
+	
+		#ifdef DifferentialTexture
+		{
+			//now we use the barycentric coordinate derivatives to interpolate the vertex texture coordinates and find its derivatives
+			const diff2 dUV  = interpolateDifferential( dBarycentric, v0.texcoord, v1.texcoord, v2.texcoord );
+			textureGrads.xy = packTextureGrads( dUV );
+			const diff2 dUV2 = interpolateDifferential( dBarycentric, v0.texcoord2, v1.texcoord2, v2.texcoord2 );
+			textureGrads.zw  = packTextureGrads( dUV2 );
+		}
+		#endif
+		#ifdef DifferentialNormal
+		{
+			//calculate normal derivatives
+			const vec3 nScale = vec3( fragmentState.transform[0][0], fragmentState.transform[1][1], fragmentState.transform[2][2] );
+			diff3 dN = interpolateDifferential( dBarycentric, v0.normal, v1.normal, v2.normal );
+			fragmentState.dN = compactDifferential( mulDifferential( nScale, dN ) );
+		}
+		#endif
+	}
+	#endif
+	fragmentState.scatterColor = fragmentState.baseColor;
+	fragmentState.sampleCoverage = 0xFFFFFFFF;
+	fragmentState.allowSkySampling = true;
+	fragmentState.anisoDirection = vec3( 0.0, 0.0, 0.0 );
+	fragmentState.anisoDirectionSecondary = vec3( 0.0, 0.0, 0.0 );
+	fragmentState.anisoAspect = 1.0;
+	fragmentState.anisoAspectSecondary = 1.0;
+	fragmentState.diffuseLight = vec3( 0, 0, 0 );
+	fragmentState.specularLight = vec3( 0, 0, 0 );
+
+	// NOTE: transmitting via Burley SSS multiple times has little benefit and causes variance spikes
+	// disallow sampling it after first diffuse bounce to avoid firefly noise
+	fragmentState.allowSubsurfaceDiffusion = !path.isDiffuse;
+	fragmentState.vertexTexCoord.uvCoord = vec4( input.texcoord, textureGrads.xy );
+	fragmentState.vertexTexCoordSecondary = vec4( input.texcoord2, textureGrads.zw );
+	
+	#ifdef TextureInitialize
+		TextureInitialize( renderable, fragmentState );
+	#endif
+
+	InitializeSampleCoords( params, fragmentState, rd.dP, uvScaleBias, uvRotation );
+
+	// flip normals if camera ray hit back face
+	if( dot( fragmentState.vertexEye, fragmentState.geometricNormal ) < 0.0 )
+	{
+		fragmentState.normal = -fragmentState.normal;
+		fragmentState.vertexNormal = -fragmentState.vertexNormal;
+		fragmentState.geometricNormal = -fragmentState.geometricNormal;
+	}
+	int	 cacheEntryCount = 0;
+	bool foundCacheEntry = false;
+	#define RENDER_SPATIAL_HASH_GRID
+#if defined( RENDER_SPATIAL_HASH_GRID )
+	const float swd = computeDiscretization( fragmentState.vertexPosition, vec2( uScreenSize ), fragmentState.vertexEyeDistance );
+	const uint2 spatialHash = computeSpatialHashIdx<false>( fragmentState.vertexPosition, fragmentState.normal, rngNextVec3( fragmentState.rng ), rngNextVec3( fragmentState.rng ), swd );
+	const vec3	color = imageLoad( tRandomColor, uint2( spatialHash.y % 100, 0 ) ).xyz;
+	imageStore( tResult, outputCoord, vec4( color, float( 1.0f ) ) );
+#else
+    vec3 color = getRadiance( fragmentState.vertexPosition, fragmentState.normal, rngNextVec3( fragmentState.rng ), rngNextVec3( fragmentState.rng ), vec2( uScreenSize ), fragmentState.vertexEyeDistance, cacheEntryCount, foundCacheEntry );
+    imageStore( tResult, outputCoord, vec4( color, float( 1.0f ) ) );
+#endif
+}

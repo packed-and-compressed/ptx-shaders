@@ -1,0 +1,305 @@
+#include "../mat/hybrid.comp"
+
+uniform int uFrameNumber;
+
+USE_INTERLOCKED_BUFFER( bCounters, 0 );
+USE_LOADSTORE_BUFFER( uint4, bShadowRaysIdx, 1 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates0, 2 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates1, 3 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIR, 4 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tReSTIRGISample, 5 );
+USE_LOADSTORE_TEXTURE2D( uint, tRefractionFeatures, 6 );
+USE_LOADSTORE_BUFFER( uint4, bSpatialHashIndirectBuffer0, 7 );
+USE_INTERLOCKED_BUFFER( bSpatialHashCheckSum, 8 );
+USE_LOADSTORE_TEXTURE2D( float, tNormal, 9 );
+#ifdef SceneHasHairStrands
+	USE_LOADSTORE_TEXTURE2D( uint, tHairStrandID, 10 );
+	#define RT_RADIANCE_ATTACHMENT 11
+	#include "../scene/raytracing/output.comp"
+	#ifdef HYBRID_DEBUG
+		USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 12 );
+	#endif
+#else
+	#define RT_RADIANCE_ATTACHMENT 10
+	#include "../scene/raytracing/output.comp"
+	#ifdef HYBRID_DEBUG
+		USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 11 );
+	#endif
+#endif
+
+#if defined(HybridRadianceCache)
+	#define INTERLOCKED_SPATIAL_HASH_CHECKSUM bSpatialHashCheckSum
+	#include "data/shader/scene/raytracing/spatialhash/spatialhash.comp"
+	#undef INTERLOCKED_SPATIAL_HASH_CHECKSUM 
+#endif
+
+COMPUTE( 8, 8, 1 )
+{
+	MATERIAL_DEBUG_CHECK_PARAMS();
+	
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	PathState path;
+	// path output initializes with uOutputChannel.x, direct light by default
+	path.outputDesc = makeOutputDesc( ushort2( outputCoord ), uOutputChannel.x );
+	const uint objectIndex = imageLoad( tPrepassObjectID, outputCoord ).x - 1;
+	if( objectIndex == ~uint( 0 ) )
+	{
+		return;
+	}
+
+	uint materialIndex;
+	if( !getMaterialBinding( objectIndex, materialIndex ) )
+	{
+		return;
+	}
+
+	const uint pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	// initialize path fragmentState
+	path.radiance = half3( 1.0, 0.0, 0.0 );
+	path.throughput = vec3( 1.0, 1.0, 1.0 );
+	path.isDiffuse = false;
+	path.isNonSpecular = false;
+	path.isTransmission = false;
+	path.isSubsurface = false;
+	path.mediumExtinction = vec3( 0.0, 0.0, 0.0 );// uSceneMediumExtinction;
+	path.mediumScatter = vec3( 0.0, 0.0, 0.0 );	  // uSceneMediumScatter;
+	path.mediumAnisotropy = 0.0;				  // uSceneMediumAnisotropy;
+
+	// fetch renderable instance
+	Renderable renderable = bRenderables[objectIndex];
+
+	// load vertex data
+	uint2		   gbuffer = asuint( imageLoad( tPrepassGeometry, outputCoord ).xy );
+	uint3		   tri = loadTriangle( renderable.mesh, gbuffer.x );
+	Vertex		   v0 = loadVertex( renderable.mesh, tri.x );
+	Vertex		   v1 = loadVertex( renderable.mesh, tri.y );
+	Vertex		   v2 = loadVertex( renderable.mesh, tri.z );
+	
+	vec2		   triangleBarycentrics = unpackUnitVec2f( gbuffer.y );
+	precise vec3   triangleEdge01, triangleEdge02;
+	Vertex		   input = interpolateVertexPrecise( triangleBarycentrics, v0, v1, v2, triangleEdge01, triangleEdge02 );
+
+#ifdef SceneHasHairStrands
+	imageStore( tHairStrandID, outputCoord, uint4( input.hairStrandID, 0, 0, 0 ) );
+#endif
+
+	vec3		   triangleNormal = cross( triangleEdge01, triangleEdge02 );
+	float		   triangleNormalScale;
+	// make sure triangle normal and interpolated normal have consistent orientation
+	HINT_FLATTEN
+	if( dot( triangleNormal, input.normal ) < 0.0 )
+	{
+		input.normal = -input.normal;
+	}
+
+	FragmentState fragmentState = newFragmentState();
+	const uint4	  rngData = rngLoadHybrid( outputCoord );
+	fragmentState.rng = rngInit( path.outputDesc & RT_OUTPUTCOORD_MASK, rngData.x );
+	fragmentState.ldsParams = rngData.yzw;
+	fragmentState.primitiveID = gbuffer.x;
+	fragmentState.triangleBarycentrics = vec3( saturate( 1 - triangleBarycentrics.x - triangleBarycentrics.y ), triangleBarycentrics.xy );
+	fragmentState.objectID = objectIndex;
+	fragmentState.transform = unpack( renderable.transform );
+	fragmentState.transformInverse = unpack( renderable.transformInverse );
+	fragmentState.transformInverseTranspose = transpose3x3( fragmentState.transformInverse );
+	fragmentState.vertexPosition = mulPoint( fragmentState.transform, input.position );
+	fragmentState.vertexEye = uLightSpaceCameraPosition.xyz - uLightSpaceCameraPosition.w * fragmentState.vertexPosition;
+	fragmentState.vertexEyeDistance = length( fragmentState.vertexEye );
+	fragmentState.vertexEye *= rcp( fragmentState.vertexEyeDistance );
+	fragmentState.vertexColor = input.color;
+	fragmentState.vertexNormal = normalize( mulVec( fragmentState.transformInverseTranspose, input.normal ) );
+	fragmentState.vertexTangent = normalize( mulVec( fragmentState.transformInverseTranspose, input.tangent ) );
+	fragmentState.vertexBitangent = normalize( mulVec( fragmentState.transformInverseTranspose, input.bitangent ) );
+	fragmentState.geometricNormal = normalizeAndGetScale( mulVec( fragmentState.transformInverseTranspose, triangleNormal ), triangleNormalScale );
+	fragmentState.normal = fragmentState.vertexNormal;
+	fragmentState.screenCoord = outputCoord;
+	fragmentState.screenTexCoord = vec2( fragmentState.screenCoord.x + 0.5, fragmentState.screenCoord.y + 0.5 );
+	fragmentState.screenTexCoord = fragmentState.screenTexCoord * uScreenTexCoordScaleBias.xy + uScreenTexCoordScaleBias.zw;
+	fragmentState.screenDepth = 0.0;
+	fragmentState.rayOffset = computeRayOffset( fragmentState, input.position, v0.position, triangleEdge01, triangleEdge02, triangleNormal, triangleNormalScale );
+	fragmentState.frontFacing = dot( fragmentState.vertexEye, fragmentState.geometricNormal ) >= 0.0;
+#ifdef TransmissionSubsurfaceDiffusion
+	// assume front facing when exiting via subsurface diffusion since in this case we don't have a meaningful view direction
+	fragmentState.frontFacing = fragmentState.frontFacing || path.isSubsurface;
+	// transmitting via subsurface diffusion multiple times has little benefit and causes variance spikes
+	// disallow sampling it after first diffuse bounce to avoid firefly noise
+	fragmentState.allowSubsurfaceDiffusion = !path.isDiffuse;
+#endif
+
+	fragmentState.scatterColor = fragmentState.baseColor;
+	fragmentState.sampleCoverage = 0xFFFFFFFF;
+	fragmentState.allowSkySampling = true;
+	fragmentState.anisoDirection = vec3( 0.0, 0.0, 0.0 );
+	fragmentState.anisoDirectionSecondary = vec3( 0.0, 0.0, 0.0 );
+	fragmentState.anisoAspect = 1.0;
+	fragmentState.anisoAspectSecondary = 1.0;
+	fragmentState.diffuseLight = vec3( 0, 0, 0 );
+	fragmentState.specularLight = vec3( 0, 0, 0 );
+
+	vec4			textureGrads = vec4( 0.0, 0.0, 0.0, 0.0 );
+	RayDifferential rd = newRayDifferential();
+	#ifdef Differentials
+	{
+		rd = getRayDifferentialPrecise( fragmentState );
+		
+		//calculate barycentric coordinate derivatives
+		diff3 dPobj = mulDifferential( fragmentState.transformInverse, rd.dP );
+		diff2 dBarycentric = makeBarycentricDifferential( dPobj, triangleEdge01, triangleEdge02, triangleNormal );
+
+		//store compact differentials
+		fragmentState.dP = compactDifferential( rd.dP );
+		fragmentState.dD = compactDifferential( rd.dD );
+	
+		#ifdef DifferentialTexture
+		{
+			//now we use the barycentric coordinate derivatives to interpolate the vertex texture coordinates and find its derivatives
+			const diff2 dUV  = interpolateDifferential( dBarycentric, v0.texcoord, v1.texcoord, v2.texcoord );
+			textureGrads.xy  = packTextureGrads( dUV );
+			const diff2 dUV2 = interpolateDifferential( dBarycentric, v0.texcoord2, v1.texcoord2, v2.texcoord2 );
+			textureGrads.zw  = packTextureGrads( dUV2 );
+		}
+		#endif
+		#ifdef DifferentialNormal
+		{
+			//calculate normal derivatives
+			const vec3 nScale = vec3( fragmentState.transform[0][0], fragmentState.transform[1][1], fragmentState.transform[2][2] );
+			diff3 dN = interpolateDifferential( dBarycentric, v0.normal, v1.normal, v2.normal );
+			fragmentState.dN = compactDifferential( mulDifferential( nScale, dN ) );
+		}
+		#endif
+	}
+	#endif
+
+	fragmentState.vertexTexCoordBase = vec4( input.texcoord, textureGrads.xy );
+	fragmentState.vertexTexCoordSecondary = vec4( input.texcoord2, textureGrads.zw );
+	
+	#ifdef TextureInitialize
+		TextureInitialize( renderable, fragmentState );
+	#endif
+
+	fetchMaterialChannels( materialIndex, rd, path, fragmentState );
+	
+	// store normals
+	vec3 normal = mulVec( uViewMatrix, normalize( fragmentState.normal ) );
+	imageStore( tNormal, outputCoord, vec4( normal, 1.0f ) );
+
+	bool isShadowCatcher = false;
+#if defined( ShadowCatcher )
+	isShadowCatcher = true;
+#endif
+
+	SampleState sampleState;
+	sampleState.origin = fragmentState.vertexPosition;
+	sampleState.basis = createTangentBasis( fragmentState.normal, fragmentState.vertexTangent );
+	sampleState.V = fragmentState.vertexEye;
+	sampleState.Ng = fragmentState.geometricNormal;
+	sampleState.NdotV = dot( fragmentState.normal, fragmentState.vertexEye );
+	sampleState.strictNormals = fragmentState.normalStrict;
+	sampleState.flagDiffuse = false;
+	sampleState.flagSpecular = false;
+	sampleState.shadow = 1.0;
+	sampleState.L = vec3( 0.0, 0.0, 0.0 );
+	sampleState.H = vec3( 0.0, 0.0, 0.0 );
+	sampleState.NdotL = 0.0;
+	sampleState.Tin = vec3( 1.0, 1.0, 1.0 );
+	sampleState.Tout = vec3( 1.0, 1.0, 1.0 );
+	sampleState.bsdf = vec3( 0.0, 0.0, 0.0 );
+	sampleState.pdf = 0.0;
+	sampleState.reflectionWeightSecondary = 0.0f;
+	sampleState.reflectionWeight = 0.0f;
+	sampleState.diffusionWeight = 0.0f;
+	sampleState.transmissionWeight = 0.f;
+
+	// compute BSDF weighting for sampling
+	vec3 fresnel = vec3( 0, 0, 0 ), fresnelCoat = vec3( 0, 0, 0 );
+	computeBSDFWeights<true>( false, path, fragmentState, sampleState, fresnel, fresnelCoat );
+
+	// store in irradiance cache
+	const bool fromCurve = ( renderable.mesh.triangleOffsetAndFlags & MESH_FLAG_FROMCURVES ) != 0;
+#if defined(HybridRadianceCache)
+	uint cellIdx = ~uint( 0 );
+	if(!fromCurve)
+	{
+		uint checkSum = 0;
+		cellIdx = findCellIdx( sampleState.origin, fragmentState.normal, rngNextVec3( fragmentState.rng ), rngNextVec3( fragmentState.rng ), vec2( uScreenSize ), fragmentState.vertexEyeDistance, checkSum );
+		bSpatialHashIndirectBuffer0[pixelIdx].w = cellIdx;
+	}
+#endif
+
+	uint4 restirData0 = uint4( 0, 0, 0, 0 );
+	uint4 restirData1 = uint4( 0, 0, 0, asuint( -1 ) );
+#if defined( HybridDirectLightCheckerboard )
+	const bool continueLightSample = ( ( uFrameNumber % 2 ) == 0 ) ? ( ( ( outputCoord.x + outputCoord.y ) % 2 ) == 0 ) : ( ( ( outputCoord.x + outputCoord.y ) % 2 ) == 1 );
+#else
+	const bool continueLightSample = true;
+#endif
+	// ***************************************** Shadow ray sample ******************************************
+
+	vec3	   diffuseLight;
+	Reservoir  reservoir = sampleLights( 0, path, fragmentState, sampleState, diffuseLight );
+
+	// store reservoir
+	vec3 radianceLight;
+	unpackVec2x3f( reservoir.Lradiance, sampleState.L, radianceLight );
+
+	bool shadowRay = luminance( radianceLight ) > 0.0f;
+#if defined( ShadowCatcher )
+	shadowRay = true;
+#endif
+
+	#ifndef ReflectionBCSDF
+	{
+		// we only allow BCSDF to have transmissive shadow ray because of non-manifold geometry used for BCSDF, for other
+		// BSDF types, we strictly only do direct light sampling in the normal direction
+		sampleState.NdotL = abs( sampleState.NdotL );
+	}
+	#endif
+	const vec3 origin = rayOriginAdjust( sampleState, fragmentState.rayOffset );
+	if( shadowRay && continueLightSample )
+	{
+		// light rays
+		uint index;
+		interlockedAdd( bCounters, HYBRID_COUNTER_LIGHT_RAYS, 1, index );
+		
+	#if defined( ShadowCatcher )
+		radianceLight = vec3( sampleState.shadow, 0, 0 );
+	#endif
+		// pack reservoir
+		reservoir.Lradiance = packVec2x3f( sampleState.L, radianceLight );
+		// shadow ray sample and direct light radiance
+		uint shadowFlag = 0;
+	#if defined( ShadowCatcher )
+		shadowFlag = RT_RAYFLAG_SHADOWCATCHER;
+	#endif
+		HYBRID_RAY_BUFFER0( bShadowRaysIdx, index ) = uint4( path.outputDesc | shadowFlag, asuint( origin ) );
+	}
+	else
+	{
+		reservoir.Lradiance = packVec2x3f( sampleState.L, vec3( 0, 0, 0 ) );
+	}
+	restirData0 = uint4( reservoir.Lradiance, asuint( reservoir.distance ) );
+	restirData1 = uint4( asuint( reservoir.pdfTarget ), asuint( reservoir.W ), ( uint( reservoir.M ) << 16 ) | uint( reservoir.age ), asuint( reservoir.lightIdx ) );
+	imageStoreArray( tReSTIR, outputCoord, 0, restirData0 );
+	imageStoreArray( tReSTIR, outputCoord, 1, restirData1 );
+
+	// write to temporary restir sampling buffer
+	const bool allowSkySampling = fragmentState.allowSkySampling;
+	uint	   restirBits = 0;
+	restirBits = restirBits | ( allowSkySampling ? HYBRID_PATH_ALLOW_SKY_SAMPLE : 0 );
+	restirBits = restirBits | ( isShadowCatcher ? RT_RAYFLAG_SHADOWCATCHER : 0 );
+	imageStoreArray( tReSTIRGISample, outputCoord, 0, vec4( origin, asfloat( restirBits ) ) );
+	
+#ifdef TransmissionSubsurfaceDiffusion
+	if( luminance( fragmentState.scatterDepth ) > 0 )
+	{
+		imageStore( tRefractionFeatures, outputCoord, uint4( 0, 0, 0, asuint( luminance( fragmentState.scatterDepth ) ) ) );
+	}
+#endif
+}

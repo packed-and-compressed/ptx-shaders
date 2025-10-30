@@ -1,0 +1,225 @@
+#include "../common/util.sh"
+#include "../common/meshBuffer.comp"
+#include "../common/tangentbasis.sh"
+#include "params.frag"
+#include "state.frag"
+
+// INPUTS
+//base level bind pose - original vertices
+USE_BUFFER(float,	bufferPositionsIN);
+USE_BUFFER(uint,	bufferTangentsNormalsIN);
+USE_BUFFER(float,	bufferTexCoords0IN);
+USE_BUFFER(float,	bufferTexCoords1IN);
+USE_BUFFER(float,	bufferColorIN);
+
+//special case for subset of mesh (multiple materials)
+USE_BUFFER(uint,	vertexIndicesIN);
+uniform uint		uUseVertexIndices;
+
+uniform uint		uNumPositions;
+uniform uint		uTotalVertices;
+
+uniform vec4		uMaterialUvScaleBias;
+uniform vec2		uMaterialUvRotation;
+
+uniform vec2		uInputMeshTexCoords0Offsets;
+uniform vec2		uInputMeshTexCoords1Offsets;
+uniform vec2		uOutputMeshTexCoords0Offsets;
+
+uniform mat4		uModelTransform;
+uniform mat4		uModelTransformInverse;
+
+// OUTPUT
+USE_INTERLOCKED_BUFFER(rawMeshBuffer, 0);
+
+// SUPPORTIG CAST
+USE_STRUCTUREDBUFFER(MaterialParams,bMaterialParams);
+
+vec2 getSrcUV0(uint id)
+{
+	const uint UNPACKED_BUFFER_STRIDE = 2;
+	const uint UNPACKED_BUFFER_U_OFFSET = 0;
+	const uint UNPACKED_BUFFER_V_OFFSET = 1;
+
+	const uint PACKED_BUFFER_STRIDE = 1;
+
+	vec2 uv;
+
+	if( areUVsPacked( uInputMeshTexCoords0Offsets ) )
+	{
+		uv.xy = decodeUVsRaw(asuint(bufferTexCoords0IN[id * PACKED_BUFFER_STRIDE]), uInputMeshTexCoords0Offsets );
+	}
+	else
+	{
+		uv.x = bufferTexCoords0IN[(id * UNPACKED_BUFFER_STRIDE) + UNPACKED_BUFFER_U_OFFSET];
+		uv.y = bufferTexCoords0IN[(id * UNPACKED_BUFFER_STRIDE) + UNPACKED_BUFFER_V_OFFSET];
+	}
+
+	return uv;
+}
+
+vec2 getSrcUV1(uint id)
+{
+	const uint UNPACKED_BUFFER_STRIDE = 2;
+	const uint UNPACKED_BUFFER_U_OFFSET = 0;
+	const uint UNPACKED_BUFFER_V_OFFSET = 1;
+
+	const uint PACKED_BUFFER_STRIDE = 1;
+
+	vec2 uv;
+
+	if( areUVsPacked( uInputMeshTexCoords1Offsets ) )
+	{
+		uv.xy = decodeUVsRaw(asuint(bufferTexCoords1IN[id * PACKED_BUFFER_STRIDE]), uInputMeshTexCoords1Offsets );
+	}
+	else
+	{
+		uv.x = bufferTexCoords1IN[(id * UNPACKED_BUFFER_STRIDE) + UNPACKED_BUFFER_U_OFFSET];
+		uv.y = bufferTexCoords1IN[(id * UNPACKED_BUFFER_STRIDE) + UNPACKED_BUFFER_V_OFFSET];
+	}
+
+	return uv;
+}
+
+vec3 getSrcVertex(uint id)
+{
+	const uint BUFFER_STRIDE = 3;
+	const uint BUFFER_X_OFFSET = 0;
+	const uint BUFFER_Y_OFFSET = 1;
+	const uint BUFFER_Z_OFFSET = 2;
+
+	vec3 v;
+	v.x = bufferPositionsIN[(id * BUFFER_STRIDE) + BUFFER_X_OFFSET];
+	v.y = bufferPositionsIN[(id * BUFFER_STRIDE) + BUFFER_Y_OFFSET];
+	v.z = bufferPositionsIN[(id * BUFFER_STRIDE) + BUFFER_Z_OFFSET];
+	return v;
+}
+
+void getSrcTangentBitangentNormal( uint vertexIndex, out vec3 tangent, out vec3 bitangent, out vec3 normal )
+{
+		const uint BUFFER_STRIDE = 2;
+		const uint BUFFER_TANGENT_OFFSET = 0;
+		const uint BUFFER_NORMAL_OFFSET = 1;
+
+		tangent = decodeUint101010NormalizedRaw(bufferTangentsNormalsIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_TANGENT_OFFSET]);
+		normal = decodeUint101010NormalizedRaw(bufferTangentsNormalsIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_NORMAL_OFFSET]);
+		float handedness = unpackHandednessRaw(bufferTangentsNormalsIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_TANGENT_OFFSET]);
+		bitangent = reconstructBitangent( tangent, normal, handedness );
+}
+
+vec4 getSrcColor(uint vertexIndex)
+{
+    const uint BUFFER_STRIDE = 4;
+    const uint BUFFER_R_OFFSET = 0;
+    const uint BUFFER_G_OFFSET = 1;
+    const uint BUFFER_B_OFFSET = 2;
+    const uint BUFFER_A_OFFSET = 3;
+
+    vec4 c;
+    c.r = bufferColorIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_R_OFFSET];
+    c.g = bufferColorIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_G_OFFSET];
+    c.b = bufferColorIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_B_OFFSET];
+    c.a = bufferColorIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_A_OFFSET];
+    return c;
+
+}
+
+void writePosition(uint vertexIndex, vec3 pos)
+{
+	uint meshBufferOffset = vertexIndexToMeshBufferOffset( vertexIndex, uOutputMeshTexCoords0Offsets );
+	interlockedStore3( rawMeshBuffer, meshBufferOffset, asuint(pos) );
+}
+
+MaterialState EvaluateLayer( in MaterialParams params, inout FragmentState state )
+{
+	//compute transformed layer UVs from base UVs
+    const uint TEX_CHANNEL_FLAG = 0x80000000;
+	
+    bool useSecondaryUVs	= bool( ( params.texCoordTransform.x & TEX_CHANNEL_FLAG ) >> 31 );
+    vec4 uvScaleBias		= unpackVec4f( uint2( params.texCoordTransform.x & (~TEX_CHANNEL_FLAG), params.texCoordTransform.y ) );
+	vec2 uvRotation			= unpackVec2f( params.texCoordTransform.z );
+    vec2 layerTexCoord		= transformUV( useSecondaryUVs ? state.vertexTexCoordSecondary.xy : state.vertexTexCoordBase.xy, uvScaleBias, uvRotation );
+	
+	//initialize layer material state
+    MaterialState material = newMaterialState();
+    material.vertexTexCoord.uvCoord = vec4( layerTexCoord, 0, 0 );
+    InitializeMaterialStateSampleCoords( params, state, material, makeDifferential( vec3( 0.0, 0.0, 0.0 ), vec3( 0.0, 0.0, 0.0 ) ), uvScaleBias, uvRotation );
+
+	
+	#ifdef Displacement
+		Displacement( params, material, state );
+	#endif
+	#ifdef Albedo
+		Albedo(params, material, state);
+	#endif
+	#ifdef Transparency
+		Transparency(params, material, state);
+	#endif
+	
+    return material;
+}
+
+void EvaluateLayerMerge( in MaterialState material, inout FragmentState state )
+{
+	#ifdef DisplacementMerge
+		DisplacementMerge( material, state );
+	#endif
+	#ifdef AlbedoMerge
+		AlbedoMerge(material, state);
+	#endif
+	#ifdef TransparencyMerge
+		TransparencyMerge(material, state);
+	#endif
+}
+
+COMPUTE(256,1,1)
+{
+	MATERIAL_DEBUG_CHECK_PARAMS();
+	
+	uint id = DISPATCH_THREAD_ID.x + (DISPATCH_THREAD_ID.y * 65535);
+	if( id < uNumPositions )
+	{
+		uint vertexIndex = id;
+		if( uUseVertexIndices == 1 )
+		{ vertexIndex = vertexIndicesIN[id]; }
+
+		MaterialParams params = bMaterialParams[0];
+
+		FragmentState state = newFragmentState();
+		state.primitiveID = 0;
+		state.triangleBarycentrics = vec3( 1, 0, 0 );
+		state.transform = submatrix3x4( uModelTransform );
+		state.transformInverse = submatrix3x4( uModelTransformInverse );
+		state.transformInverseTranspose = transpose3x3( state.transformInverse );
+		state.vertexPosition = getSrcVertex(vertexIndex);
+		getSrcTangentBitangentNormal(vertexIndex, state.vertexTangent, state.vertexBitangent, state.vertexNormal);
+		state.vertexTexCoordBase.xy = getSrcUV0( vertexIndex );
+		state.vertexTexCoordSecondary.xy = getSrcUV1( vertexIndex );
+		state.vertexColor = getSrcColor( vertexIndex );
+
+		#ifdef TextureInitialize
+			TextureInitialize( state );
+		#endif
+
+		MaterialState material = EvaluateLayer( params, state );
+		state.vertexTexCoord = material.vertexTexCoord;  // Propagate base layer tex coords, so we don't have to recompute them again
+
+		#if MATERIAL_LAYER_COUNT > 1
+			for( int layerIndex = 1; layerIndex < MATERIAL_LAYER_COUNT; ++layerIndex )
+			{
+				MaterialParams layerParams = bMaterialParams[layerIndex];
+				MaterialState layerMaterial = EvaluateLayer( layerParams, state );
+				MaterialComposite( layerParams, state, material, layerMaterial, layerIndex );
+			}
+		#endif
+
+		EvaluateLayerMerge( material, state );
+
+		#ifdef DisplacementApply
+			DisplacementApply( state );
+		#endif
+
+		writePosition( vertexIndex, state.vertexPosition );
+	}
+}
+

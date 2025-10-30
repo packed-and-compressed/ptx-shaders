@@ -1,0 +1,1075 @@
+#include "../mat/hybrid.comp"
+
+USE_BUFFER( uint4, bInPathStates0 );
+USE_BUFFER( uint4, bInPathStates1 );
+USE_BUFFER( uint4, bIntersections );
+USE_OBJECTINDEXBUFFER( bObjectIndices );
+USE_BUFFER( uint, bHitIndices );
+USE_BUFFER( uint, bSpatialHashRadianceCache );
+
+uniform uint3 uBounceCount;//{diffuse, specular, transmission}}
+uniform float uSceneRadius;
+uniform int	  uFrameNumber;
+uniform float uRadianceCacheRate;
+
+uniform uint2 uDiffuseScreenSize;
+uniform vec4  uDiffuseScreenTexCoordScaleBias;
+#define SCREEN_SIZE uDiffuseScreenSize
+#define SCREEN_TEXCOORD_SCALE uDiffuseScreenTexCoordScaleBias
+
+// shared outputs
+USE_INTERLOCKED_BUFFER( bCounters, 0 );
+USE_LOADSTORE_BUFFER( uint4, bShadowRaysIdx, 1 );
+USE_LOADSTORE_BUFFER( uint, bIndirectRaysIdx, 2 );
+USE_LOADSTORE_BUFFER( uint4, bSSSProbeRay, 3 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates0, 4 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates1, 5 );
+USE_LOADSTORE_BUFFER( uint4, bShadowRay, 6 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRIndirect, 7 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tReSTIRIndirectSample, 8 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRSpecularIndirect, 9 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tReSTIRSpecularIndirectSample, 10 );
+USE_LOADSTORE_TEXTURE2D( uint, tSpecularHitNormalAndObjID, 11 );
+USE_LOADSTORE_TEXTURE2D( uint, tRefractionFeatures, 12 );
+USE_LOADSTORE_TEXTURE2D( float, tRefractionRadiance, 13 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tAlbedo, 14 );
+USE_LOADSTORE_BUFFER( uint4, bSpatialHashIndirectBuffer0, 15 );
+USE_INTERLOCKED_BUFFER( bSpatialHashCheckSum, 16 );
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 17 );
+#endif
+
+// radiance cache
+#if defined(HybridRadianceCache)
+	#define INTERLOCKED_SPATIAL_HASH_CHECKSUM bSpatialHashCheckSum
+	#define SPATIAL_HASH_RADIANCE_CACHE bSpatialHashRadianceCache
+	#include "data/shader/scene/raytracing/spatialhash/spatialhash.comp"
+	#undef SPATIAL_HASH_RADIACNCE_CACHE
+	#undef INTERLOCKED_SPATIAL_HASH_CHECKSUM 
+#endif
+
+uint makeOutputDesc( ushort2 coord, uint channel )
+{
+    uint desc = uint(coord.x) | ( uint(coord.y)<<16 );
+    desc |= (channel << 13) & RT_RAYFLAG_CHANNEL;
+    return desc;
+}
+
+uint makeOutputDesc( uint desc, uint channel )
+{
+    desc &= RT_OUTPUTCOORD_MASK; //mask-out flag bits
+    desc |= (channel << 13) & RT_RAYFLAG_CHANNEL;
+    return desc;
+}
+
+ushort2 makeOutputCoord( uint desc )
+{
+    desc &= RT_OUTPUTCOORD_MASK; //mask-out flag bits
+    return ushort2( desc, desc>>16 );
+}
+
+bool getMaterialBindingHybrid( const uint objectIndex, inout uint materialIndex )
+{
+	// if we are using uniform binding then we just use the old way of fetching material index
+	// otherwise we use wave intrinsic with first lane fetching + broadcasting
+#ifndef MATERIAL_BINDING_UNIFORM
+	if( waveAllEqual( objectIndex ) )
+	{
+		// only first lane fetch from shader buffer for material index
+		uint firstLaneMaterialIndex;
+		if( waveIsFirstLane() )
+		{ 
+			if( !getMaterialBinding( objectIndex, firstLaneMaterialIndex ) )
+			{
+				firstLaneMaterialIndex = ~0u;
+			}
+		}
+		// broadcast material index to other threads in the wave if using wave intrinsic for fetching material index
+		materialIndex = waveBroadcastFirst( firstLaneMaterialIndex );
+	}
+	else
+	{
+		// only first lane fetch from shader buffer for material index
+		if( !getMaterialBinding( objectIndex, materialIndex ) )
+		{ 
+			materialIndex = ~0u;
+		}
+	}
+#else
+	// only first lane fetch from shader buffer for material index
+	if( !getMaterialBinding( objectIndex, materialIndex ) )
+	{ 
+		materialIndex = ~0u;
+	}
+#endif
+	// check for validity of material index
+	if( materialIndex == ~0u )
+	{
+		return false;
+	}
+	return true;
+
+}
+
+void getPathStates(
+	const uint		pixelIdx,
+	inout uint4		pathState0, 
+	inout uint4		pathState1 )
+{
+	pathState0 = HYBRID_PATHSTATE_BUFFER( bInPathStates0, pixelIdx );
+	pathState1 = HYBRID_PATHSTATE_BUFFER( bInPathStates1, pixelIdx );
+}
+
+void writePathStates(
+	const uint		index,
+	inout uint4		pathState0, 
+	inout uint4		pathState1 )
+{
+	HYBRID_PATHSTATE_BUFFER( bPathStates0, index ) = pathState0;
+	HYBRID_PATHSTATE_BUFFER( bPathStates1, index ) = pathState1;
+}
+
+void getRayDirRadiance(
+	const ushort	hybridPass,
+	const uint2		outputCoord,
+	inout vec3		rayDir, 
+	inout vec3		radiance )
+{
+	if( hybridPass == HYBRID_SPECULAR )
+	{
+		unpackVec2x3f( imageLoadRWArray( tReSTIRSpecularIndirect, outputCoord, 0 ).xyz, rayDir, radiance );
+	}
+	else
+	{
+		unpackVec2x3f( imageLoadRWArray( tReSTIRIndirect, outputCoord, 0 ).xyz, rayDir, radiance );
+	}
+}
+
+RayDifferential computeRayDifferential(
+	inout FragmentState fragmentState,
+	inout vec4			textureGrads,
+	const in vec3		triangleEdge01, 
+	const in vec3		triangleEdge02, 
+	const in vec3		triangleNormal, 
+	const in Vertex		v0,
+	const in Vertex		v1,
+	const in Vertex		v2 )
+{
+	RayDifferential rd = newRayDifferential();
+#ifdef Differentials
+	{
+		rd = getRayDifferentialPrecise( fragmentState );
+		//propagate ray differential at this bounce
+		propagateRayDifferential( fragmentState, rd );
+
+		//calculate barycentric coordinate derivatives
+		diff3 dPobj = mulDifferential( fragmentState.transformInverse, rd.dP );
+		diff2 dBarycentric = makeBarycentricDifferential( dPobj, triangleEdge01, triangleEdge02, triangleNormal );
+
+		//store compact differentials
+		fragmentState.dP = compactDifferential( rd.dP );
+		fragmentState.dD = compactDifferential( rd.dD );
+	
+		#ifdef DifferentialTexture
+		{
+			//now we use the barycentric coordinate derivatives to interpolate the vertex texture coordinates and find its derivatives
+			const diff2 dUV  = interpolateDifferential( dBarycentric, v0.texcoord, v1.texcoord, v2.texcoord );
+			textureGrads.xy  = packTextureGrads( dUV );
+			const diff2 dUV2 = interpolateDifferential( dBarycentric, v0.texcoord2, v1.texcoord2, v2.texcoord2 );
+			textureGrads.zw  = packTextureGrads( dUV2 );
+		}
+		#endif
+		#ifdef DifferentialNormal
+		{
+			//calculate normal derivatives
+			const vec3 nScale = vec3( fragmentState.transform[0][0], fragmentState.transform[1][1], fragmentState.transform[2][2] );
+			diff3 dN = interpolateDifferential( dBarycentric, v0.normal, v1.normal, v2.normal );
+			fragmentState.dN = compactDifferential( mulDifferential( nScale, dN ) );
+		}
+		#endif
+	}
+#endif
+	return rd;
+}
+
+void dispatchShadowRay(
+	const ushort		hybridPass,
+	const bool			requireDemodulation,
+	const PathState		path, 
+	const uint			pathBits,
+	const FragmentState fragmentState, 
+	const SampleState	sampleState,
+	const vec3			transmissionPathAlbedo,
+	const float		    rayDistance,
+	inout vec3			radianceLight )
+{
+	// increment counter and push to shadow ray queue
+	uint shadowRayIdx;
+	interlockedAdd( bCounters, HYBRID_COUNTER_LIGHT_RAYS, 1, shadowRayIdx );
+	HYBRID_RAY_BUFFER0( bShadowRaysIdx, shadowRayIdx ) = uint4( path.outputDesc, 0, 0, pathBits );
+	if( hybridPass == HYBRID_REFRACTION )
+	{
+		// apply demodulatioon for direct light contribution (previously we have only applied it to cached radiance)
+		if( requireDemodulation )
+		{
+			radianceLight *= rcpSafe( transmissionPathAlbedo );
+		}
+	}
+	// apply throughput of current bounce for this radiance contribution
+	radianceLight *= path.throughput;
+
+#if defined( TransmissionSubsurfaceDiffusion ) || defined( TransmissionPassthrough )
+	// skip direct light shadow ray if transmitting via diffusion BSSRDF or via passthrough
+	HINT_FLATTEN
+	if( isTransmission( sampleState ) )
+	{
+		// invalidate sample
+		radianceLight = vec3( 0.0, 0.0, 0.0 );
+	}
+#endif
+	// apply radiance clamp
+	radianceLight = clamp( radianceLight, vec3( 0, 0, 0 ), vec3( uIndirectClamp, uIndirectClamp, uIndirectClamp ) );
+		
+	// store secondary hit object ID and g-buffer
+	const vec3 origin = rayOriginAdjust( sampleState, fragmentState.rayOffset );
+		
+	// direct light ray direction and distance for shadow tracing, we pack the radiance contribution of this bounce to shadow ray
+	// and only add it to path radiance when this shadow ray is unoccluded
+	HYBRID_RAY_BUFFER0( bShadowRay, shadowRayIdx ) = uint4( asuint( packVec2x3f( sampleState.L, radianceLight ) ), asuint( rayDistance ) );
+	HYBRID_RAY_BUFFER1( bShadowRay, shadowRayIdx ) = uint4( asuint( origin ), 0 );
+}
+
+void writeSecondaryGBuffer(
+	const ushort		hybridPass,
+	const PathState		path, 
+	const FragmentState fragmentState, 
+	const SampleState	sampleState,
+	const uint2			outputCoord )
+{
+#if defined( HybridSecondaryHitGBuffer )
+	if( hybridPass == HYBRID_SPECULAR )
+	{
+	#ifdef TransmissionSubsurfaceDiffusion
+		if( !path.isDiffuse )
+	#else
+		if( sampleState.transmissionWeight < 1e-2f && !path.isDiffuse )
+	#endif
+		{
+			const uint packedNormal = packUnitVectorOct( normalize( fragmentState.normal ) );
+			// to match primary pass object id, the first entry is environment/sky,
+			const uint objectId = fragmentState.objectID + 1;
+			imageStore( tSpecularHitNormalAndObjID, outputCoord, uint4( packedNormal, objectId, 0, 0 ) );
+		}
+	}
+#endif
+}
+
+void writeReservoirsSample(
+	const ushort		hybridPass,
+	const FragmentState fragmentState, 
+	const uint2			outputCoord,
+	const vec3			origin,  
+	inout bool			recordReSTIRIndirectSample, 
+	inout int			restirIndirectIdx )
+{
+	if( ( uBounce == 1 ) && ( hybridPass == HYBRID_DIFFUSE_GI || hybridPass == HYBRID_SPECULAR ) )
+	{
+		// ReSTIR indirect sample (sample point)
+		recordReSTIRIndirectSample = true;
+		restirIndirectIdx = 1;
+	}
+
+	if( recordReSTIRIndirectSample )
+	{
+		const vec4 samplePtData = vec4( origin, asfloat( packUnitVectorOct( fragmentState.normal ) ) );
+		if(hybridPass == HYBRID_SPECULAR )
+		{
+			imageStoreArray( tReSTIRSpecularIndirectSample, outputCoord, restirIndirectIdx, samplePtData );
+		}
+		else
+		{
+			imageStoreArray( tReSTIRIndirectSample, outputCoord, restirIndirectIdx, samplePtData );
+		}
+	}
+}
+
+void writeReservoirs(
+	const bool	 writeReSTIRIndirect0, 
+	const bool	 writeReSTIRIndirect1,
+	const ushort hybridPass,
+	const uint2  outputCoord,
+	const uint4  restirData0,
+	const uint4  restirData1 )
+{
+	if( writeReSTIRIndirect0 )
+	{
+		if( hybridPass == HYBRID_SPECULAR )
+		{
+			imageStoreArray( tReSTIRSpecularIndirect, outputCoord, 0, restirData0 );
+		}
+		else
+		{
+			imageStoreArray( tReSTIRIndirect, outputCoord, 0, restirData0 );
+		}
+	}
+
+	// update ReSTIR indirect reservoirs
+	if( writeReSTIRIndirect1 )
+	{
+		if( hybridPass == HYBRID_SPECULAR )
+		{
+			imageStoreArray( tReSTIRSpecularIndirect, outputCoord, 1, restirData1 );
+		}
+		else
+		{
+			imageStoreArray( tReSTIRIndirect, outputCoord, 1, restirData1 );
+		}
+	}
+}
+
+bool updateRefractionFeatures(
+	const ushort		hybridPass,
+	const uint2			outputCoord,
+	inout PathState		path,
+	inout FragmentState fragmentState, 
+	inout SampleState	sampleState,
+	const vec3			origin,
+	inout uint			pathBits,
+	const bool			requireDemodulation,
+	inout vec3			brdf,
+	const vec3			transmissionPathAlbedo )
+{
+	// get pixel index
+	const uint	pixelIdx = outputCoord.y * SCREEN_SIZE.x + outputCoord.x;
+
+	int restirIndirectIdx = -1;
+	bool isSSSReservoir = false;
+	bool recordReSTIRIndirectSample = false;
+#ifdef TransmissionSubsurfaceDiffusion
+	if( hybridPass == HYBRID_REFRACTION )
+#else
+	if( ( sampleState.transmissionWeight < 1e-2f ) && ( hybridPass == HYBRID_REFRACTION ) )
+#endif
+	{
+		// if we have yet to record visible point,
+		const bool hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+		const bool hasRecordedSecondaryGBuffer = ( ( pathBits & HYBRID_PATH_REFRACTION_SECONDARY_GBUFFER ) > 0 );
+		
+		bool writeRefractionFeatures = false;
+		uint3 refractionFeature = imageLoadRW( tRefractionFeatures, outputCoord ).xyz;
+		// record secondary hit normal and object id for refraction if we are specular path, this is because we want to filter
+		// with the obj id and normal behind the refraction
+		if( !path.isNonSpecular && !hasRecordedSecondaryGBuffer )
+		{
+			// we want to record non-specular/diffuse surfaces visible through the refraction surface, so if there is a specular surface
+			// sitting inside a refraction object, then we want to see the normals inside the reflector through the refractor (i.e. 3rd bounce)
+		#ifndef TransmissionSubsurfaceDiffusion
+			if( sampleState.diffusionWeight > 0.0f || !sampleState.flagSpecular || sampleState.flagDiffuse )
+		#endif
+			{
+				writeRefractionFeatures = true;
+				const vec3	viewNormal = mulVec( uViewMatrix, fragmentState.normal );
+				refractionFeature.y = packUnitVectorOct( normalize( viewNormal ) );
+				// to match primary pass object id, the first entry is environment/sky,
+				refractionFeature.z = ( fragmentState.objectID + 1 );
+				pathBits |= HYBRID_PATH_REFRACTION_SECONDARY_GBUFFER;
+			}
+		}
+
+		if( !hasRecordedVisiblePt )
+		{
+			imageStoreArray( tAlbedo, outputCoord, HybridAlbedoChannel::HYBRID_ALBEDO_REFRACTION, vec4( transmissionPathAlbedo, 1.0f ) );
+			if( requireDemodulation )
+			{
+				brdf *= rcpSafe( transmissionPathAlbedo );
+			}
+			
+			writeRefractionFeatures = true;
+			// visible point, we want the ray distance to the visible point and ray direction
+			refractionFeature.x = asuint( fragmentState.vertexEyeDistance );
+			// update reservoir to say suggest this is a SSS reservoir, this is important for resampling GI contribution from SSS
+		#ifdef TransmissionSubsurfaceDiffusion
+			isSSSReservoir = true;
+		#endif
+			// record visible sample for refraction (original full resolution)
+			recordReSTIRIndirectSample = true;
+			restirIndirectIdx = 0;
+			// mark as visible point recorded
+			pathBits |= HYBRID_PATH_REFRACTION_VISIBLE_POINT;
+		}
+		else
+		{
+			// if we have yet to record sample point after recording visible point, then for sure we want to record it
+			// moreover, if this is not a shadow caster (i.e. window), then we know that 0th bounce intersects the surface of the refraction material
+			// 1st bounce intersects the visible point, and 2nd bounce intersects the sample point
+			const bool nonShadowCaster = ( ( pathBits & HYBRID_PATH_REFRACTION_NON_SHADOW_CAST ) > 0 );
+			const bool hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+			const bool hasRecordedSamplePt = ( ( pathBits & HYBRID_PATH_REFRACTION_SAMPLE_POINT ) > 0 );
+			if( ( nonShadowCaster && ( uBounce == 2 ) )  || ( hasRecordedVisiblePt && !hasRecordedSamplePt ) )
+			{
+				recordReSTIRIndirectSample = true;
+				restirIndirectIdx = 1;
+				pathBits |= HYBRID_PATH_REFRACTION_SAMPLE_POINT;
+			}
+		}
+
+		if( writeRefractionFeatures )
+		{
+			imageStore( tRefractionFeatures, outputCoord, uint4( refractionFeature, asuint( luminance( fragmentState.scatterDepth ) ) ) );
+		}
+	}
+	
+	writeReservoirsSample( hybridPass, fragmentState, outputCoord, origin, recordReSTIRIndirectSample, restirIndirectIdx );
+
+	return isSSSReservoir;
+}
+
+void updateReservoirs(
+	const ushort		hybridPass,
+	const uint2			outputCoord,
+	const PathState		path,
+	const FragmentState fragmentState, 
+	const SampleState	sampleState,
+	const vec3			brdf,
+	const vec3			diffuseLight,
+	const bool			isSSSReservoir,
+	const bool			foundCacheEntry,
+	const bool			fromCurve,
+	const uint			pathBits,
+	const uint			cellIdx )
+{
+	// get pixel index
+	const uint	pixelIdx = outputCoord.y * SCREEN_SIZE.x + outputCoord.x;
+
+	// fetch restir data
+	uint4 restirData0 = uint4( 0, 0, 0, 0 ); 
+	uint4 restirData1 = uint4( 0, 0, 0, 0 );
+	bool writeReSTIRIndirect0 = false;
+	bool writeReSTIRIndirect1 = false;
+	
+	if(isSSSReservoir)
+	{
+		// only read when we have to write restir data
+		if( hybridPass == HYBRID_SPECULAR )
+		{
+			restirData1 = imageLoadRWArray( tReSTIRSpecularIndirect, outputCoord, 1 );
+		}
+		else
+		{
+			restirData1 = imageLoadRWArray( tReSTIRIndirect, outputCoord, 1 );
+		}
+		// update flag to set this as a SSS reservoir for diffuse GI
+		restirData1.w |= ( RT_PATHFLAG_DIFFUSE | RT_PATHFLAG_TRANSMISSION | RT_PATHFLAG_SUBSURFACE_AXIS );
+		writeReSTIRIndirect1 |= true;
+	}
+	
+#if defined(HybridRadianceCache)
+	if( foundCacheEntry )
+	{
+		bool updateReSTIRIndirect = true;
+		if( hybridPass == HYBRID_REFRACTION )
+		{
+			const bool nonShadowCaster = ( ( pathBits & HYBRID_PATH_REFRACTION_NON_SHADOW_CAST ) > 0 );
+			const bool hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+			const bool hasRecordedSamplePt = ( ( pathBits & HYBRID_PATH_REFRACTION_SAMPLE_POINT ) > 0 );
+			// we are splitting direct light inside the refraction from the indirect, we write the direct light 
+			// directly to the radiance buffer and record the indirect contribution into restir gi reservoir and then
+			// apply resampling for GI. Theoretically we can do the same for direct light but that means we gotta keep
+			// another reservoir for this refraction image's direct light and we cannot have it overwrite the record
+			// inside the direct light reservoir as that could be used for specular reflection of the refractive material
+			// so we need to have another copy of reservoir just for this refraction direct light if we want to achieve
+			// direct light resampling at this stage, because of this complexity we are not currently doing it
+			updateReSTIRIndirect = updateReSTIRIndirect && 
+				( ( nonShadowCaster && uBounce > 1 ) || 
+					( hasRecordedVisiblePt && hasRecordedSamplePt ) );
+		}
+
+		if( updateReSTIRIndirect )
+		{
+			writeReSTIRIndirect0 |= true;
+			restirData0 = uint4( asuint( packVec2x3f( vec3( sampleState.L ), vec3( path.radiance ) ) ), asuint( sampleState.pdf ) );
+		}
+		else
+		{
+			if( hybridPass == HYBRID_REFRACTION )
+			{
+				vec4 currentRadiance = vec4( imageLoadRW( tRefractionRadiance, outputCoord ) );
+				currentRadiance += vec4( vec3( path.radiance ), 0.0f );
+				currentRadiance = clamp( currentRadiance, 0.0f, 65535.0f );
+				imageStore( tRefractionRadiance, outputCoord, currentRadiance );
+			}
+		}
+	}
+#endif
+
+	if( !foundCacheEntry )
+	{
+		writeReSTIRIndirect0 |= true;
+		restirData0 = uint4( asuint( packVec2x3f( sampleState.L, vec3( path.radiance ) ) ), asuint( sampleState.pdf ) );
+
+	#if defined(HybridRadianceCache)
+		// store in irradiance cache
+		if( uBounce == 1 && !fromCurve && sampleState.diffusionWeight > 0.0f && bSpatialHashIndirectBuffer0[pixelIdx].w == ~uint( 0 ) )
+		{
+			uint	   checkSum;
+			const vec3 rayEye = uLightSpaceCameraPosition.xyz - uLightSpaceCameraPosition.w * fragmentState.vertexPosition.xyz;
+			if( cellIdx != ~uint( 0 ) )
+			{
+				uint4 cacheData = uint4( packVec2x3f( diffuseLight, sampleState.flagDiffuse ? brdf * rcpSafe( sampleState.pdf ) : vec3( 0, 0, 0 ) ), cellIdx );
+				bSpatialHashIndirectBuffer0[pixelIdx] = cacheData;
+			}
+		}
+	#endif
+	}
+	
+	writeReservoirs( writeReSTIRIndirect0, writeReSTIRIndirect1, hybridPass, outputCoord, restirData0, restirData1 );
+}
+
+void continueNextPath(
+	const ushort		hybridPass,
+	const uint			pathBits,
+	inout PathState		path,
+	inout FragmentState fragmentState, 
+	inout SampleState	sampleState,
+	const vec3			origin )
+{
+	float pContinue = 1.0f;
+	bool  doRussianRoulette = true, continuePath = true;
+
+	if( hybridPass == HYBRID_REFRACTION )
+	{	
+		doRussianRoulette = false;
+		const bool	hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+		const bool	hasRecordedSamplePt = ( ( pathBits & HYBRID_PATH_REFRACTION_SAMPLE_POINT ) > 0 );
+		// only perform russian roulette after we have all the recorded points we needed
+		if( hasRecordedVisiblePt && hasRecordedSamplePt )
+		{
+			doRussianRoulette = true;
+		}
+	}
+
+	// compute termination probability
+	if (doRussianRoulette)
+	{
+		pContinue = saturate( maxcomp( path.throughput ) );
+		continuePath = continuePath && ( luminance( path.throughput ) > 0.0f );
+	}
+	
+	// check for reflection, if BCSDF samples a lobe, it marks flagReflection to true in all cases
+	const bool isReflectionRay = isReflection( sampleState ) || sampleState.flagHairBCSDF;
+
+	// setup ray type for setting up the next ray
+	bool sampleBSDF = false;
+	bool sampleBSSRDF = false;
+	if(isReflectionRay)
+	{
+		sampleBSDF = true;
+	}
+	else
+	{
+	#if defined( TransmissionSubsurfaceDiffusion )
+		sampleBSSRDF = true;
+	#elif ( defined( TransmissionSample ) && defined( TransmissionEvaluate ) )
+		sampleBSDF = hybridPass == HYBRID_REFRACTION || hybridPass == HYBRID_SPECULAR;
+	#endif
+	}
+
+	// perform russian roulette
+	if( continuePath &&	
+	    ( rngNextFloat( fragmentState.rng ) < pContinue ) && 
+	    ( sampleBSDF || sampleBSSRDF ) )
+	{
+		// assemble new path state
+		uint4 pathState0 = uint4( 0, 0, 0, 0 );
+		uint4 pathState1 = uint4( asuint( origin ), 0 );
+		// update path
+		path.isDiffuse = path.isDiffuse || sampleState.flagDiffuse;
+		path.isNonSpecular = path.isNonSpecular || !sampleState.flagSpecular;
+		path.isTransmission = path.isTransmission || isTransmission( sampleState );
+		pathState0.w = pathBits;
+		pathState0.w |= fragmentState.allowSkySampling ? HYBRID_PATH_ALLOW_SKY_SAMPLE : 0;
+		pathState0.w |= path.isNonSpecular ? RT_PATHFLAG_NONSPECULAR : 0;
+		pathState0.w |= path.isDiffuse ? RT_PATHFLAG_DIFFUSE : 0;
+		pathState0.w |= path.isTransmission ? RT_PATHFLAG_TRANSMISSION : 0;
+		// scale throughput if continue
+		path.throughput *= rcp( pContinue );
+		// update path state with new throughput and updated ray differentials
+		pathState0.xyz = uint3( packVec4f( vec4( path.throughput, fragmentState.skyOcclusion ) ), packVec2f( vec2( fragmentState.dP, fragmentState.dD ) ) );
+
+		bool writeState = false;
+		uint index = ~uint(0);
+		if( sampleBSDF )
+		{
+			// indirect dispatch index for indirect ray
+			interlockedAdd( bCounters, HYBRID_COUNTER_GI_RAYS, 1, index );
+			HYBRID_RAY_BUFFER0( bIndirectRaysIdx, index ) = path.outputDesc & ~uint(RT_RAYFLAG_SUBSURFACE);
+			writeState = true;
+		}
+		else if( sampleBSSRDF )
+		{
+		#if defined( TransmissionSubsurfaceDiffusion )
+			sampleState.r = ldsRandHybridVec4( fragmentState.rng, fragmentState.screenCoord, HYBRID_SECONDARY_SAMPLE_DIM_SSS, uBounce, hybridPass, fragmentState.ldsParams );
+			// sample SSS position
+			uint		rayAxis;
+			float		rayMaxT;
+			const vec3	subsurfaceOrigin = sampleState.origin;
+			const uint	subsurfaceNormal = packUnitVectorOct( sampleState.Ng );
+			const float subsurfaceRadius = sampleBSSRDF_BurleyDiffusionPosition( sampleState, fragmentState.scatterDepth, rayAxis, rayMaxT );
+
+			if( any( path.throughput ) && subsurfaceRadius > 0.0 )
+			{
+				// SSS rays
+				interlockedAdd( bCounters, HYBRID_COUNTER_GI_RAYS, 1, index );
+				// half res, make new output desc
+				HYBRID_RAY_BUFFER0( bIndirectRaysIdx, index ) = path.outputDesc | RT_RAYFLAG_SUBSURFACE;
+				HYBRID_RAY_BUFFER0( bSSSProbeRay, index ) = uint4( asuint( sampleState.origin ), 0 );
+				HYBRID_RAY_BUFFER1( bSSSProbeRay, index ) = uint4( packVec3f( sampleState.L ), asuint( rayMaxT ), fragmentState.objectID );
+				// encode path state
+				pathState0.w = pathBits & ( HYBRID_PATH_REFRACTION_VISIBLE_POINT | HYBRID_PATH_REFRACTION_SAMPLE_POINT | HYBRID_PATH_REFRACTION_NON_SHADOW_CAST);
+				pathState0.w |= f32tof16( subsurfaceRadius ) | ( rayAxis << 16 );
+				pathState0.w |= RT_PATHFLAG_NONSPECULAR | RT_PATHFLAG_TRANSMISSION;
+				writeState = true;
+			}
+			pathState1 = uint4( asuint( subsurfaceOrigin ), subsurfaceNormal );
+		#endif
+		}
+
+		if( writeState )
+		{
+			writePathStates( index, pathState0, pathState1 );
+		}
+	}
+}
+
+
+void evaluateShading(
+	PathState			path, 
+	FragmentState		fragmentState, 
+	SampleState			sampleState,
+	const bool			fromCurve,
+	uint				pathBits )
+{
+	// check hybrid pass	
+	const ushort hybridPass = ushort( ( path.outputDesc & HYBRID_OUTPUT_TYPE ) >> 13 );
+	// get output coordinates
+	const uint2 outputCoord = uint2( makeOutputCoord( path.outputDesc ) );
+	const uint	pixelIdx = outputCoord.y * SCREEN_SIZE.x + outputCoord.x;
+	// compute BSDF weighting for sampling
+	vec3 fresnel = vec3( 0, 0, 0 ), fresnelCoat = vec3( 0, 0, 0 );
+	computeBSDFWeights<false>( hybridPass == HYBRID_DIFFUSE_GI, path, fragmentState, sampleState, fresnel, fresnelCoat );
+
+#ifdef TransmissionSubsurfaceDiffusion
+	if( path.isSubsurface )
+	{
+	#ifdef TransparencyIsStochastic
+		// sampling subsurface is less likely to succeed for fractional alpha since it needs two intersections (entry & exit)
+		// divide path throughput by alpha value to make sample proportionally more significant so that the estimator balances out
+		if( fragmentState.albedo.a < 1.0 )
+		{
+			float alphaWeight = min( rcpSafe( fragmentState.albedo.a ), uIndirectClamp );
+			path.throughput *= alphaWeight;
+		}
+	#endif
+		// finalize diffusion BSSRDF sampling
+		uint hitCount = path.subsurfaceHitCountAxis >> 16;
+		uint subsurfaceAxis = path.subsurfaceHitCountAxis & 3;
+		vec3 subsurfaceNormal = unpackUnitVectorOct( path.subsurfaceNormal );
+		vec3 subsurfaceWeight = evaluateBSSRDF_BurleyDiffusionPosition( sampleState, fragmentState.scatterColor, fragmentState.scatterDepth, path.subsurfaceOrigin, subsurfaceNormal, path.subsurfaceRadius, subsurfaceAxis, hitCount );
+		path.throughput *= subsurfaceWeight;
+	}
+#endif
+
+	// kill off path if this is diffuse GI pass and there is no diffuse contribution, we avoid caustics
+	// in hybrid to prevent extra noise/biased caustics resampling
+	if( !path.isSubsurface && hybridPass == HYBRID_DIFFUSE_GI && sampleState.diffusionWeight == 0.0f )
+	{
+		return;
+	}
+	
+	bool requireDemodulation = false;
+	vec3 transmissionPathAlbedo = vec3( 0, 0, 0 );
+	if( hybridPass == HYBRID_REFRACTION )
+	{
+		// if we have not yet recorded the visible point this means this is the first bounce for the image behind the refraction
+		// and so we treat it like as if this is primary hit and therefore we do demodulation and write out the albedo
+		// for the direct light radiance for current bounce. Basically we are treating this bounce as the primary hit
+		const bool hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+		if( path.isTransmission && !hasRecordedVisiblePt )
+		{
+			requireDemodulation = true;
+			transmissionPathAlbedo = fragmentState.emission;
+			transmissionPathAlbedo += getDiffuseAlbedo( fragmentState );
+			transmissionPathAlbedo += getSpecularAlbedo( fragmentState, sampleState, fresnel, fresnelCoat );
+			// Note: we need to demodulate emission as we are writing it to albedo in this case
+			// so later on otherwise if we add emission to radiance accumulated for current path
+			// we would be multiplying emission to itself, which could either amplify or reduce
+			// its luminance relative to the expected luminance
+			fragmentState.emission *= rcpSafe(transmissionPathAlbedo);
+		}
+	}
+
+	uint cellIdx = ~uint( 0 );
+	bool foundCacheEntry = false;
+#if defined(HybridRadianceCache)
+	bool sampleRadianceCache = false;
+	if(!fromCurve)
+	{
+		if( hybridPass == HYBRID_SPECULAR )
+		{
+			sampleRadianceCache = sampleState.diffusionWeight > 0;
+		}
+		else if( hybridPass == HYBRID_DIFFUSE_GI )
+		{
+			sampleRadianceCache = !path.isSubsurface && ( sampleState.diffusionWeight > 0 ) && ( rngNextFloat( fragmentState.rng ) < uRadianceCacheRate );
+		}
+		else if( hybridPass == HYBRID_REFRACTION )
+		{
+			const bool hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+			if(!hasRecordedVisiblePt)
+			{
+				sampleRadianceCache = false;
+			}
+			else
+			{
+				sampleRadianceCache = ( sampleState.diffusionWeight > 0 ) && ( rngNextFloat( fragmentState.rng ) < uRadianceCacheRate );
+			}
+		}
+	}
+	// stochastic sampling for GI to reduce GI estimation bias as the color differences can be quite glaring
+	if( sampleRadianceCache )
+	{
+		// have to make sure we lookup the cache using the exact same parameters as we have originally written to the cache
+		int cacheEntryCount = 0;
+		const vec3 rayEye = uLightSpaceCameraPosition.xyz - uLightSpaceCameraPosition.w * fragmentState.vertexPosition.xyz;
+		vec3 cachedRadiance;
+		cellIdx = findCellIdxAndRadiance( sampleState.origin, fragmentState.normal, rngNextVec3( fragmentState.rng ), rngNextVec3( fragmentState.rng ), vec2( uScreenSize ), length( rayEye ), foundCacheEntry,  cachedRadiance );
+		if( foundCacheEntry )
+		{
+			// update radiance using out found cached radiance
+			if( requireDemodulation )
+			{
+				cachedRadiance *= rcpSafe( transmissionPathAlbedo );
+			}
+			path.radiance += half3( cachedRadiance * path.throughput );
+		}
+	}
+#endif
+
+
+	// sample light source and evaluate incoming radiance
+	vec3	   diffuseLight;
+	Reservoir  reservoir = sampleLights( hybridPass, path, fragmentState, sampleState, diffuseLight );
+	// unpack sampled light radiance
+	vec3	   radianceLight;
+	unpackVec2x3f( reservoir.Lradiance, sampleState.L, radianceLight );
+	// apply weighting to radiance light as we do not do restir for direct light of indirect bounce
+	radianceLight *= reservoir.W;
+	// indirect dispatch index for shadow ray
+	if( !foundCacheEntry )
+	{
+		dispatchShadowRay( hybridPass, requireDemodulation, path, pathBits, fragmentState, sampleState, transmissionPathAlbedo, reservoir.distance, radianceLight );
+	}
+
+	// store emissive light for diffuse/specular indirect but not SSS (to avoid double counting)
+	if( !path.isSubsurface )
+	{
+		vec3 emission = min( fragmentState.emission * path.throughput, uIndirectClamp );
+		path.radiance += half3( emission );
+	}
+
+	// accumulate unlit albedo (for non-diffuse paths only in order to limit the appearance of emission)
+#ifdef DiffusionUnlit
+	if( !path.isDiffuse )
+	{
+		vec3 emission = min( fragmentState.albedo.rgb * path.throughput, uIndirectClamp );
+		path.radiance += half3( emission );
+	}
+#endif
+
+	// initialize sample state
+	sampleState.L = vec3( 0.0, 0.0, 0.0 );
+	sampleState.H = vec3( 0.0, 0.0, 0.0 );
+	sampleState.NdotL = 0.0;
+	sampleState.Tin = vec3( 1.0, 1.0, 1.0 );
+	sampleState.Tout = vec3( 1.0, 1.0, 1.0 );
+	sampleState.bsdf = vec3( 0.0, 0.0, 0.0 );
+	sampleState.pdf = 0.0;
+	sampleState.r = ldsRandHybridVec4( fragmentState.rng, fragmentState.screenCoord, HYBRID_SECONDARY_SAMPLE_DIM_BSDF, uBounce, hybridPass, fragmentState.ldsParams );
+	
+	// sample next indirect ray
+	vec3 brdf = sampleBSDF( path, fragmentState, sampleState );
+
+	// store secondary hit object ID and g-buffer
+	const vec3 origin = rayOriginAdjust( sampleState, fragmentState.rayOffset );
+	
+	// write secondary gbuffer for filtering
+	writeSecondaryGBuffer( hybridPass, path,  fragmentState, sampleState, outputCoord );
+
+	// update refraction features, refraction requires special treatment
+	const bool isSSSReservoir = updateRefractionFeatures( hybridPass, outputCoord, path, fragmentState, sampleState, origin, pathBits, requireDemodulation, brdf, transmissionPathAlbedo );
+
+	if( ( hybridPass != HYBRID_REFRACTION ) && luminance( path.throughput ) < 1e-5f )
+	{
+		return;
+	}
+	
+	// update reservoirs with latest radiance data
+	updateReservoirs( hybridPass, outputCoord, path, fragmentState, sampleState, brdf, diffuseLight, isSSSReservoir, foundCacheEntry, fromCurve, pathBits, cellIdx );
+
+	// calculate new throughput and calculate probability of continuing for russian roulette
+	path.throughput = path.throughput * brdf * rcpSafe( sampleState.pdf );
+
+	// perform russian roulette and queue next trace
+	continueNextPath( hybridPass, pathBits, path, fragmentState, sampleState, origin );
+}
+
+COMPUTE(64,1,1)
+{
+	MATERIAL_DEBUG_CHECK_PARAMS();
+	
+	const uint2 numRays = interlockedLoad2( bCounters, HYBRID_COUNTER_GI_HITS );
+	const uint  id = 64 * numRays.y * DISPATCH_THREAD_ID.y + DISPATCH_THREAD_ID.x;
+	if( id >= numRays.x )
+	{
+		return;
+	}
+	const uint hitIndex = bHitIndices[id];
+	const uint4 intersectionData = HYBRID_INTERSECTION_BUFFER0( bIntersections, hitIndex );
+
+	// get output description
+	PathState path;
+	path.outputDesc = intersectionData.y;
+
+	const ushort hybridPass = ushort( ( path.outputDesc & HYBRID_OUTPUT_TYPE ) >> 13 );
+
+	// get output coordinates
+	const uint2 outputCoord = uint2( makeOutputCoord( path.outputDesc ) );
+
+	if( outputCoord.x >= SCREEN_SIZE.x || outputCoord.y >= SCREEN_SIZE.y )
+	{
+		// we do have even pixels from primary hit, but because resolution can be even/odd
+		// number of pixels width and height, so there could be a chance that the coord here
+		// gets out of bounds
+		return;
+	}
+	// get pixel index
+	const uint	pixelIdx = outputCoord.y * SCREEN_SIZE.x + outputCoord.x;
+
+	// get object index
+	const uint	objectIndex = bObjectIndices[id];
+	
+	uint materialIndex;
+	if( !getMaterialBindingHybrid( objectIndex, materialIndex ) )
+	{ 
+		return; 
+	}
+
+	uint4 pathData0, pathData1;
+	getPathStates( hitIndex, pathData0, pathData1 );
+
+	vec2 rayDifferentials = vec2( 0.0, 0.0 );
+	uint pathBits = pathData0.w;
+	// initialize path fragmentState
+	path.radiance = half3( 0.0, 0.0, 0.0 );
+	path.throughput = vec3( 1.0, 1.0, 1.0 );
+	path.isDiffuse = ( pathBits & RT_PATHFLAG_DIFFUSE ) != 0;
+	path.isNonSpecular = ( pathBits & RT_PATHFLAG_NONSPECULAR ) != 0;
+	path.isTransmission = ( pathBits & RT_PATHFLAG_TRANSMISSION ) != 0;
+	path.isSubsurface = ( intersectionData.y & RT_RAYFLAG_SUBSURFACE ) != 0;
+#ifdef Differentials
+	rayDifferentials = unpackVec2f( pathData0.z );
+#endif
+
+	path.mediumExtinction = vec3( 0.0, 0.0, 0.0 );// uSceneMediumExtinction;
+	path.mediumScatter = vec3( 0.0, 0.0, 0.0 );	  // uSceneMediumScatter;
+	path.mediumAnisotropy = 0.0;				  // uSceneMediumAnisotropy;
+#ifdef TransmissionSubsurfaceDiffusion
+	path.subsurfaceOrigin = vec3( 0.0, 0.0, 0.0 );
+	path.subsurfaceNormal = 0;
+	path.subsurfaceRadius = 0.0;
+	path.subsurfaceHitCountAxis = 0;
+#endif
+
+	if( hybridPass == HYBRID_DIFFUSE_GI )
+	{
+		const bool isDirectOnly = 
+			uViewMode == VIEW_MODE_LIGHTING_DIRECT ||
+			uViewMode == VIEW_MODE_LIGHTING_DIRECT_DIFFUSE;
+
+		if( isDirectOnly && !path.isTransmission && uBounce >= uBounceCount[0] )
+		{
+			return;
+		}
+	}
+	else if( hybridPass == HYBRID_SPECULAR )
+	{
+		const bool isDirectOnly = 
+			uViewMode == VIEW_MODE_LIGHTING_DIRECT ||
+			uViewMode == VIEW_MODE_LIGHTING_DIRECT_SPECULAR;
+
+		if( isDirectOnly && !path.isTransmission && uBounce >= uBounceCount[1] )
+		{
+			return;
+		}
+	}
+
+	// get previous ray distance
+	float rayDistance = asfloat( intersectionData.x );
+
+	// get throughput
+	path.throughput = unpackVec4f( pathData0.xy ).xyz;
+
+#ifdef TransmissionSubsurfaceDiffusion
+	HINT_BRANCH
+	if( path.isSubsurface )
+	{
+		// exiting via subsurface diffusion; read additional sampling data from path state
+		path.subsurfaceOrigin = asfloat( pathData1.xyz );
+		path.subsurfaceNormal = pathData1.w;
+		path.subsurfaceRadius = f16tof32( pathData0.w );
+		const uint subsurfaceAxis = ( pathData0.w & RT_PATHFLAG_SUBSURFACE_AXIS ) >> 16;
+
+		// probe ray hit count stored as float in rayDistance
+		path.subsurfaceHitCountAxis = ( uint( rayDistance ) << 16 ) | subsurfaceAxis;
+		rayDistance = 0.0;
+	}
+#endif
+
+	// fetch renderable instance
+	Renderable renderable = bRenderables[objectIndex];
+	
+	// load vertex data
+	uint3		   tri = loadTriangle( renderable.mesh, intersectionData.z );
+	Vertex		   v0 = loadVertex( renderable.mesh, tri.x );
+	Vertex		   v1 = loadVertex( renderable.mesh, tri.y );
+	Vertex		   v2 = loadVertex( renderable.mesh, tri.z );
+
+	// compute interpolated vertex attributes
+	vec2		   triangleBarycentrics = unpackUnitVec2f( intersectionData.w );
+	Vertex		   input = interpolateVertex( triangleBarycentrics, v0, v1, v2 );
+	vec3		   triangleEdge01 = v1.position - v0.position;
+	vec3		   triangleEdge02 = v2.position - v0.position;
+	vec3		   triangleNormal = cross( triangleEdge01, triangleEdge02 );
+	float		   triangleNormalScale;
+	
+	//check if we hit degenerate triangle and if so bail out
+	if( dot( triangleNormal, triangleNormal ) == 0.0 )
+	{ return; }
+	
+	//make sure triangle normal and interpolated normal have consistent orientation
+	HINT_FLATTEN
+	if( dot( triangleNormal, input.normal ) < 0.0 )
+	{ input.normal = -input.normal; }
+	
+	// get radiance for this path so far
+	vec3 rayDir, radiance;
+	getRayDirRadiance( hybridPass, outputCoord, rayDir, radiance );
+	path.radiance = half3( radiance );
+
+	// initialize fragment state
+	FragmentState fragmentState = newFragmentState();
+	const uint4	  rngData = rngLoadHybrid( outputCoord );
+	fragmentState.rng = rngInit( ( uBounce << 28 ) | ( path.outputDesc & RT_OUTPUTCOORD_MASK ), rngData.x );
+	fragmentState.ldsParams = rngData.yzw;
+	fragmentState.primitiveID = intersectionData.z;
+	fragmentState.triangleBarycentrics = vec3( saturate( 1 - triangleBarycentrics.x - triangleBarycentrics.y ), triangleBarycentrics.xy );
+	fragmentState.objectID = objectIndex;
+	fragmentState.transform = unpack( renderable.transform );
+	fragmentState.transformInverse = unpack( renderable.transformInverse );
+	fragmentState.transformInverseTranspose = transpose3x3( fragmentState.transformInverse );
+	fragmentState.vertexPosition = mulPoint( fragmentState.transform, input.position );
+	fragmentState.vertexEye = normalize(-rayDir);
+	fragmentState.vertexEyeDistance = rayDistance;
+	fragmentState.vertexColor = input.color;
+	fragmentState.vertexNormal = normalize( mulVec( fragmentState.transformInverseTranspose, input.normal ) );
+	fragmentState.vertexTangent = normalize( mulVec( fragmentState.transformInverseTranspose, input.tangent ) );
+	fragmentState.vertexBitangent = normalize( mulVec( fragmentState.transformInverseTranspose, input.bitangent ) );
+	fragmentState.geometricNormal = normalizeAndGetScale( mulVec( fragmentState.transformInverseTranspose, triangleNormal ), triangleNormalScale );
+	fragmentState.normal = fragmentState.vertexNormal;
+	fragmentState.screenCoord = outputCoord;
+	fragmentState.screenTexCoord = vec2( fragmentState.screenCoord.x + 0.5, fragmentState.screenCoord.y + 0.5 );
+	fragmentState.screenTexCoord = fragmentState.screenTexCoord * SCREEN_TEXCOORD_SCALE.xy + SCREEN_TEXCOORD_SCALE.zw;
+	fragmentState.rayOffset = computeRayOffset( fragmentState, input.position, v0.position, triangleEdge01, triangleEdge02, triangleNormal, triangleNormalScale );
+	fragmentState.frontFacing = dot( fragmentState.vertexEye, fragmentState.geometricNormal ) >= 0.0;
+	fragmentState.dP = rayDifferentials.x;
+	fragmentState.dD = rayDifferentials.y;
+#ifdef TransmissionSubsurfaceDiffusion
+	// assume front facing when exiting via subsurface diffusion since in this case we don't have a meaningful view direction
+	fragmentState.frontFacing = fragmentState.frontFacing || path.isSubsurface;
+	// transmitting via subsurface diffusion multiple times has little benefit and causes variance spikes
+	// disallow sampling it after first diffuse bounce to avoid firefly noise
+	fragmentState.allowSubsurfaceDiffusion = true;
+	// disable subsurface diffusion
+	if( hybridPass == HYBRID_DIFFUSE_GI )
+	{
+		if( path.isDiffuse && !path.isTransmission )
+		{
+			fragmentState.allowSubsurfaceDiffusion = false;
+		} 
+	}
+	else
+	{
+		if( path.isDiffuse )
+		{
+			fragmentState.allowSubsurfaceDiffusion = false;
+		}
+	}
+#endif
+
+	fragmentState.screenDepth = 0.0;
+	fragmentState.scatterColor = fragmentState.baseColor;
+	fragmentState.sampleCoverage = 0xFFFFFFFF;
+	fragmentState.allowSkySampling = true;
+	fragmentState.anisoDirection = vec3( 0.0, 0.0, 0.0 );
+	fragmentState.anisoDirectionSecondary = vec3( 0.0, 0.0, 0.0 );
+	fragmentState.anisoAspect = 1.0;
+	fragmentState.anisoAspectSecondary = 1.0;
+
+	vec4			textureGrads = vec4( 0.0, 0.0, 0.0, 0.0 );
+	RayDifferential rd = computeRayDifferential( 
+		fragmentState,
+		textureGrads,
+		triangleEdge01, 
+		triangleEdge02, 
+		triangleNormal, 
+		v0,
+		v1,
+		v2 );
+
+	fragmentState.vertexTexCoordBase = vec4( input.texcoord, textureGrads.xy );
+	fragmentState.vertexTexCoordSecondary = vec4( input.texcoord2, textureGrads.zw );
+	
+	#ifdef TextureInitialize
+		TextureInitialize( renderable, fragmentState );
+	#endif
+	
+	const bool fromCurve = ( renderable.mesh.triangleOffsetAndFlags & MESH_FLAG_FROMCURVES ) != 0;
+
+	// fetch material
+	fetchMaterialChannels( materialIndex, rd, path, fragmentState );
+
+	SampleState sampleState;
+	sampleState.origin = fragmentState.vertexPosition;
+	sampleState.basis = createTangentBasis( fragmentState.normal, fragmentState.vertexTangent );
+	sampleState.V = fragmentState.vertexEye;
+	sampleState.Ng = fragmentState.geometricNormal;
+	sampleState.NdotV = dot( fragmentState.normal, fragmentState.vertexEye );
+	sampleState.strictNormals = fragmentState.normalStrict;
+	sampleState.flagDiffuse = false;
+	sampleState.flagSpecular = false;
+	sampleState.flagHairBCSDF = false;
+	sampleState.shadow = 1.0;
+	sampleState.L = vec3( 0.0, 0.0, 0.0 );
+	sampleState.H = vec3( 0.0, 0.0, 0.0 );
+	sampleState.NdotL = 0.0;
+	sampleState.Tin = vec3( 1.0, 1.0, 1.0 );
+	sampleState.Tout = vec3( 1.0, 1.0, 1.0 );
+	sampleState.bsdf = vec3( 0.0, 0.0, 0.0 );
+	sampleState.pdf = 0.0;
+	sampleState.reflectionWeightSecondary = 0.0f;
+	sampleState.reflectionWeight = 0.0f;
+	sampleState.diffusionWeight = 0.0f;
+	sampleState.transmissionWeight = 0.f;
+	
+	evaluateShading( path, fragmentState, sampleState, fromCurve, pathBits );
+}

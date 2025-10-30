@@ -1,0 +1,36 @@
+#ifndef MSET_V2_BINDING_COMP
+#define MSET_V2_BINDING_COMP
+
+uniform uint2 uMaterialBinding;
+
+#ifndef MATERIAL_BINDING_UNIFORM
+	struct  ShaderBinding
+	{
+		uint signature;
+		uint parametersIndex;
+	};
+	USE_STRUCTUREDBUFFER(ShaderBinding,bShaderBindings);
+#endif
+
+bool getMaterialBinding( uint objectIndex, out uint materialIndex )
+{
+	materialIndex = ~0u;
+	#ifdef MATERIAL_BINDING_UNIFORM
+	{
+		if( objectIndex != uMaterialBinding.x )
+		{ return false; }
+		materialIndex = uMaterialBinding.y;
+	}
+	#else
+	{
+		const ShaderBinding shader = bShaderBindings[objectIndex];
+		if( shader.signature != uMaterialBinding.x )
+		{ return false; }
+		materialIndex = shader.parametersIndex;
+	}
+	#endif
+
+	return true;
+}
+
+#endif

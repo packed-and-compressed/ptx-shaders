@@ -1,0 +1,576 @@
+#ifndef HYBRID_COMP
+#define HYBRID_COMP
+
+#include "data/shader/mat/matEvaluate.frag"
+#include "data/shader/mat/hybridConstants.comp"
+
+#include "data/shader/common/const.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/rngHybrid.comp"
+#include "data/shader/common/ldsamplerHybrid.comp"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/raydifferential.sh"
+#include "data/shader/scene/raytracing/rayoffset.sh"
+#include "data/shader/scene/raytracing/reservoir.comp"
+#include "data/shader/scene/raytracing/lights/distantlight.comp"
+#include "data/shader/scene/raytracing/lights/pointlight.comp"
+#include "data/shader/scene/raytracing/lights/skylight.comp"
+
+#include "binding.comp"
+#include "mesh.comp"
+#include "renderable.frag"
+#include "state.comp"
+
+#define RT_PRIMARYHIT
+
+uniform uint  uBounce;
+uniform uint  uRandomSeed;
+uniform float uDirectClamp;
+uniform float uIndirectClamp;
+uniform vec4  uScreenTexCoordScaleBias;
+uniform uint2 uOutputChannel;//{direct/specular, diffuse}
+uniform uint  uViewMode;
+
+#ifdef RT_PRIMARYHIT
+uniform mat4 uViewMatrix;
+uniform vec4 uLightSpaceCameraPosition;
+uniform vec2 uShadingIntensity;//{specular, diffuse}
+#endif
+
+uniform uint2 uScreenSize;
+    
+#if defined( MATERIAL_PASS_HYBRID_PRIMARYHIT ) || defined ( MATERIAL_PASS_HYBRID_LIGHT_SAMPLE ) || defined( MATERIAL_PASS_HYBRID_SPATIALHASHDEBUG )
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tPrepassObjectID );
+USE_TEXTURE2D_NOSAMPLER( tPrepassGeometry );
+#endif
+
+template<bool split>
+void	computeBSDFWeights( const bool diffuseOnly, PathState path, inout FragmentState fs, inout SampleState ss, inout vec3 fresnel, inout vec3 fresnelCoat )
+{
+#ifdef TransmissionSubsurface
+	if( path.isSubsurface )
+	{
+		// exiting via subsurface; enforce diffuse transmission into the scene
+		ss.reflectionWeightSecondary = 0.0;
+		ss.reflectionWeight = 0.0;
+		ss.diffusionWeight = 0.0;
+		ss.transmissionWeight = 1.0;
+		return;
+	}
+	else if( !fs.frontFacing )
+	{
+		// hit back face of subsurface material while not currently sampling BSSRDF
+		// terminate path as we don't support nested mediums
+		return;
+	}
+#endif
+	//calculate Fresnel reflectance of the topmost specular layer
+	vec3  Fcoat = vec3( 0.0, 0.0, 0.0 );
+	float lumReflectionCoat = 0.0;
+	#ifdef ReflectionFresnelSecondary
+		Fcoat = ReflectionFresnelSecondary( fs, ss.NdotV );
+		lumReflectionCoat = luminance( Fcoat.rgb ) * fs.reflectionOcclusion;
+		if( fs.emissionUnderCoat )
+		{ fs.emission *= oneminus( Fcoat ); }
+	#endif
+	fresnelCoat = Fcoat;
+
+	//calculate Fresnel reflectance of the base specular layer
+	vec3  F = vec3( 0.0, 0.0, 0.0 );
+	float lumReflection = 0.0;
+	#ifdef ReflectionFresnel
+		F = ReflectionFresnel( fs, ss.NdotV );
+		lumReflection = luminance( F * oneminus(Fcoat) ) * fs.reflectionOcclusion;
+		// metalness increases base layer contribution to 1.0
+		lumReflection = mix( lumReflection, 1.0f, fs.metalness );
+	#endif
+	#ifdef ReflectionBCSDF
+		lumReflection = 1.0;
+	#endif
+	fresnel = F;
+
+	// calculate diffuse weight
+	float lumDiffusion = 0.0;
+	#ifdef DiffusionSample
+		#ifdef ShadowCatcher
+			//for shadow catchers weigh diffuse samples uniformly since albedo is actually background color
+			lumDiffusion = saturate( 1.0 - fs.metalness ) * fs.diffusion;
+		#else
+			//diffuse leaks in hybrid into GI so we correct it by metalness here
+			lumDiffusion = saturate( 1.0 - fs.metalness ) * luminance( fs.albedo.rgb );
+		#endif
+	#endif
+
+	// calculate transmission weight
+	float lumTransmission = 0.0;
+	#ifdef TransmissionSample
+		#ifdef TransmissionSubsurface
+			lumTransmission	= fs.transmissivity.r;
+		#else
+			lumTransmission	= luminance( fs.transmissivity * oneminus(F) * oneminus(Fcoat) );
+		#endif
+	#endif
+
+	// disable caustics for diffuse GI pass
+	if( diffuseOnly )
+	{
+		lumReflectionCoat = 0.0f;
+		lumReflection = 0.0f;
+		lumTransmission = 0.0f;
+	}
+
+	// accumulate the total weight according ot their lobes
+	// 1. specular reflection lobes
+	// 2. diffuse + transmission lobes
+	float totalReflection			  = lumReflectionCoat + lumReflection;
+	float totalDiffuseAndTransmission = lumDiffusion + lumTransmission;
+
+	// if we are not splitting specular from diffuse and transmission, then we make sure we add them
+	// to the total
+	if( !split )
+	{
+		totalReflection += lumDiffusion + lumTransmission;
+		totalDiffuseAndTransmission += lumReflectionCoat + lumReflection;
+	}
+
+	// compute reciprocal for normalization
+	float invTotalReflection = totalReflection > 0.0 ? rcp( totalReflection ) : 0.0;
+	float invTotalDiffuseAndTransmission = totalDiffuseAndTransmission > 0.0 ? rcp( totalDiffuseAndTransmission ) : 0.0;
+
+	// now compute each weight accordingly, notice that if they are split they are not
+	// normalized across all 4, but only to their respective groupings
+	ss.reflectionWeightSecondary = lumReflectionCoat * invTotalReflection;
+	ss.reflectionWeight			 = lumReflection * invTotalReflection;
+	ss.diffusionWeight			 = lumDiffusion * invTotalDiffuseAndTransmission;
+	ss.transmissionWeight		 = lumTransmission * invTotalDiffuseAndTransmission;
+}
+
+void	evaluateBSDF( PathState path, FragmentState fs, inout SampleState ss, out vec3 diffuseLight, out vec3 specularLight, out float diffuseLightPdf, out float specularLightPdf )
+{
+	// we compute specular component separately from diffuse, so make sure
+	// we separate them out
+	specularLight = vec3( 0, 0, 0 );
+	specularLightPdf = 0.0f;
+#ifdef TransmissionSubsurface
+	if( !path.isSubsurface )
+#endif
+	{
+	#ifdef ReflectionEvaluateSecondary
+		ReflectionEvaluateSecondary( path, fs, ss );
+	#endif
+	#ifdef ReflectionEvaluate
+		ReflectionEvaluate( path, fs, ss );
+	#endif
+	// record specular for later subtraction
+	specularLight = ss.bsdf;
+	specularLightPdf = ss.pdf;
+	#ifdef DiffusionEvaluate
+		DiffusionEvaluate( path, fs, ss );
+	#endif
+	}
+	#ifdef TransmissionEvaluate
+		TransmissionEvaluate( path, fs, ss );
+	#endif
+	// diffuse is total minus specular
+	diffuseLight = ss.bsdf - specularLight;
+	diffuseLightPdf = ss.pdf - specularLightPdf;
+}
+
+void	evaluateDirectLight( const int lightIndex, const float weight, PathState path, inout FragmentState fs, inout SampleState ss )
+{
+	const float pdfChooseSky = fs.allowSkySampling ? uLightChoosePDF.x : 0.0;
+	const float pdfChooseDynamic = fs.allowSkySampling ? uLightChoosePDF.y : uLightChoosePDF.z;
+	if( weight > 0.0f )
+	{
+		LightSampleState ls;
+		ls.L = ss.L;
+		ls.radiance = vec3( 0.0, 0.0, 0.0 );
+		ls.distance = INFINITY;
+		ls.pdf = 0.0;
+
+		if( lightIndex == LS_INDEX_SKY )
+		{
+		#ifdef SceneHasSkyLight
+			evaluateLight_Sky( ls );
+
+			vec3  diffuseRadiance, specularRadiance;
+			float diffusePdf, specularPdf;
+			evaluateBSDF( path, fs, ss, diffuseRadiance, specularRadiance, diffusePdf, specularPdf );
+
+			if( ls.pdf > 0.0f )
+			{
+				float weight = ls.pdf >= 0.0 ? misWeight( ls.pdf * pdfChooseSky, diffusePdf ) * rcpSafe( ls.pdf ) : 1.0;
+				fs.diffuseLight = ls.radiance * diffuseRadiance * fs.skyOcclusion * weight;
+				weight = ls.pdf >= 0.0 ? misWeight( ls.pdf * pdfChooseSky, specularPdf ) * rcpSafe( ls.pdf ) : 1.0;
+				fs.specularLight = ls.radiance * specularRadiance * fs.skyOcclusion * weight;
+			}
+		#else
+			fs.diffuseLight = vec3( 0, 0, 0 );
+			fs.specularLight = vec3( 0, 0, 0 );
+		#endif
+		}
+		else
+		{
+			vec3  diffuseRadiance, specularRadiance;
+			float diffusePdf, specularPdf;
+			evaluateBSDF( path, fs, ss, diffuseRadiance, specularRadiance, diffusePdf, specularPdf );
+			
+			if( lightIndex < uLightCountPoint )
+			{
+			#ifdef SceneHasPointLights
+				LightParamsRT lp = computePointLightParams( lightIndex, ss.origin );
+				float		  peval = saturate( maxcomp( lp.color ) );// probability of evaluation given fade factors
+				if( rngNextFloat( fs.rng ) < peval )
+				{
+					lp.color *= rcp( peval );
+					evaluateDirectLight_Point<true>( lp, ss.origin, abs( ls.distance ), ls );
+					float diffuseWeight = ls.pdf >= 0.0 ? misWeight( ls.pdf * pdfChooseDynamic, diffusePdf ) * rcpSafe( ls.pdf ) : 1.0;
+					fs.diffuseLight = ls.radiance * diffuseRadiance * diffuseWeight;
+					float specularWeight = ls.pdf >= 0.0 ? misWeight( ls.pdf * pdfChooseDynamic, diffusePdf ) * rcpSafe( ls.pdf ) : 1.0;
+					fs.specularLight = ls.radiance * specularRadiance * specularWeight;
+				}
+			#endif
+			}
+			else
+			{
+			#ifdef SceneHasDistantLights
+				LightParamsRT lp = computeDistantLightParams( lightIndex, ss.origin );
+				evaluateDirectLight_Distant( lp, ls );
+				float diffuseWeight = ls.pdf >= 0.0 ? misWeight( ls.pdf * pdfChooseDynamic, diffusePdf ) * rcpSafe( ls.pdf ) : 1.0;
+				fs.diffuseLight += ls.radiance * diffuseRadiance * diffuseWeight;
+				float specularWeight = ls.pdf >= 0.0 ? misWeight( ls.pdf * pdfChooseDynamic, diffusePdf ) * rcpSafe( ls.pdf ) : 1.0;
+				fs.specularLight += ls.radiance * specularRadiance * specularWeight;
+			#endif
+			}
+		}
+		fs.diffuseLight *= weight;
+		fs.specularLight *= weight;
+	}
+}
+
+vec3	sampleBSDF( PathState path, FragmentState fs, inout SampleState ss )
+{
+	float pCoatReflection = ss.reflectionWeightSecondary;
+	float pReflection = ss.reflectionWeight;
+	float pDiffusion = ss.diffusionWeight;
+
+	bool  sampledBRDF = false;
+#ifdef ReflectionSampleSecondary
+	if( ss.r.w < pCoatReflection )
+	{
+		ReflectionSampleSecondary( path, fs, ss );
+		sampledBRDF = true;
+	}
+	else
+	{
+		pReflection /= ss.reflectionWeight + ss.diffusionWeight + ss.transmissionWeight;
+		ss.r.w = ( ss.r.w - pCoatReflection ) / ( 1.0 - pCoatReflection );// reuse random sample
+	}
+#endif
+#ifdef ReflectionSample
+	if( !sampledBRDF && ss.r.w < pReflection )
+	{
+		ReflectionSample( path, fs, ss );
+		sampledBRDF = true;
+	}
+	else
+	{
+		pDiffusion /= ss.diffusionWeight + ss.transmissionWeight;
+	}
+#endif
+#ifdef DiffusionSample
+	if( !sampledBRDF && ss.r.z < pDiffusion )
+	{
+		DiffusionSample( path, fs, ss );
+		sampledBRDF = true;
+	}
+#endif
+#ifdef TransmissionSample
+	if( !sampledBRDF )
+	{
+		TransmissionSample( path, fs, ss );
+	}
+#endif
+
+	// evaluate BSDF stack for sampled direction
+	vec3  diffuseRadiance, specularRadiance;
+	float diffusePdf, specularPdf;
+	evaluateBSDF( path, fs, ss, diffuseRadiance, specularRadiance, diffusePdf, specularPdf );
+	return ss.bsdf;
+}
+
+vec3	sampleDiffuseGI( PathState path, FragmentState fs, inout SampleState ss )
+{
+	float pDiffusion	= ss.diffusionWeight;
+	float pTransmission = ss.transmissionWeight;
+	const float total = pDiffusion + pTransmission;
+	pDiffusion *= rcpSafe(total);
+	pTransmission *= rcpSafe(total);
+
+	// sample GI path, evaluate path throughput
+	bool sampledBRDF = false;
+#if defined( DiffusionSample ) 
+	if(ss.r.w < pDiffusion)
+	{
+		DiffusionSample( path, fs, ss );
+	#if defined( DiffusionEvaluate )
+		DiffusionEvaluate( path, fs, ss );
+	#endif
+		sampledBRDF = true;
+	}
+#endif
+#if defined( TransmissionSample )
+	if(!sampledBRDF)
+	{
+		TransmissionSample( path, fs, ss );
+	#if defined( TransmissionEvaluate )
+		TransmissionEvaluate( path, fs, ss );
+	#endif
+	}
+#endif
+	return ss.bsdf;
+}
+
+
+LightSampleState sampleLightsCandidate( PathState path, FragmentState fs, SampleState ss, inout int lightIndex, out vec3 diffuseLight )
+{
+	LightSampleState ls;
+	ls.L		 = vec3(0.0, 0.0, 0.0);
+	ls.radiance	 = vec3(0.0, 0.0, 0.0);
+	ls.distance	 = INFINITY;
+	ls.shadow	 = 1.0;
+	ls.pdf		 = 0.0;
+	ls.pdfChoose = 0.0;
+
+	float pdfChooseSky = fs.allowSkySampling ? uLightChoosePDF.x : 0.0;
+	float pdfChooseDynamic = fs.allowSkySampling ? uLightChoosePDF.y : uLightChoosePDF.z;
+
+#ifdef SceneHasSkyLight
+	HINT_BRANCH
+	if( lightIndex == LS_INDEX_SKY )
+	{
+		//sky light
+		sampleLight_Sky( ss.r.xy, ls );
+		ls.radiance *= fs.skyOcclusion;
+		ls.pdfChoose = pdfChooseSky;
+	}
+	else
+#endif
+	{
+		//dynamic light
+		HINT_FLATTEN
+		if( lightIndex < 0 )
+		{
+			//no light index provided; choose one at random
+			lightIndex = clamp( int(ss.r.z * uLightCountTotal), 0, int( uLightCountTotal ) - 1 );
+		}
+		ls.pdfChoose = pdfChooseDynamic;
+		
+		if( lightIndex < uLightCountPoint )
+		{
+		#ifdef SceneHasPointLights
+			LightParamsRT lp = computePointLightParams( lightIndex, ss.origin );
+			sampleLight_Point( lp, ss.r.xy, ss.origin, ls );
+			ls.shadow = lp.fade;
+		#endif
+		}
+		else
+		{
+		#ifdef SceneHasDistantLights
+			LightParamsRT lp = computeDistantLightParams( lightIndex, ss.origin );
+			sampleLight_Distant( lp, ss.r.xy, ls );
+		#endif
+		}
+	}
+
+	ss.L	 = ls.L;
+	ss.NdotL = dot( ss.L, ss.basis.N );
+
+#ifdef ShadowCatcher
+	//sampling for a shadow catcher: compute shadow opacity
+	float radianceFade = saturate( maxcomp(ls.radiance) * (1.0/0.05) );
+	ls.shadow *= (radianceFade * radianceFade) * (ss.NdotL > 0.0 ? 1.0 : 0.0);
+#endif
+
+#ifndef TransmissionThinSurface
+	HINT_FLATTEN
+	if( isTransmission(ss) )
+	{
+		ss.H = -normalize( ss.L + fs.eta * ss.V );
+		HINT_FLATTEN if( dot( ss.basis.N, ss.H ) < 0.0 )
+		{ ss.H = -ss.H; }
+	}
+	else
+#endif
+	{
+		ss.H = normalize( ss.L + ss.V );
+	}
+
+	if( lightIndex == LS_INDEX_SKY || lightIndex < uLightCountTotal )
+	{
+		// separate out diffuse and specular
+		vec3  diffuseRadiance, specularRadiance;
+		float diffusePdf, specularPdf;
+		evaluateBSDF( path, fs, ss, diffuseRadiance, specularRadiance, diffusePdf, specularPdf );
+
+		// calculate diffuse radiance contribution
+		float diffuseWeight = ls.pdf >= 0.0 ? misWeight( ls.pdf * ls.pdfChoose, diffusePdf ) * rcpSafe( ls.pdf ) : 1.0;
+		fs.diffuseLight = ls.radiance * diffuseRadiance * diffuseWeight;
+
+		// calculate specular radiance contribution
+		float specularWeight = ls.pdf >= 0.0 ? misWeight( ls.pdf * ls.pdfChoose, specularPdf ) * rcpSafe( ls.pdf ) : 1.0;
+		fs.specularLight = ls.radiance * specularRadiance * specularWeight;
+
+		// no MIS for LTC, but we gotta remember to account for the pdf to calculate
+		// final radiance
+		ls.radiance = ( fs.diffuseLight + fs.specularLight );
+	}
+	diffuseLight = fs.diffuseLight;
+	return ls;
+}
+
+Reservoir sampleLights( 
+	const ushort		hybridPass, 
+	inout PathState		path, 
+	inout FragmentState fs, 
+	inout SampleState	ss, 
+	out vec3			diffuseLight )
+{
+	diffuseLight = vec3( 0, 0, 0 );
+
+	// Note: from wallace, I have found with checkerboard mode, if we use the original screencoord for sampling light
+	// this cold increase variance and slow down convergence in direct light sampling and evaluation, especially in the
+	// case of environment cdf sampling. The scrambling of random number assuming checkerboarded pixels are right next
+	// to each other seems to fix the variance issue. Since this issue is only observed in direct light sampling,
+	// the fix is only applied for direct light sampling, at least for now until further observation.
+#if defined( HybridDirectLightCheckerboard )
+	const uint2 sampleCoord = fs.screenCoord / 2;
+#else
+	const uint2 sampleCoord = fs.screenCoord;
+#endif
+	ss.r = ldsRandHybridVec4( fs.rng, sampleCoord, HYBRID_SAMPLE_DIM_LIGHT, uBounce, hybridPass, fs.ldsParams );
+	uint numSkySamples = 0;
+#ifdef SceneHasSkyLight
+	{
+		// determine number of skylight samples ahead of time in order to perform skylight sampling before dynamic light sampling
+		// this reduces execution divergence and improves performance of AdvancedLightSampling path. ~ms
+		float pdfChooseSky = fs.allowSkySampling ? uLightChoosePDF.x : 0.0;
+		if( ss.r.w < pdfChooseSky )
+		{
+			numSkySamples++;
+			ss.r.w = ( ss.r.w / pdfChooseSky );
+		}
+		else
+		{
+			ss.r.w = ( 1.0f - ss.r.w ) / ( 1.0f - pdfChooseSky );
+		}
+	}
+#endif
+
+	Reservoir res = newReservoir();
+	bool sampleSky = numSkySamples > 0;
+	int lightIndex = sampleSky ? LS_INDEX_SKY : LS_INDEX_RANDOM;
+	LightSampleState ls = sampleLightsCandidate( path, fs, ss, lightIndex, diffuseLight );
+
+	float pdfSource = ls.pdfChoose;
+#if defined( ShadowCatcher )
+	// make shadow catcher equi-distribution so that we always guarantee to at least shoot some rays even if 
+	// their contribution might be 0, and example why this is needed is omni-lights where light contribution exceed
+	// some radius is 0, but we still want shadow to be rendered properly for shadow catcher, so we always need to 
+	// shoot some rays
+	const float pdfTarget = 1.0f;
+#else
+	const float pdfTarget = luminance( ls.radiance );
+#endif
+	updateReservoir( res, ss.r.w, ls, lightIndex, pdfTarget, pdfSource );
+
+#if defined( ShadowCatcher )
+	ss.shadow = ls.shadow;
+#else
+	ss.shadow = 1.0f;
+#endif
+	// convert total weight to average weight for resampling
+	res.W = rcpSafe( res.pdfTarget * res.M ) * res.W;
+
+	vec3 radiance, L;
+	unpackVec2x3f( res.Lradiance, L, radiance );
+	ss.L = L;
+	ss.NdotL = dot( L, ss.basis.N );
+	return res;
+}
+
+void fetchMaterialChannels(
+	const int materialIndex,
+	in RayDifferential rd,
+	inout PathState path,
+	inout FragmentState fragmentState)
+{
+	evaluateMaterial( materialIndex, rd, fragmentState );
+	
+	// flip normals if camera ray hit back face
+	HINT_FLATTEN
+	if( !fragmentState.frontFacing )
+	{
+	#ifndef SurfaceFlipBackfacingNormals
+		fragmentState.normal = -fragmentState.normal;
+		fragmentState.vertexNormal = -fragmentState.vertexNormal;
+		fragmentState.geometricNormal = -fragmentState.geometricNormal;
+	#endif
+	#if defined( MATERIAL_PASS_HYBRID_PRIMARYHIT ) || defined ( MATERIAL_PASS_HYBRID_LIGHT_SAMPLE )
+		//for primary hit assume front-facing orientation from now on so that medium change logic is correct
+		fragmentState.frontFacing = true;
+	#endif
+	}
+#ifndef TransmissionThinSurface
+	if( !fragmentState.frontFacing )
+	{
+		// invert eta since we're exiting into scene medium
+		fragmentState.eta = rcp( fragmentState.eta );
+		fragmentState.etaSecondary = rcp( fragmentState.etaSecondary );
+	}
+#endif
+
+#ifdef SurfaceNormalAdjust
+	// adjust shading normal so that reflection vector is always valid
+	// NOTE: this must be done after flipping the normal due to backface hit so that it works for transmission
+	SurfaceNormalAdjust( fragmentState );
+#endif
+}
+
+vec3 getDiffuseAlbedo( FragmentState fs )
+{
+#ifdef TransmissionSubsurfaceDiffusion
+	return fs.scatterColor + fs.sheen.xyz;
+#else
+	return fs.albedo.xyz + fs.sheen.xyz + fs.transmissivity;
+#endif
+}
+
+vec3 getSpecularAlbedo( FragmentState fs, SampleState ss, const vec3 fresnel, const vec3 fresnelCoat )
+{
+	// specular for demodulation, we make sure fresnel is accounted for
+	vec3 specularAlbedo = vec3( 0, 0, 0 );
+#ifdef ReflectionBCSDF
+	// this is basically the transmissive albedo for hair, but since we treat
+	// everything as specular (to be consistent with BCSDF) we use the albedo 
+	// in specular and then account for fresnel in our albedo
+	specularAlbedo = fs.albedo.xyz;
+	// we want to retain the highlight without applying full saturation when 
+	// we multiply albedo back at the end of the render loop
+	fs.reflectivity = vec3( 1, 1, 1 );
+	fs.reflectivitySecondary = vec3( 1, 1, 1 );
+#endif
+#ifdef ReflectionFresnel
+	vec3 specularBaseAlbedo = fresnel;
+	specularAlbedo += specularBaseAlbedo * fs.reflectionOcclusion;
+#endif
+#ifdef ReflectionFresnelSecondary
+	vec3 specularSecondaryAlbedo = fresnelCoat;
+	specularAlbedo += specularSecondaryAlbedo * fs.reflectionOcclusion;
+#endif
+	return specularAlbedo;
+}
+
+#endif
