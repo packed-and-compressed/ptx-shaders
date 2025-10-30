@@ -1,0 +1,453 @@
+#include "../common/util.sh"
+#include "../common/meshBuffer.comp"
+#include "../common/projector.sh"
+
+
+USE_INTERLOCKED_BUFFER(rawMeshBuffer, 0);
+
+USE_BUFFER(uint, fusedIndexMapIN);
+USE_BUFFER(uint, triangleIndicesIN);
+USE_BUFFER(uint, fusedVertexValenceMapIN);
+
+uniform uint	uNumVertices;
+
+uniform vec2	uMeshTexCoord0Offsets;
+
+uniform vec4	uMaterialUvScaleBias;
+uniform vec2	uMaterialUvRotation;
+uniform float	uMaterialTriplanarFade;
+
+vec3 getSrcVertex(uint id)
+{
+	uint meshBufferOffset = vertexIndexToMeshBufferOffset( id, uMeshTexCoord0Offsets );
+	return asfloat(interlockedLoad3(rawMeshBuffer, meshBufferOffset));
+}
+
+vec2 getSrcUV(uint id)
+{
+	uint meshBufferOffset = vertexIndexToMeshBufferOffset( id, uMeshTexCoord0Offsets );
+	uint meshBufferUVOffset = applyUVOffsetToMeshBufferOffset( meshBufferOffset );
+	return asfloat(interlockedLoad2(rawMeshBuffer, meshBufferUVOffset));
+}
+
+uint establishHandedness( vec3 tangent, vec3 bitangent, vec3 normal )
+{
+	float det = determinant( float3x3( tangent, bitangent, normal ) );
+	return det < 0.0 ? 0 : 1;
+}
+
+uint packVector( vec3 normal )
+{
+	uint packed;
+
+	float nx = ((normal.x*0.5) + 0.5) * 1022.f;
+	float ny = ((normal.y*0.5) + 0.5) * 1022.f;
+	float nz = ((normal.z*0.5) + 0.5) * 1022.f;
+
+	int ux = int(nx);
+	int uy = int(ny);
+	int uz = int(nz);
+
+	packed  = ux;
+	packed |= uy << 10;
+	packed |= uz << 20;
+
+	return packed;
+}
+
+uint packVector( vec3 normal, uint w )
+{
+	uint packed = packVector( normal );
+	packed |= ( w & 0x3 ) << 30;
+	return packed;
+}
+
+float cornerWeight(vec3 v1, vec3 v2)
+{
+	v1 = normalize(v1);
+	v2 = normalize(v2);
+	float weight = 1.0 - dot(v1, v2);
+	if( weight < 0 )//angle past 90 degrees
+	{
+		weight = 1.0-weight;//will be > 1
+	}
+	return weight;
+}
+
+void gatherSrcTangentBitangentNormal(uint vertexIndex, out vec3 tangent, out vec3 bitangent, out vec3 normal)
+{
+	const uint FUSED_VERTEX_VALENCE_MAP_STRIDE = 2;
+	const uint FUSED_VERTEX_VALENCE_MAP_TRI_NUM_OFFSET = 0;
+	const uint FUSED_VERTEX_VALENCE_MAP_TABLE_OFFSET = 1;
+
+	normal.x = 0;
+	normal.y = 0;
+	normal.z = 0;
+
+	tangent.x = 0;
+	tangent.y = 0;
+	tangent.z = 0;
+
+	bitangent.x = 0;
+	bitangent.y = 0;
+	bitangent.z = 0;
+
+	uint fusedIndex = fusedIndexMapIN[vertexIndex];
+
+	uint numSrcTriangles = fusedVertexValenceMapIN[(fusedIndex * FUSED_VERTEX_VALENCE_MAP_STRIDE) + FUSED_VERTEX_VALENCE_MAP_TRI_NUM_OFFSET];
+	uint tableStartIndex = fusedVertexValenceMapIN[(fusedIndex * FUSED_VERTEX_VALENCE_MAP_STRIDE) + FUSED_VERTEX_VALENCE_MAP_TABLE_OFFSET] + (uNumVertices*2);
+
+
+	for( uint i=0; i<numSrcTriangles; i++ )
+	{
+		uint triangleIndex = fusedVertexValenceMapIN[tableStartIndex+i];
+
+		vec3 triangleNormal;
+		vec3 triangleTangent;
+		vec3 triangleBitangent;
+
+		uint a = triangleIndicesIN[(triangleIndex*3)+0];
+		uint b = triangleIndicesIN[(triangleIndex*3)+1];
+		uint c = triangleIndicesIN[(triangleIndex*3)+2];
+		vec3 va = getSrcVertex(a);
+		vec3 vb = getSrcVertex(b);
+		vec3 vc = getSrcVertex(c);
+		vec3 vab = va-vb;
+		vec3 vac = va-vc;
+
+		uint cornerIndex = 0;
+		if( fusedIndex == fusedIndexMapIN[b] )
+		{ cornerIndex = 1; }
+		else if( fusedIndex == fusedIndexMapIN[c] )
+		{ cornerIndex = 2; }
+
+		triangleNormal.x = ((vab.y * vac.z) - (vab.z * vac.y));
+		triangleNormal.y = ((vab.z * vac.x) - (vab.x * vac.z));
+		triangleNormal.z = ((vab.x * vac.y) - (vab.y * vac.x));
+
+		float tlen = sqrt((triangleNormal.x*triangleNormal.x)+(triangleNormal.y*triangleNormal.y)+(triangleNormal.z*triangleNormal.z));
+		if( tlen != 0 )
+		{
+			float weight = 0;
+
+			if( cornerIndex == 0 )
+			{ weight = cornerWeight(vb-va, vc-va); }
+			else if( cornerIndex == 1 )
+			{ weight = cornerWeight(va-vb, vc-vb); }
+			else if( cornerIndex == 2 )
+			{ weight = cornerWeight(va-vc, vb-vc); }
+			else
+			{
+				//not a direct match for index - still ok for non-fused normals mode
+			}
+
+			float scale = (1.0 / tlen) * weight;
+			triangleNormal.x *= scale;
+			triangleNormal.y *= scale;
+			triangleNormal.z *= scale;
+
+			//only include local tangents
+			if( vertexIndex == a || vertexIndex == b || vertexIndex == c )
+			{
+#ifdef MATERIAL_TEXTURE_MODE_TRIPLANAR
+                const vec3 DUMMY_TANGENT = vec3(0.0, 0.0, 0.0);
+                const vec3 DUMMY_BITANGENT = vec3(0.0, 0.0, 0.0);
+                const vec3 DUMMY_DPDX = vec3(0.0, 0.0, 0.0);
+                const vec3 DUMMY_DPDY = vec3(0.0, 0.0, 0.0);
+                const vec4 DEFAULT_UV_SCALE_AND_BIAS = vec4(1.0, 1.0, 0.0, 0.0);
+                const vec2 DEFAULT_UV_ROTATION = vec2(1.0, 0.0);
+				
+                TriplanarProjector aProjector = getTriplanarProjectorLod(va,
+																		 triangleNormal,				
+																		 createTangentBasis( DUMMY_TANGENT, DUMMY_BITANGENT, triangleNormal ),
+																		 DUMMY_DPDX,
+																		 DUMMY_DPDY,
+																		 uMaterialUvScaleBias,
+																		 uMaterialUvRotation,
+																		 DEFAULT_UV_SCALE_AND_BIAS,
+																		 DEFAULT_UV_ROTATION,
+																		 uMaterialTriplanarFade,
+																		 true);
+				
+                TriplanarProjector bProjector = getTriplanarProjectorLod(vb,
+																		 triangleNormal,				
+																		 createTangentBasis( DUMMY_TANGENT, DUMMY_BITANGENT, triangleNormal ),
+																		 DUMMY_DPDX,
+																		 DUMMY_DPDY,
+																		 uMaterialUvScaleBias,
+																		 uMaterialUvRotation,
+																		 DEFAULT_UV_SCALE_AND_BIAS,
+																		 DEFAULT_UV_ROTATION,
+																		 uMaterialTriplanarFade,
+																		 true);
+				
+                TriplanarProjector cProjector = getTriplanarProjectorLod(vc,
+																		 triangleNormal,				
+																		 createTangentBasis( DUMMY_TANGENT, DUMMY_BITANGENT, triangleNormal ),
+																		 DUMMY_DPDX,
+																		 DUMMY_DPDY,
+																		 uMaterialUvScaleBias,
+																		 uMaterialUvRotation,
+																		 DEFAULT_UV_SCALE_AND_BIAS,
+																		 DEFAULT_UV_ROTATION,
+																		 uMaterialTriplanarFade,
+																		 true);
+				
+				vec3 q1 = vb-va;
+				vec3 q2 = vc-va;
+
+                vec2 uvaX = aProjector.uvX.xy;
+                vec2 uvbX = bProjector.uvX.xy;
+                vec2 uvcX = cProjector.uvX.xy;
+
+                vec2 uvaY = aProjector.uvY.xy;
+                vec2 uvbY = bProjector.uvY.xy;
+                vec2 uvcY = cProjector.uvY.xy;
+				
+                vec2 uvaZ = aProjector.uvZ.xy;
+                vec2 uvbZ = bProjector.uvZ.xy;
+                vec2 uvcZ = cProjector.uvZ.xy;
+				
+				float s1X = uvbX.x - uvaX.x;
+				float s2X = uvcX.x - uvaX.x;
+				float t1X = uvbX.y - uvaX.y;
+				float t2X = uvcX.y - uvaX.y;
+
+                float s1Y = uvbY.x - uvaY.x;
+                float s2Y = uvcY.x - uvaY.x;
+                float t1Y = uvbY.y - uvaY.y;
+                float t2Y = uvcY.y - uvaY.y;
+
+                float s1Z = uvbZ.x - uvaZ.x;
+                float s2Z = uvcZ.x - uvaZ.x;
+                float t1Z = uvbZ.y - uvaZ.y;
+                float t2Z = uvcZ.y - uvaZ.y;
+	
+				vec4 tX;
+				vec4 bX;
+				tX.x = ( q1.x*t2X - q2.x*t1X );
+				tX.y = ( q1.y*t2X - q2.y*t1X );
+				tX.z = ( q1.z*t2X - q2.z*t1X );
+                tX.w = 0.0;
+				bX.x = ( q2.x*s1X - q1.x*s2X );
+				bX.y = ( q2.y*s1X - q1.y*s2X );
+				bX.z = ( q2.z*s1X - q1.z*s2X );
+                bX.w = 0.0;
+				
+                vec4 tY;
+                vec4 bY;
+                tY.x = (q1.x * t2Y - q2.x * t1Y);
+                tY.y = (q1.y * t2Y - q2.y * t1Y);
+                tY.z = (q1.z * t2Y - q2.z * t1Y);
+                tY.w = 0.0;
+                bY.x = (q2.x * s1Y - q1.x * s2Y);
+                bY.y = (q2.y * s1Y - q1.y * s2Y);
+                bY.z = (q2.z * s1Y - q1.z * s2Y);
+                bY.w = 0.0;
+				
+                vec4 tZ;
+                vec4 bZ;
+                tZ.x = (q1.x * t2Z - q2.x * t1Z);
+                tZ.y = (q1.y * t2Z - q2.y * t1Z);
+                tZ.z = (q1.z * t2Z - q2.z * t1Z);
+                tZ.w = 0.0;
+                bZ.x = (q2.x * s1Z - q1.x * s2Z);
+                bZ.y = (q2.y * s1Z - q1.y * s2Z);
+                bZ.z = (q2.z * s1Z - q1.z * s2Z);
+                bZ.w = 0.0;
+				
+                vec3 t = triplanarMix(aProjector, tX, tY, tZ).xyz;
+                vec3 b = triplanarMix(aProjector, bX, bY, bZ).xyz;
+#else
+				vec3 q1 = vb-va;
+				vec3 q2 = vc-va;
+
+				vec2 uva = getSrcUV(a);
+				vec2 uvb = getSrcUV(b);
+				vec2 uvc = getSrcUV(c);
+
+				float s1 = uvb.x - uva.x;
+				float s2 = uvc.x - uva.x;
+				float t1 = uvb.y - uva.y;
+				float t2 = uvc.y - uva.y;
+	
+				vec3 t;
+				vec3 b;
+				t.x = ( q1.x*t2 - q2.x*t1 );
+				t.y = ( q1.y*t2 - q2.y*t1 );
+				t.z = ( q1.z*t2 - q2.z*t1 );
+				b.x = ( q2.x*s1 - q1.x*s2 );
+				b.y = ( q2.y*s1 - q1.y*s2 );
+				b.z = ( q2.z*s1 - q1.z*s2 );
+#endif				
+                t = normalize(t);
+                b = normalize(b);
+				
+				tangent += t;
+				bitangent += b;
+			}
+		}
+
+		normal += triangleNormal;
+	}
+
+	float slen = (normal.x*normal.x)+(normal.y*normal.y)+(normal.z*normal.z);
+	if( slen != 0 )
+	{ normal *= rsqrt(slen); }
+
+	//fast preview mode normals only
+
+	slen = (tangent.x*tangent.x)+(tangent.y*tangent.y)+(tangent.z*tangent.z);
+	if( slen != 0 )
+	{ tangent *= rsqrt(slen); }
+
+	slen = (bitangent.x*bitangent.x)+(bitangent.y*bitangent.y)+(bitangent.z*bitangent.z);
+	if( slen != 0 )
+	{ bitangent *= rsqrt(slen); }
+
+
+	float NdotT = (tangent.x*normal.x + tangent.y*normal.y + tangent.z*normal.z);
+	tangent.x -= NdotT * normal.x;
+	tangent.y -= NdotT * normal.y;
+	tangent.z -= NdotT * normal.z;
+
+	slen = tangent.x*tangent.x + tangent.y*tangent.y + tangent.z*tangent.z;
+	if( slen != 0.f )
+	{
+		float L = rsqrt( slen );
+		tangent.x *= L; tangent.y *= L; tangent.z *= L;
+	}
+	else
+	{
+		if( normal.x == 0.f )
+		{ tangent.x = 1.f; tangent.y = tangent.z = 0.f; }
+		else if( normal.y == 0.f )
+		{ tangent.y = 1.f; tangent.x = tangent.z = 0.f; }
+		else if( normal.z == 0.f )
+		{ tangent.z = 1.f; tangent.x = tangent.y = 0.f; }
+		else
+		{
+			tangent.x = tangent.y = 1.f;
+			tangent.z = (-normal.x-normal.y) / normal.z;
+			slen = (tangent.x*tangent.x)+(tangent.y*tangent.y)+(tangent.z*tangent.z);
+			if( slen != 0 )
+			{ tangent *= rsqrt(slen); }
+		}
+	}
+			
+	float NdotB = (bitangent.x*normal.x + bitangent.y*normal.y + bitangent.z*normal.z);
+	float TdotB = (bitangent.x*tangent.x + bitangent.y*tangent.y + bitangent.z*tangent.z);
+	bitangent.x -= NdotB * normal.x + TdotB * tangent.x;
+	bitangent.y -= NdotB * normal.y + TdotB * tangent.y;
+	bitangent.z -= NdotB * normal.z + TdotB * tangent.z;
+	slen = tangent.x*tangent.x + tangent.y*tangent.y + tangent.z*tangent.z;
+	if( slen != 0.f )
+	{
+		float L = rsqrt( slen );
+		bitangent.x *= L; bitangent.y *= L; bitangent.z *= L;
+	}
+	else
+	{
+		bitangent.x = ((normal.y * tangent.z) - (normal.z * tangent.y));
+		bitangent.y = ((normal.z * tangent.x) - (normal.x * tangent.z));
+		bitangent.z = ((normal.x * tangent.y) - (normal.y * tangent.x));
+	}
+}
+
+uint gatherSrcNormal(uint vertexIndex)
+{
+
+	vec3 normal;
+	normal.x = 0;
+	normal.y = 0;
+	normal.z = 0;
+
+	uint fusedIndex = fusedIndexMapIN[vertexIndex];
+
+	uint numSrcTriangles = fusedVertexValenceMapIN[(fusedIndex*2)+0];
+	uint tableStartIndex = fusedVertexValenceMapIN[(fusedIndex*2)+1]+(uNumVertices*2);
+
+	for( uint i=0; i<numSrcTriangles; i++ )
+	{
+		uint triangleIndex = fusedVertexValenceMapIN[tableStartIndex+i];
+
+		vec3 triangleNormal;
+		vec3 triangleTangent;
+		vec3 triangleBitangent;
+
+		uint a = triangleIndicesIN[(triangleIndex*3)+0];
+		uint b = triangleIndicesIN[(triangleIndex*3)+1];
+		uint c = triangleIndicesIN[(triangleIndex*3)+2];
+		vec3 va = getSrcVertex(a);
+		vec3 vb = getSrcVertex(b);
+		vec3 vc = getSrcVertex(c);
+		vec3 vab = va-vb;
+		vec3 vac = va-vc;
+
+		uint cornerIndex = 0;
+		if( fusedIndex == fusedIndexMapIN[b] )
+		{ cornerIndex = 1; }
+		else if( fusedIndex == fusedIndexMapIN[c] )
+		{ cornerIndex = 2; }
+
+		triangleNormal.x = ((vab.y * vac.z) - (vab.z * vac.y));
+		triangleNormal.y = ((vab.z * vac.x) - (vab.x * vac.z));
+		triangleNormal.z = ((vab.x * vac.y) - (vab.y * vac.x));
+
+		float tlen = sqrt((triangleNormal.x*triangleNormal.x)+(triangleNormal.y*triangleNormal.y)+(triangleNormal.z*triangleNormal.z));
+		if( tlen != 0 )
+		{
+			float weight = 0;
+
+			if( cornerIndex == 0 )
+			{ weight = cornerWeight(vb-va, vc-va); }
+			else if( cornerIndex == 1 )
+			{ weight = cornerWeight(va-vb, vc-vb); }
+			else if( cornerIndex == 2 )
+			{ weight = cornerWeight(va-vc, vb-vc); }
+			else
+			{
+				//not a direct match for index - still ok for non-fused normals mode
+			}
+
+			float scale = (1.0 / tlen) * weight;
+			triangleNormal.x *= scale;
+			triangleNormal.y *= scale;
+			triangleNormal.z *= scale;
+		}
+
+		normal += triangleNormal;
+	}
+
+	float slen = (normal.x*normal.x)+(normal.y*normal.y)+(normal.z*normal.z);
+	if( slen != 0 )
+	{ normal *= rsqrt(slen); }
+
+	return packVector(normal);
+}
+
+void writePackedTangentNormal(uint2 tn, uint id)
+{
+	uint meshBufferOffset = vertexIndexToMeshBufferOffset( id, uMeshTexCoord0Offsets );
+	uint meshTangentBufferOffset = applyTangentOffsetToMeshBufferOffset( meshBufferOffset );
+	interlockedStore2(rawMeshBuffer, meshTangentBufferOffset, tn);
+}
+
+COMPUTE(256,1,1)
+{
+	uint id = DISPATCH_THREAD_ID.x + (DISPATCH_THREAD_ID.y * 65535);
+    if( id < uNumVertices )
+    {
+		vec3 tangent;
+		vec3 bitangent;
+		vec3 normal;
+
+		gatherSrcTangentBitangentNormal(id, tangent, bitangent, normal);
+
+		uint2 result;
+		result.x = packVector(tangent, establishHandedness( tangent, bitangent, normal ));
+		result.y = packVector(normal);
+		writePackedTangentNormal(result, id);
+	}
+}
+

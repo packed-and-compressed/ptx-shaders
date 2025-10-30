@@ -1,0 +1,73 @@
+#include "hairStrandCommon.comp"
+
+uniform uint uNumSegments;
+
+USE_BUFFER(vec4, bPointsBuffer);
+USE_BUFFER(vec3, bVertexColorsBuffer);
+USE_STRUCTUREDBUFFER(CurveSegment, bSegmentsBuffer);
+USE_STRUCTUREDBUFFER(HairStrand, bStrandsBuffer);
+USE_LOADSTORE_STRUCTUREDBUFFER(HairVertex, bEvaluatedBuffer, 0);
+
+groupshared float4 gCache[MAX_THREAD_COUNT * MAX_BEZIER_CURVE_DEGREE];
+
+vec4 evaluateCache( float t, CurveSegment segment, uint localCacheID )
+{
+    const uint degree = segment.size - 1;
+    uint n = degree;
+    while (n > 1)
+    {
+        --n;
+        for (uint j = 0; j < n; ++j)
+        {
+            gCache[localCacheID + j] = gCache[localCacheID + j] * ( 1.0 - t ) + gCache[localCacheID + j + 1] * t;
+        }
+    }
+
+    return gCache[localCacheID];
+}
+
+vec4 evaluatePoint(float t, CurveSegment segment, uint localCacheID)
+{
+    // initialize local cache
+    for (uint i = 0; i < segment.size; ++i)
+    {
+        gCache[localCacheID + i] = bPointsBuffer[segment.offset + i] * ( 1.0 - t ) + bPointsBuffer[segment.offset + i + 1] * t;
+    }
+    return evaluateCache( t, segment, localCacheID );
+}
+
+vec3 evaluateColor(float t, CurveSegment segment, uint localCacheID)
+{
+    // initialize local cache
+    for (uint i = 0; i < segment.size; ++i)
+    {
+        gCache[localCacheID + i] = vec4(bVertexColorsBuffer[segment.offset + i], 1.0) * ( 1.0 - t ) + vec4(bVertexColorsBuffer[segment.offset + i + 1], 1.0) * t;
+    }
+    return evaluateCache( t, segment, localCacheID ).xyz;
+}
+
+COMPUTE(MAX_THREAD_COUNT, 1, 1)
+{
+    if ( DISPATCH_THREAD_ID.x >= uNumSegments )
+    { return; }
+
+    // Each thread processes one segment
+    CurveSegment segment = bSegmentsBuffer[DISPATCH_THREAD_ID.x];
+    HairStrand strand = bStrandsBuffer[DISPATCH_THREAD_ID.x];
+    uint localCacheID = GROUP_THREAD_ID.x * MAX_BEZIER_CURVE_DEGREE;
+    
+    uint offset = strand.offset;
+    for (uint i = 0; i < strand.size; ++i)
+    {
+        float t = float(i) / float(strand.size - 1);
+        vec4 p = evaluatePoint( t, segment, localCacheID );
+        vec3 c = evaluateColor( t, segment, localCacheID );
+    
+        HairVertex v;
+        v.position = p.xyz;
+        v.radius = p.w * 0.5;
+        v.t = t;
+        v.color = c;
+        bEvaluatedBuffer[offset + i] = v;
+    }
+}

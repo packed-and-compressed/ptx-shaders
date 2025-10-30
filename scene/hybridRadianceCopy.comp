@@ -1,0 +1,24 @@
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "raytracing/buffers.comp"
+
+// textures
+uniform uint2  uInputSize;
+uniform uint2  uScreenSize;
+USE_TEXTURE2D( tInput );
+
+#define RT_RADIANCE_ATTACHMENT 0
+#include "data/shader/scene/raytracing/output.comp"
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+	
+	const uint2 inputCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uInputSize ) );
+	const vec4	inputRadiance = imageLoad( tInput, inputCoord );
+	radianceAdd( ushort( 0 ), ushort2( outputCoord ), half3( inputRadiance.xyz ) );
+}

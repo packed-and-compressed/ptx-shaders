@@ -1,0 +1,209 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/mat/light.comp"
+#include "data/shader/mat/state.comp"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/reservoir.comp"
+#include "data/shader/scene/raytracing/lights/skylight.comp"
+
+uniform vec3 uOcclusionColor;
+uniform uint uOcclusionComposite;
+
+USE_RAWBUFFER( bCounters );
+USE_BUFFER( uint4, bMisses );
+USE_BUFFER( uint, bSpatialHashCheckSum );
+
+uniform uint2 uScreenSize;
+uniform uint  uFirstBounce;
+uniform uint  uBounce;
+uniform int3  uLightingChannels;// direct light, diffuse GI, reflection
+
+uniform float uDirectClamp;
+uniform float uIndirectClamp;
+
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRGI, 0 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRSpecular, 1 );
+USE_LOADSTORE_BUFFER( uint4, bSpatialHashIndirectBuffer, 2 );
+USE_LOADSTORE_TEXTURE2D( float, tRefractionRadiance, 3 );
+#define RT_RADIANCE_ATTACHMENT 4
+#include "../scene/raytracing/output.comp"
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 5 );
+#endif
+
+COMPUTE( 64, 1, 1 )
+{
+	uint2 numRays = rawLoad2( bCounters, HYBRID_COUNTER_MISS_DIFFUSE );
+	uint  id = 64 * numRays.y * DISPATCH_THREAD_ID.y + DISPATCH_THREAD_ID.x;
+	if( id >= numRays.x )
+	{
+		return;
+	}
+
+	const uint4		 missData = bMisses[id];
+	const uint		 outputDesc = missData.x;
+	const ushort	 hybridPass = ushort( ( outputDesc & HYBRID_OUTPUT_TYPE ) >> 13 );
+	const uint2		 outputCoord = uint2( makeOutputCoord( outputDesc ) );
+	const uint		 pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	uint pathBits = 0;
+	uint4 restirData0 = uint4( 0, 0, 0, 0 );
+	uint4 restirData1 = uint4( 0, 0, 0, 0 );
+
+	int				 channel = -1;
+	LightSampleState ls;
+	// check if this is a diffuse path
+	switch( hybridPass )
+	{
+	case HYBRID_DIFFUSE_GI:
+	case HYBRID_REFRACTION:
+		restirData0 = imageLoadRWArray( tReSTIRGI, outputCoord, 0 );
+		restirData1 = imageLoadRWArray( tReSTIRGI, outputCoord, 1 );
+		break;
+	case HYBRID_SPECULAR:
+		restirData0 = imageLoadRWArray( tReSTIRSpecular, outputCoord, 0 );
+		restirData1 = imageLoadRWArray( tReSTIRSpecular, outputCoord, 1 );
+		break;
+	default:
+		return;
+	}
+	
+	pathBits = missData.w;
+	channel = uLightingChannels[(hybridPass == HYBRID_SPECULAR) ? HYBRID_CHANNEL_SPECULAR : HYBRID_CHANNEL_DIFFUSE_GI];
+
+	if( channel < 0 )
+	{
+		return;
+	}
+
+	// get ray direction
+	vec3 radiance;
+	unpackVec2x3f( restirData0.xyz, ls.L, radiance );
+
+	ls.radiance = vec3( 0.0, 0.0, 0.0 );
+	ls.distance = INFINITY;
+	ls.pdf = 0.0f;
+
+	evaluateLight_Sky( ls );
+	HINT_FLATTEN if( ls.pdf > 0 )
+	{
+		const bool	allowSkySampling = ( pathBits & HYBRID_PATH_ALLOW_SKY_SAMPLE ) > 0;
+		const float pdfChooseSky = allowSkySampling ? uLightChoosePDF.x : 0.0;
+		const float pdfChooseDynamic = allowSkySampling ? uLightChoosePDF.y : uLightChoosePDF.z;
+		
+		// check if this is a diffuse path
+		const vec4 pathData = unpackVec4f( missData.yz );
+		const float skyOcclusion = pathData.w;
+		const float brdfPdf = asfloat( restirData0.w );
+		const float weight = misWeight( brdfPdf, ls.pdf * pdfChooseSky );
+
+		// clamping
+		const float clampVal = uFirstBounce ? uDirectClamp : uIndirectClamp;
+
+		// get throughput, this is demodulated already
+		vec3		indirectRadiance = ls.radiance * skyOcclusion * weight;
+		const uint	cellIdx = bSpatialHashIndirectBuffer[pixelIdx].w;
+		if( ( hybridPass == HYBRID_DIFFUSE_GI ) && ( cellIdx != ~uint( 0 ) ) )
+		{
+			// throughput from previous bounce only (not counting the vertices before this)
+			vec3 radiance, previousThroughput;
+			unpackVec2x3f( bSpatialHashIndirectBuffer[pixelIdx].xyz, radiance, previousThroughput );
+
+			vec3 indirectDiffuseRadiance = previousThroughput * indirectRadiance;
+
+			indirectDiffuseRadiance = clamp( indirectDiffuseRadiance, vec3( 0, 0, 0 ), vec3( clampVal, clampVal, clampVal ) );
+			radiance += indirectDiffuseRadiance;
+			bSpatialHashIndirectBuffer[pixelIdx].xyz = packVec2x3f( radiance, previousThroughput );
+		}
+
+		// apply path throughput
+		const vec3 throughput = pathData.xyz;
+		indirectRadiance *= throughput;
+
+		// clamping
+		indirectRadiance = clamp( indirectRadiance, vec3( 0, 0, 0 ), vec3( clampVal, clampVal, clampVal ) );
+
+		// load current radiance
+		const ushort2 coord = ushort2( outputCoord );
+	#ifdef SPLAT_TO_RADIANCE_BUFFER
+		vec4 currentRadiance = vec4( radianceLoad( ushort( channel ), coord ) );
+	#endif
+		// deal with indirect rays
+		if( hybridPass == HYBRID_DIFFUSE_GI )
+		{
+			// get throughput, this is demodulated already
+			radiance += indirectRadiance;
+			// use the original restir ray direction
+			restirData0.xyz = uint3( asuint( packVec2x3f( ls.L, radiance ) ) );
+		#ifdef SPLAT_TO_RADIANCE_BUFFER
+			// write to diffuse gi pass, avoid double counting
+			currentRadiance += vec4( indirectRadiance, 0.0f );
+			currentRadiance = clamp( currentRadiance, 0.0f, 65504.0f );
+		#else
+
+			//disabled restir for indirect environment contribution for now, it seems like there
+			//can be light leak despite having visibility tracing and jacobian
+			restirData1.xyz = uint3( asuint( luminance( radiance ) ), asuint( 1.0f ), ( uint( 1 ) << 16 ) | uint( 0.0f ) );
+			imageStoreArray( tReSTIRGI, outputCoord, 0, restirData0 );
+			imageStoreArray( tReSTIRGI, outputCoord, 1, restirData1 );
+			return;
+		#endif
+		}
+		else if ( hybridPass == HYBRID_REFRACTION )
+		{
+			const bool nonShadowCaster = ( ( pathBits & HYBRID_PATH_REFRACTION_NON_SHADOW_CAST ) > 0 );
+			const bool hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+			const bool hasRecordedSamplePt = ( ( pathBits & HYBRID_PATH_REFRACTION_SAMPLE_POINT ) > 0 );
+
+			// this is to separate direct light behind refraction from GI
+			if( ( nonShadowCaster && uBounce > 1 ) || ( hasRecordedVisiblePt && hasRecordedSamplePt ) )
+			{
+				// get throughput, this is demodulated already
+				radiance += indirectRadiance;
+				// use the original restir ray direction
+				restirData0.xyz = uint3( asuint( packVec2x3f( ls.L, radiance ) ) );
+			#ifdef SPLAT_TO_RADIANCE_BUFFER
+				// write to diffuse gi pass, avoid double counting
+				currentRadiance += vec4( indirectRadiance, 0.0f );
+				currentRadiance = clamp( currentRadiance, 0.0f, 65504.0f );
+			#else
+				//disabled restir for indirect environment contribution for now, it seems like there
+				//can be light leak despite having visibility tracing and jacobian
+				restirData1.xyz = uint3( asuint( luminance( radiance ) ), asuint( 1.0f ), ( uint( 1 ) << 16 ) | uint( 0.0f ) );
+				imageStoreArray( tReSTIRGI, outputCoord, 0, restirData0 );
+				imageStoreArray( tReSTIRGI, outputCoord, 1, restirData1 );
+				return;
+			#endif
+			}
+			else
+			{
+				vec4 currentRadiance = vec4( imageLoadRW( tRefractionRadiance, outputCoord ) );
+				currentRadiance += vec4( indirectRadiance, 0.0f );
+				currentRadiance = clamp( currentRadiance, 0.0f, 65504.0f );
+				imageStore( tRefractionRadiance, outputCoord, currentRadiance );
+				return;
+			}
+		}
+		else if( hybridPass == HYBRID_SPECULAR )
+		{
+			// get throughput, this is demodulated already
+			radiance += indirectRadiance;
+			// use the original restir ray direction
+			restirData0.xyz = uint3( asuint( packVec2x3f( ls.L, radiance ) ) );
+		#ifdef SPLAT_TO_RADIANCE_BUFFER
+			currentRadiance += vec4( indirectRadiance, 0.0f );
+			currentRadiance = clamp( currentRadiance, 0.0f, 65504.0f );
+		#else
+			restirData1.xyz = uint3( asuint( luminance( radiance ) ), asuint( 1.0f ), ( uint( 1 ) << 16 ) | uint( 0.0f ) );
+			imageStoreArray( tReSTIRSpecular, outputCoord, 0, restirData0 );
+			imageStoreArray( tReSTIRSpecular, outputCoord, 1, restirData1 );
+			return;
+		#endif
+		}
+	#ifdef SPLAT_TO_RADIANCE_BUFFER
+		radianceStore( ushort( channel ), ushort2( coord ), half4( currentRadiance ) );
+	#endif
+	}
+}

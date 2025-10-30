@@ -1,0 +1,32 @@
+#define MAX_THREAD_COUNT 32 //REVIEW: usually at least 64 threads are needed for optimal occupancy. I guess you're using 32 to use less groupshared mem? ~ms
+//ANSWER: Yep, maximum groupshared memory size is 32KB, so I'm using 32 threads to keep the groupshared memory usage low
+
+#define MAX_SPLINE_CONTROL_POINT 64
+#define MAX_BEZIER_CURVE_DEGREE 4
+
+struct CurveSegment
+{
+    uint offset;
+    uint size;
+
+    uint knotOffset;
+    uint knotSize;
+};
+
+struct HairVertex
+{
+    packed_vec3 position;
+    float radius;
+    float t;
+    packed_vec3 color;
+};
+
+struct HairStrand
+{
+    uint offset;
+    uint size;
+
+    uint vertexOffset;
+    uint indexOffset;
+    uint wireframeIndexOffset;
+};

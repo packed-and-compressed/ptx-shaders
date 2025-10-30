@@ -1,0 +1,31 @@
+#include "../common/util.sh"
+#include "../common/meshBuffer.comp"
+
+
+USE_INTERLOCKED_BUFFER(rawMeshBuffer, 0);
+USE_BUFFER(uint, bufferTangentsNormalsIN);
+
+uniform uint	uNumVertices;
+
+uniform vec2	uMeshTexCoord0Offsets;
+
+COMPUTE(256,1,1)
+{
+	uint id = DISPATCH_THREAD_ID.x + (DISPATCH_THREAD_ID.y * 65535);
+	if( id < uNumVertices )
+	{
+		const uint BUFFER_STRIDE = 2;
+		const uint BUFFER_TANGENT_OFFSET = 0;
+		const uint BUFFER_NORMAL_OFFSET = 1;
+
+		uint vertexIndex = id;
+
+		uint2 tn;
+		tn.x = bufferTangentsNormalsIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_TANGENT_OFFSET];
+		tn.y = bufferTangentsNormalsIN[(vertexIndex * BUFFER_STRIDE) + BUFFER_NORMAL_OFFSET];
+
+		uint meshBufferOffset = vertexIndexToMeshBufferOffset( vertexIndex, uMeshTexCoord0Offsets );
+		uint meshBufferTangentOffset = applyTangentOffsetToMeshBufferOffset( meshBufferOffset );
+		interlockedStore2( rawMeshBuffer, meshBufferTangentOffset, tn );
+	}
+}

@@ -1,0 +1,50 @@
+#include "../common/util.sh"
+#include "../common/meshBuffer.comp"
+
+
+USE_INTERLOCKED_BUFFER(rawMeshBuffer, 0);
+USE_BUFFER(uint, duplicateVertexMapIN);
+USE_BUFFER(uint, duplicateVertexListIN);
+
+uniform uint	uNumPositions;
+uniform uint	uTotalVertices;
+
+uniform vec2	uMeshTexCoord0Offsets;
+
+vec3 getSrcVertex(uint id)
+{
+	uint meshBufferOffset = vertexIndexToMeshBufferOffset( id, uMeshTexCoord0Offsets );
+	return asfloat(interlockedLoad3(rawMeshBuffer, meshBufferOffset));
+}
+
+void writePosition(uint vertexIndex, vec3 pos)
+{
+	uint meshBufferOffset = vertexIndexToMeshBufferOffset( vertexIndex, uMeshTexCoord0Offsets );
+	interlockedStore3( rawMeshBuffer, meshBufferOffset, asuint(pos) );
+}
+
+COMPUTE(256,1,1)
+{
+	uint id = DISPATCH_THREAD_ID.x + (DISPATCH_THREAD_ID.y * 65535);
+	if( id < uNumPositions )
+	{
+		uint vertexIndex = duplicateVertexListIN[id];
+		uint numTableEntries = duplicateVertexMapIN[(vertexIndex*2)+0];
+		if( numTableEntries > 1 )
+		{
+			uint tableStartIndex = duplicateVertexMapIN[(vertexIndex*2)+1]+(uTotalVertices*2);
+			vec3 avgPos = vec3( 0.0, 0.0, 0.0 );
+			for( uint i=0; i<numTableEntries; i++ )
+			{
+				uint vertexIndex = duplicateVertexMapIN[tableStartIndex + i];
+				avgPos += getSrcVertex(vertexIndex);
+			}
+			avgPos /= numTableEntries;
+			for( uint j=0; j<numTableEntries; j++ )
+			{
+				uint vertexIndex = duplicateVertexMapIN[tableStartIndex + j];
+				writePosition(vertexIndex, avgPos);
+			}
+		}
+	}
+}

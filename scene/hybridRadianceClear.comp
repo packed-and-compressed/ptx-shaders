@@ -1,0 +1,38 @@
+#include "data/shader/common/packed.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "raytracing/buffers.comp"
+
+uniform uint2	uScreenSize;
+uniform vec4	uClearColor;
+uniform int2	uRadianceIndices;
+uniform int		uKeepAlpha;
+
+#define RT_RADIANCE_ATTACHMENT 0
+#include "data/shader/scene/raytracing/output.comp"
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRGI, 1 );
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+	const vec4 currentRadiance = vec4( radianceLoad( ushort( uRadianceIndices.x ), ushort2( outputCoord ) ) );
+	radianceStore( ushort( uRadianceIndices.x ), ushort2( outputCoord ), half4( vec4( uClearColor.xyz, uKeepAlpha ? currentRadiance.w : uClearColor.w ) ) );
+	
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	vec3 rayDir, radiance;
+	uint4 restirData = imageLoadRWArray( tReSTIRGI, outputCoord, 0 );
+	unpackVec2x3f( restirData.xyz, rayDir, radiance );
+	restirData.xyz = packVec2x3f( rayDir, vec3( 0,0,0 ) );
+	imageStoreArray( tReSTIRGI, outputCoord, 0, restirData );
+
+	if(uRadianceIndices.y != uRadianceIndices.x)
+	{
+		const vec4 currentRadiance = vec4( radianceLoad( ushort( uRadianceIndices.y ), ushort2( outputCoord ) ) );
+		radianceStore( ushort( uRadianceIndices.y ), ushort2( outputCoord ), half4( vec4( uClearColor.xyz, uKeepAlpha ? currentRadiance.w : uClearColor.w ) ) );
+	}
+}

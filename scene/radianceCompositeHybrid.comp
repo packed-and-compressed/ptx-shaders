@@ -1,0 +1,161 @@
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "raytracing/buffers.comp"
+
+// textures
+USE_TEXTURE2DARRAY( tAlbedo );
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tObjectID );
+USE_TEXTURE2DARRAY( tFiltered );
+USE_TEXTURE2DARRAY( tSVGFMoments );
+USE_TEXTURE2D( tPrepassShadowCatcher );
+
+uniform uint2 uScreenSize;
+uniform int3  uLightingChannels; // direct light, diffuse GI, reflection
+uniform int3  uOutputChannels; // 1 or -1 for each channel to check if enabled
+uniform int	  uLightingOnly;
+uniform int3  uEnableFilter;
+uniform float uDirectFilterStrength;
+uniform float uDiffuseFilterStrength;
+uniform float uSpecularFilterStrength;
+uniform int	  uDiffuseGIResolutionFactor;
+uniform int	  uRefractionResolutionFactor;
+uniform int	  uSpecularResolutionFactor;
+
+USE_LOADSTORE_TEXTURE2D( float, tComposite, 0 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tSVGFNewMoments, 1 );
+#define RT_RADIANCE_ATTACHMENT 2
+#include "data/shader/scene/raytracing/output.comp"
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	if( uLightingChannels[HYBRID_CHANNEL_DIRECT_LIGHT] >= 0 )
+	{
+		const vec4 moments = imageLoadArray( tSVGFMoments, outputCoord, uint( uLightingChannels[HYBRID_CHANNEL_DIRECT_LIGHT] ) );
+		imageStoreArray( tSVGFNewMoments, outputCoord, uint( uLightingChannels[HYBRID_CHANNEL_DIRECT_LIGHT] ), moments );
+	}
+	if( uLightingChannels[HYBRID_CHANNEL_DIFFUSE_GI] >= 0 )
+	{
+		const vec4 moments = imageLoadArray( tSVGFMoments, outputCoord, uint( uLightingChannels[HYBRID_CHANNEL_DIFFUSE_GI] ) );
+		imageStoreArray( tSVGFNewMoments, outputCoord, uint( uLightingChannels[HYBRID_CHANNEL_DIFFUSE_GI] ), moments );
+	}
+	if( uLightingChannels[HYBRID_CHANNEL_SPECULAR] >= 0 )
+	{
+		const vec4 moments = imageLoadArray( tSVGFMoments, outputCoord, uint( uLightingChannels[HYBRID_CHANNEL_SPECULAR] ) );
+		imageStoreArray( tSVGFNewMoments, outputCoord, uint( uLightingChannels[HYBRID_CHANNEL_SPECULAR] ), moments );
+	}
+	const vec2 uv = ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize );
+	const uint objectID = imageLoad( tObjectID, outputCoord ).x - 1;
+	if( objectID == ~uint( 0 ) )
+	{
+		return;
+	}
+
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+
+	vec4		totalRadiance = vec4( 0, 0, 0, 0 );
+
+	// background
+	const vec4  background = imageLoadRW( tComposite, outputCoord ).xyzw;
+	vec4		albedoPrepass = imageLoadArray( tAlbedo, outputCoord, HybridAlbedoChannel::HYBRID_ALBEDO_DIFFUSE_METALNESS );
+	vec3		albedo = uLightingOnly > 0 ? vec3( 1.0f, 1.0f, 1.0f ) : albedoPrepass.xyz;
+	const vec3	specularAlbedo = imageLoadArray( tAlbedo, outputCoord, HybridAlbedoChannel::HYBRID_ALBEDO_SPECULAR_GLOSSINESS ).xyz;
+#if defined( HybridRayTracedRefraction )
+	const vec4	refractionAlbedo = imageLoadArray( tAlbedo, uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / float( uRefractionResolutionFactor ) ), HybridAlbedoChannel::HYBRID_ALBEDO_REFRACTION );
+#endif	
+	// direct diffuse
+	vec4 directDiffuse = vec4( 0, 0, 0, 0 );
+	if (uOutputChannels[HYBRID_CHANNEL_DIRECT_LIGHT] >= 0)
+	{
+		// non filtered direct light
+		vec4 unfilteredDirectDiffuse = vec4( radianceLoad( ushort( uLightingChannels[HYBRID_CHANNEL_DIRECT_LIGHT] ), ushort2( outputCoord ) ) );
+		unfilteredDirectDiffuse.xyz *= unfilteredDirectDiffuse.w;
+		
+		// filtered
+		vec4 filteredDirectDiffuse;
+		const int directDiffuseChannel = uLightingChannels[HYBRID_CHANNEL_DIRECT_LIGHT];
+		if (uEnableFilter[HYBRID_CHANNEL_DIRECT_LIGHT] > 0)
+		{
+			filteredDirectDiffuse = texture2DArrayLod( tFiltered, vec3( uv, directDiffuseChannel ), 0 );
+			filteredDirectDiffuse.xyz *= filteredDirectDiffuse.w;
+		}
+		else
+		{
+			filteredDirectDiffuse = unfilteredDirectDiffuse;
+		}
+		
+		directDiffuse = mix( unfilteredDirectDiffuse, filteredDirectDiffuse, uDirectFilterStrength );
+	}
+
+	vec4 directLight = vec4( directDiffuse.xyz, directDiffuse.w );
+	totalRadiance = vec4( albedo * directLight.xyz, 1.0f );
+#if defined( HybridRayTracedRefraction )
+	if (refractionAlbedo.w > 0.0f)
+	{
+		totalRadiance.xyz *= refractionAlbedo.xyz;
+	}
+#endif
+
+#ifdef PrepassOutputShadowCatcher
+	const float shadowCatcherAlpha = imageLoad( tPrepassShadowCatcher, outputCoord ).x;
+#else
+	const float shadowCatcherAlpha = 1.0f;
+#endif
+
+	// lerp
+	totalRadiance = mix( background, totalRadiance, directLight.a * shadowCatcherAlpha );
+
+	// diffuse gi
+	const int diffuseGIChannel = uLightingChannels[HYBRID_CHANNEL_DIFFUSE_GI];
+	if( uOutputChannels[HYBRID_CHANNEL_DIFFUSE_GI] >= 0 && diffuseGIChannel > 0 )
+	{
+		// non filtered direct light
+		vec3 unfilteredDiffuseGI = vec3( radianceLoad( ushort( diffuseGIChannel ), ushort2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / uDiffuseGIResolutionFactor ) ).xyz );
+
+		// filtered
+		vec3 filteredDiffuseGI;
+		if( uEnableFilter[HYBRID_CHANNEL_DIFFUSE_GI] > 0 )
+		{
+			filteredDiffuseGI = texture2DArrayLod( tFiltered, vec3( uv, diffuseGIChannel ), 0 ).xyz;
+		}
+		else
+		{
+			filteredDiffuseGI = unfilteredDiffuseGI;
+		}
+
+		const vec3 diffuseGI = mix( unfilteredDiffuseGI, filteredDiffuseGI, uDiffuseFilterStrength );
+		totalRadiance.xyz += ( albedo * diffuseGI );
+	}
+
+	// specular
+	const int specularChannel = uLightingChannels[HYBRID_CHANNEL_SPECULAR];
+	if( uOutputChannels[HYBRID_CHANNEL_SPECULAR] >= 0 && specularChannel > 0 )
+	{
+		// non filtered direct light
+		vec3	   unfilteredSpecular = vec3( radianceLoad( ushort( specularChannel ), ushort2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / uSpecularResolutionFactor ) ).xyz );
+
+		// filtered
+		vec3	   filteredSpecular;
+		if( uEnableFilter[HYBRID_CHANNEL_SPECULAR] > 0 )
+		{
+			filteredSpecular = texture2DArrayLod( tFiltered, vec3( uv, specularChannel ), 0 ).xyz;
+		}
+		else
+		{
+			filteredSpecular = unfilteredSpecular;
+		}
+
+		const vec3 specular = mix( unfilteredSpecular, filteredSpecular, uSpecularFilterStrength );
+		totalRadiance.xyz += specular * specularAlbedo;
+	}
+
+	// ensure accumulated radiance is non-negative and at most largest half-float normal number
+	// filters out any NaNs and +Infs that might have crept in
+	totalRadiance = clamp( totalRadiance, 0, 65504 );
+	imageStore( tComposite, outputCoord, vec4( totalRadiance ) );
+}

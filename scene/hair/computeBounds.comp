@@ -1,0 +1,52 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/floatmap.sh"
+#include "hairMesh.comp"
+
+USE_RAWBUFFER(bMeshIndices);
+USE_RAWBUFFER(bMeshVertices);
+
+USE_INTERLOCKED_BUFFER(bMeshBounds, 0);
+
+uniform uint uNumIndices;
+uniform uint uOffset;
+
+COMPUTE(128, 1, 1)
+{
+	uint loadIndex = DISPATCH_THREAD_ID.x + uOffset * 128;
+    if ( loadIndex >= uNumIndices )
+    { return; }
+
+    const uint kVertexStride = sizeof( VertexStandard ) / 4;
+
+    uint index    = rawLoad( bMeshIndices, loadIndex );
+    vec3 position = asfloat( rawLoad3( bMeshVertices, index * kVertexStride ) );
+
+    vec3 wave_min = waveMin( position );
+    vec3 wave_max = waveMax( position );
+
+	if ( any( isnan( wave_min ) ) )
+	{ return; }
+
+	if ( any( isnan( wave_max ) ) )
+	{ return; }
+
+    if (waveIsFirstLane())
+    {
+        uint original = 0; // unused
+        #ifdef CPR_METAL
+			interlockedMin( (volatile device atomic_uint*) bMeshBounds, 0, orderPreservingFloatMap( wave_min.x ), original );
+			interlockedMin( (volatile device atomic_uint*) bMeshBounds, 1, orderPreservingFloatMap( wave_min.y ), original );
+			interlockedMin( (volatile device atomic_uint*) bMeshBounds, 2, orderPreservingFloatMap( wave_min.z ), original );
+			interlockedMax( (volatile device atomic_uint*) bMeshBounds, 3, orderPreservingFloatMap( wave_max.x ), original );
+			interlockedMax( (volatile device atomic_uint*) bMeshBounds, 4, orderPreservingFloatMap( wave_max.y ), original );
+			interlockedMax( (volatile device atomic_uint*) bMeshBounds, 5, orderPreservingFloatMap( wave_max.z ), original );
+		#else
+			interlockedMin( bMeshBounds, 0, orderPreservingFloatMap( wave_min.x ), original );
+			interlockedMin( bMeshBounds, 1, orderPreservingFloatMap( wave_min.y ), original );
+			interlockedMin( bMeshBounds, 2, orderPreservingFloatMap( wave_min.z ), original );
+			interlockedMax( bMeshBounds, 3, orderPreservingFloatMap( wave_max.x ), original );
+			interlockedMax( bMeshBounds, 4, orderPreservingFloatMap( wave_max.y ), original );
+			interlockedMax( bMeshBounds, 5, orderPreservingFloatMap( wave_max.z ), original );
+		#endif
+    }
+}

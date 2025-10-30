@@ -1,0 +1,92 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/packed.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+#if defined(PrepassMotionVector)
+#include "data/shader/common/motion.sh"
+#endif
+
+uniform uint  uPerspective;
+uniform uint  uDitherSeed;
+uniform uint2 uScreenSize;
+uniform vec2  uInvScreenSize;
+uniform mat4  uView;
+uniform mat4  uInvView;
+uniform mat4  uInvProjection;
+
+USE_STENCILTEXTURE(tStencil);
+
+USE_LOADSTORE_TEXTURE2D(float,tViewDepth,0);
+#if defined(PrepassGBuffer)
+	USE_LOADSTORE_TEXTURE2D(uint,tObjectID,1);
+	USE_LOADSTORE_TEXTURE2D(uint,tGeometry,2);
+#endif
+
+#if defined(PrepassMotionVector)
+	#if defined(PrepassGBuffer)
+		USE_LOADSTORE_TEXTURE2D(float,tMotionVector,3);
+	#else
+		USE_LOADSTORE_TEXTURE2D(float,tMotionVector,1);
+	#endif
+#endif
+
+COMPUTE(8,8,1)
+{
+    uint2 outputCoord = DISPATCH_THREAD_ID_8x8.xy;
+	if( outputCoord.x >= uScreenSize.x || outputCoord.y >= uScreenSize.y )
+	{ return; }
+
+    if( imageLoad( tStencil, outputCoord ).g == 0 )
+    { return; }
+
+	vec2 screenCoord = ( vec2(outputCoord) + vec2( 0.5, 0.5 ) ) * uInvScreenSize;
+#ifdef RENDERTARGET_Y_DOWN
+	vec2 ndcCoord = vec2( 2.0, -2.0 ) * ( screenCoord - vec2( 0.5, 0.5 ) );
+#else
+	vec2 ndcCoord = vec2( 2.0,  2.0 ) * ( screenCoord - vec2( 0.5, 0.5 ) );
+#endif
+	vec4 nearPlaneCoord = mulPoint( uInvProjection, vec3( ndcCoord, 0.0 ) );
+
+    Ray ray;
+    ray.minT = 0.0;
+    ray.maxT = INFINITY;
+    if( uPerspective == 0 )
+    {
+		//ortho projection
+		ray.origin    = nearPlaneCoord.xyz;
+		ray.direction = vec3( 0.0, 0.0, -1.0 );
+    }
+    else
+    {
+		//infinite perspective projection
+		ray.origin    = vec3( 0.0, 0.0, 0.0 );
+		ray.direction = normalize( nearPlaneCoord.xyz / nearPlaneCoord.w );      
+    }
+    ray.origin    = mulPoint( uInvView, ray.origin ).xyz;
+    ray.direction = mulVec( uInvView, ray.direction );
+    
+    RayHit hit;
+    RayPayload payload;
+    #if defined(TraceTransparencyDither)
+        payload.rng = rngInit( ushort2(outputCoord), uDitherSeed );
+    #endif
+    if( traceRay( SceneTraceable, RT_RAYTYPE_PRIMARY_CURVES, ray, payload, hit ) )
+    {
+        vec3  position     = ray.origin + hit.distance * ray.direction;
+        float viewDepthHit = mulPoint( uView, position ).z;
+        float viewDepth    = imageLoadRW( tViewDepth, outputCoord ).r;
+
+        if( viewDepthHit > viewDepth )
+        {
+            imageStore( tViewDepth, outputCoord, vec4(viewDepthHit, 0.0, 0.0, 0.0) );
+        #if defined(PrepassGBuffer)
+            imageStore( tObjectID, outputCoord, uint4(hit.objectIndex+1, 0, 0, 0) );
+            imageStore( tGeometry, outputCoord, uint4(hit.triangleIndex, packUnitVec2f(hit.triangleCoords), 0, 0) );
+		#endif
+        #if defined(PrepassMotionVector)
+			vec2 motion = computeMotionNDC( position );
+			imageStore( tMotionVector, outputCoord, vec4( motion, 0, 0 ) );
+        #endif
+        }
+    }
+}

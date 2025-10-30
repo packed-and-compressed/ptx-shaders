@@ -1,0 +1,40 @@
+uniform uint	uFrameNumber;
+USE_TEXTURE2D(tBlueNoise);
+
+/**
+* Generate three components of low discrepancy blue noise in image-space.
+* Blue noise texture from Christoph Peters at: http://momentsingraphics.de/BlueNoise.html
+*/
+float3 getLDSBlueNoise(uint2 position, uint frame, float scale)
+{
+    const float goldenRatioConjugate = 0.61803398875f;
+
+    // Load a blue noise value from texture
+    float3 rnd = imageLoad( tBlueNoise, position % 256 ).rgb;
+
+    // Generate a low discrepancy sequence
+    rnd = frac(rnd + goldenRatioConjugate * ((frame - 1) % 16));
+
+    // D3D rounds when converting from FLOAT to UNORM
+    // Shift the random values from [0, 1] to [-0.5, 0.5]
+    rnd -= 0.5f;
+
+    // Scale the noise magnitude, values are in the range [-scale/2, scale/2]
+    // The scale should be determined by the precision (and therefore quantization amount) of the target image's format
+    return (rnd * scale);
+}
+
+float3 applyDither(uint2 position, float3 c)
+{
+    if (any(c))
+    {
+        // Dithering
+	    float noiseScale = 1.f/256.f;
+	    float3 noise = getLDSBlueNoise(position, uFrameNumber, noiseScale);
+        c.x += c.x >= 1.0f ? 0.0f : noise.x;
+        c.y += c.y >= 1.0f ? 0.0f : noise.y;
+        c.z += c.z >= 1.0f ? 0.0f : noise.z;
+        return c;
+    }
+    return c;
+}

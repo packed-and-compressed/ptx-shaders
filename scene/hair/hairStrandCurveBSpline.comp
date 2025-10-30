@@ -1,0 +1,96 @@
+#include "hairStrandCommon.comp"
+
+uniform uint uNumSegments;
+uniform uint uCurveDegree;
+
+USE_BUFFER(vec4, bPointsBuffer);
+USE_BUFFER(vec3, bVertexColorsBuffer);
+USE_STRUCTUREDBUFFER(CurveSegment, bSegmentsBuffer);
+USE_BUFFER(float, bKnotsBuffer);
+USE_STRUCTUREDBUFFER(HairStrand, bStrandsBuffer);
+USE_LOADSTORE_STRUCTUREDBUFFER(HairVertex, bEvaluatedBuffer, 0);
+
+groupshared float4 gCache[MAX_THREAD_COUNT * MAX_SPLINE_CONTROL_POINT];
+
+vec4 evaluateCache(float t, CurveSegment segment, uint localCacheID)
+{
+    const uint knotOffset = segment.knotOffset;
+    const uint knotSize = segment.knotSize;
+
+    const uint p = uCurveDegree;
+    const uint2 domain = uint2( p, knotSize - 1 - p );
+    
+    // Remap x
+    const float t0 = bKnotsBuffer[knotOffset + domain[0]];
+    const float t1 = bKnotsBuffer[knotOffset + domain[1]];
+    const float x = t * ( t1 - t0 ) + t0;
+
+    // find k (knot interval) for the [x] value provided
+    uint k;
+    for ( k = domain[0]; k < domain[1]; ++k )
+    {
+        if ( x >= bKnotsBuffer[knotOffset + k] && x <= bKnotsBuffer[knotOffset + k + 1] )
+        {
+            break;
+        }
+    }
+
+    // r goes from 1 to the curve degree + 1
+    for ( uint r = 1; r <= p + 1; r++ )
+    {
+        for ( uint i = k; i > k - p - 1 + r; --i )
+        {
+            float a = ( x - bKnotsBuffer[knotOffset + i] ) / ( bKnotsBuffer[knotOffset + i + p + 1 - r] - bKnotsBuffer[knotOffset + i] );
+            // interpolate
+            gCache[localCacheID + i] = ( 1.0f - a ) * gCache[localCacheID + i - 1] + a * gCache[localCacheID + i];
+        }
+    }
+
+    return gCache[localCacheID + k];
+}
+
+vec4 evaluatePoint(float t, CurveSegment segment, uint localCacheID)
+{
+    // initialize local cache
+    for ( uint i = 0; i < segment.size; ++i )
+    {
+        gCache[localCacheID + i] = bPointsBuffer[segment.offset + i];
+    }
+    return evaluateCache( t, segment, localCacheID );
+}
+
+vec3 evaluateColor(float t, CurveSegment segment, uint localCacheID)
+{
+    // initialize local cache
+    for ( uint i = 0; i < segment.size; ++i )
+    {
+        gCache[localCacheID + i] = vec4(bVertexColorsBuffer[segment.offset + i], 1.0f);
+    }
+    return evaluateCache( t, segment, localCacheID ).xyz;
+}
+
+COMPUTE(MAX_THREAD_COUNT, 1, 1)
+{
+    if ( DISPATCH_THREAD_ID.x >= uNumSegments )
+    { return; }
+
+    // Each thread processes one segment
+    CurveSegment segment = bSegmentsBuffer[DISPATCH_THREAD_ID.x];
+    HairStrand strand = bStrandsBuffer[DISPATCH_THREAD_ID.x];
+    uint localCacheID = GROUP_THREAD_ID.x * MAX_SPLINE_CONTROL_POINT;
+    
+    uint offset = strand.offset;
+    for ( uint i = 0; i < strand.size; ++i )
+    {
+        float t = float(i) / float(strand.size - 1);
+        vec4 p = evaluatePoint( t, segment, localCacheID );
+        vec3 c = evaluateColor( t, segment, localCacheID );
+    
+        HairVertex v;
+        v.position = p.xyz;
+        v.radius = p.w * 0.5;
+        v.t = t;
+        v.color = c;
+        bEvaluatedBuffer[offset + i] = v;
+    }
+}

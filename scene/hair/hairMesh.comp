@@ -1,0 +1,64 @@
+#ifndef MSET_HAIR_MESH_COMP
+#define MSET_HAIR_MESH_COMP
+
+struct	VertexStandard
+{
+	packed_vec3 position;
+	uint tangent;
+	uint normal;
+    packed_vec2 texcoord;
+};
+
+uint2 asuint_packed_vec2( packed_vec2 v )
+{
+	return uint2( asuint(v.x), asuint(v.y) );
+}
+
+uint3 asuint_packed_vec3( packed_vec3 v )
+{
+	return uint3( asuint(v.x), asuint(v.y), asuint(v.z) );
+}
+
+VertexStandard makeVertexStandard( vec3 position, uint tangent, uint normal, vec2 texcoord )
+{
+    VertexStandard v;
+    v.position = packed_vec3( position.x, position.y, position.z );
+    v.tangent = tangent;
+    v.normal = normal;
+    v.texcoord = packed_vec2( texcoord.x, texcoord.y );
+    return v;
+}
+
+uint establishHandedness( vec3 tangent, vec3 bitangent, vec3 normal )
+{
+	float det = determinant( float3x3( tangent, bitangent, normal ) );
+	return det >= 0.0 ? 1 : 0;
+}
+
+uint packVector( vec3 normal )
+{
+	uint packed;
+
+	float nx = ((normal.x*0.5) + 0.5) * 1022.f;
+	float ny = ((normal.y*0.5) + 0.5) * 1022.f;
+	float nz = ((normal.z*0.5) + 0.5) * 1022.f;
+
+	int ux = int(nx);
+	int uy = int(ny);
+	int uz = int(nz);
+
+	packed  = ux;
+	packed |= uy << 10;
+	packed |= uz << 20;
+
+	return packed;
+}
+
+uint packVector( vec3 normal, uint w )
+{
+	uint packed = packVector( normal );
+	packed |= ( w & 0x3 ) << 30;
+	return packed;
+}
+
+#endif
