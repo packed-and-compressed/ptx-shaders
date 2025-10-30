@@ -1,0 +1,37 @@
+#ifndef MSET_DITHER_LDS_BLUE_NOISE_COMP
+#define MSET_DITHER_LDS_BLUE_NOISE_COMP
+
+uniform float4 uDitherLdsParams; // x: Frame number, yzw: Scale
+USE_TEXTURE2D_NOSAMPLER(tDitherLdsBlueNoise);
+
+#define GOLDEN_RATIO_CONJUGATE (0.61803398875f)
+
+/**
+* Generate three components of low discrepancy blue noise in image-space.
+* Blue noise texture from Christoph Peters at: http://momentsingraphics.de/BlueNoise.html
+*/
+float3 ditherLdsBlueNoise(float3 c, uint2 position)
+{
+    float3 scale = uDitherLdsParams.yzw;
+
+    // Load a blue noise value from texture
+    float3 rnd = imageLoad( tDitherLdsBlueNoise, uint2(position) % 256 ).rgb;
+
+    // Generate a low discrepancy sequence
+    rnd = frac(rnd + GOLDEN_RATIO_CONJUGATE * ((uint(uDitherLdsParams.x) - 1) % 16));
+
+    // Generate triangle distribution from sampled blue noise
+    //float3 orig = rnd * 2.0f - 1.0f;
+    //rnd = max(-1.0f, orig / sqrt(abs(orig)));
+    //rnd = rnd - sign(orig) + 0.5f;
+
+    // D3D rounds when converting from FLOAT to UNORM
+    // Shift the random values from [0, 1] to [-0.5, 0.5]
+    rnd -= 0.5f;
+
+    // Scale the noise magnitude, values are in the range [-scale/2, scale/2]
+    // The scale should be determined by the precision (and therefore quantization amount) of the target image's format
+    return c + (rnd * scale);
+}
+
+#endif

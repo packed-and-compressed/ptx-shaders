@@ -1,0 +1,44 @@
+#ifndef MSET_DISPATCH_SWIZZLE_COMP
+#define MSET_DISPATCH_SWIZZLE_COMP
+
+//2D thread-group ID swizzle into 8x8 tiles
+//implementation based on: https://github.com/GPUOpen-Effects/FidelityFX-Denoiser/blob/master/ffx-shadows-dnsr/ffx_denoiser_shadows_util.h
+//why it's useful: https://developer.nvidia.com/blog/optimizing-compute-shaders-for-l2-locality-using-thread-group-id-swizzling/
+
+uint bitfieldExtract( uint src, uint off, uint bits )
+{
+    uint mask = (1u << bits) - 1;
+    return (src >> off) & mask;
+}
+
+uint bitfieldInsert( uint src, uint ins, uint bits )
+{
+    uint mask = (1u << bits) - 1;
+    return (ins & mask) | (src & (~mask));
+}
+
+//  LANE TO 8x8 MAPPING
+//  ===================
+//  00 01 08 09 10 11 18 19 
+//  02 03 0a 0b 12 13 1a 1b
+//  04 05 0c 0d 14 15 1c 1d
+//  06 07 0e 0f 16 17 1e 1f 
+//  20 21 28 29 30 31 38 39 
+//  22 23 2a 2b 32 33 3a 3b
+//  24 25 2c 2d 34 35 3c 3d
+//  26 27 2e 2f 36 37 3e 3f 
+uint2 swizzleLane8x8( uint lane )
+{
+	uint2 swz;
+	swz.x = bitfieldInsert( bitfieldExtract(lane, 2u, 3u), lane, 1u );
+	swz.y = bitfieldInsert( bitfieldExtract(lane, 3u, 3u), bitfieldExtract(lane, 1u, 2u), 2u );
+	return swz;
+}
+
+#define DISPATCH_THREAD_ID_8x8 \
+    ( GROUP_ID.xy * 8 + swizzleLane8x8( GROUP_INDEX ) )
+
+#define GROUP_THREAD_ID_8x8 \
+	( swizzleLane8x8( GROUP_INDEX ) )
+    
+#endif

@@ -1,0 +1,17 @@
+#ifndef MSET_RNG_HYBIRD_COMP
+#define MSET_RNG_HYBRID_COMP
+
+#include "rng.comp"
+
+USE_TYPEDTEXTURE2D_NOSAMPLER(uint, tRNGHistory);
+
+uniform uint4 uRNGParams;
+uniform uint4 uRNGParamsPrev;
+
+uint4 rngLoadHybrid( uint2 coord )
+{
+    uint historyBit = imageLoad( tRNGHistory, coord ).x;
+    return historyBit ? uRNGParamsPrev : uRNGParams;
+}
+
+#endif

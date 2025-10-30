@@ -1,0 +1,75 @@
+#ifndef MSET_LDSAMPLER_COMP
+#define MSET_LDSAMPLER_COMP
+
+//low discrepancy sampler
+//up to 256 dimensions, optimized for 1,2,4,8,16,32,64,128,256 spp
+//based on "A Low-Discrepancy Sampler that Distributes Monte Carlo Errors as a Blue Noise in Screen Space", Eirc Heitz et al.
+
+#include "rng.comp"
+
+uniform uint3 uLDSamplerParams; // {baseDim, sampleIndex, offset}
+
+USE_TEXTURE2D_NOSAMPLER(tLDSamplerSobol);
+USE_TEXTURE2D_NOSAMPLER(tLDSamplerScramble);
+USE_TEXTURE2D_NOSAMPLER(tLDSamplerRank);
+
+//private; do not call directly
+vec4 ldsRandVec4_Impl( uint2 screenCoord, uint dimension, uint sampleIndex, float offset )
+{
+	uint2 coord;
+	coord.x = ((screenCoord.x & 127)<<1) | ((dimension>>2) & 1);
+	coord.y = screenCoord.y & 127;
+
+	uint2 rank = uint2(imageLoad( tLDSamplerRank, coord ).xy * 255.0);
+	uint2 rankedSampleIndex = uint2(sampleIndex,sampleIndex) ^ rank;
+
+	uint4 sobol;
+	sobol.xy = uint2(imageLoad( tLDSamplerSobol, uint2( (dimension>>1)  , rankedSampleIndex.x ) ).xy * 255.0);
+	sobol.zw = uint2(imageLoad( tLDSamplerSobol, uint2( (dimension>>1)+1, rankedSampleIndex.y ) ).xy * 255.0);
+
+	uint4 scramble = uint4(imageLoad( tLDSamplerScramble, coord ) * 255.0);
+	sobol ^= scramble;
+
+	vec4 noise = ( vec4(sobol) + vec4(0.5,0.5,0.5,0.5) ) * (1.0/256.0);
+	return fract( noise + vec4(offset, offset, offset, offset) );
+}
+
+//dimension MUST be a multiple of 4 and baseDim+dimension MUST be <= 252 (256-4)
+vec4 ldsRandVec4( uint2 screenCoord, uint dimension )
+{
+	dimension += uLDSamplerParams.x;
+	return ldsRandVec4_Impl( screenCoord, dimension, uLDSamplerParams.y, asfloat(uLDSamplerParams.z) );
+}
+
+//dimension MUST be a multiple of 4
+bool ldsRandVec4( uint screenCoord, uint dimension, out vec4 noise )
+{
+	dimension += uLDSamplerParams.x;
+	if( dimension <= 252 /* 256-4 */ )
+	{
+		noise = ldsRandVec4_Impl( screenCoord, dimension, uLDSamplerParams.y, asfloat(uLDSamplerParams.z) );
+		return true;
+	}
+	else
+	{
+		noise = vec4(0.0, 0.0, 0.0, 0.0);
+		return false;
+	}
+}
+
+//dimension MUST be a multiple of 4
+vec4 ldsRandVec4( inout RNG rng, uint2 screenCoord, uint dimension )
+{
+	dimension += uLDSamplerParams.x;
+	if( dimension <= 252 /* 256-4 */ )
+	{
+		return ldsRandVec4_Impl( screenCoord, dimension, uLDSamplerParams.y, asfloat(uLDSamplerParams.z) );
+	}
+	else
+	{
+		//fall back to white noise
+		return rngNextVec4( rng );
+	}
+}
+
+#endif

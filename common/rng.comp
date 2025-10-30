@@ -1,0 +1,82 @@
+#ifndef MSET_RNG_H
+#define MSET_RNG_H
+
+/*
+	For best results, initialize RNG with some kind of integer (pixel) coordinates and an uniform seed value.
+	Good choices for seed include output of RandGenerator::randomInt() or some arbitrary large prime.
+
+	Example usage:
+		RNG rng = rngInit( ushort2(IN_POSITION.xy), uRandomSeed );
+		float r = rngNextFloat( rng );
+*/
+
+struct RNG
+{
+	uint s;
+};
+
+// Thomas Wang 32-bit hash function
+uint hashWang( uint seed )
+{
+	seed  = (seed ^ 61) ^ (seed >> 16);
+	seed *= 9;
+	seed  = seed ^ (seed >> 4);
+	seed *= 0x27d4eb2d;
+	seed  = seed ^ (seed >> 15);
+	return seed;
+}
+
+// Xorshift32 by George Marsaglia
+uint rngNext( inout RNG rng )
+{
+	rng.s ^= rng.s << 13;
+	rng.s ^= rng.s >> 17;
+	rng.s ^= rng.s << 5;
+	return rng.s;
+}
+
+RNG rngInit( uint s0, uint s1 )
+{
+	RNG rng;
+	rng.s = hashWang( s0 * 31 + s1 );
+	return rng;
+}
+
+RNG rngInit( ushort2 coord, uint seed )
+{
+	return rngInit( uint(coord.x) | (uint(coord.y)<<16), seed );
+}
+
+float rngNextFloat( inout RNG rng )
+{
+	uint u = 0x3f800000 | (rngNext(rng) >> 9);
+	return asfloat(u) - 1.0;
+}
+
+vec2 rngNextVec2( inout RNG rng )
+{
+	vec2 r;
+	r.x = rngNextFloat( rng );
+	r.y = rngNextFloat( rng );
+	return r;
+}
+
+vec3 rngNextVec3( inout RNG rng )
+{
+	vec3 r;
+	r.x = rngNextFloat( rng );
+	r.y = rngNextFloat( rng );
+	r.z = rngNextFloat( rng );
+	return r;
+}
+vec4 rngNextVec4( inout RNG rng )
+{
+	vec4 r;
+	r.x = rngNextFloat( rng );
+	r.y = rngNextFloat( rng );
+	r.z = rngNextFloat( rng );
+	r.w = rngNextFloat( rng );
+	return r;
+}
+
+#endif

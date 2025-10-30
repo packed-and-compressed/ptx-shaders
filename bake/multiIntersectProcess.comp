@@ -1,0 +1,31 @@
+#include "intersectionData.frag"
+#include "dither.frag"
+
+uniform uint2	uGroupMeshRange;
+uniform uint2	uSectorOrigin, uSectorEnd;
+uniform uint	uDither;
+
+USE_LOADSTORE_TEXTURE2D( float, tOutput, 0 );
+
+COMPUTE(8,8,1)
+{
+	uint2 pixelCoord = uSectorOrigin + DISPATCH_THREAD_ID.xy;
+	if( pixelCoord.x >= uSectorEnd.x || pixelCoord.y >= uSectorEnd.y )
+	{ return; }
+	
+	vec2 packedHit = loadPackedHit( pixelCoord ).xy;
+	
+	HINT_BRANCH
+	if( hitMatchesGroup( packedHit, uGroupMeshRange.x, uGroupMeshRange.y ) )
+	{
+		BakeHit hit;
+		if( loadIntersection( hit, pixelCoord, packedHit ) )
+		{
+			Process( hit );
+
+			if( uDither )
+			{ hit.output0.rgb = dither8bit( hit.output0.rgb, pixelCoord ); }
+			imageStore( tOutput, pixelCoord, Pack( hit.output0 ) );
+		}
+	}	
+}

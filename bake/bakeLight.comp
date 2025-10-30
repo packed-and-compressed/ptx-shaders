@@ -1,0 +1,53 @@
+#include "intersectionData.frag"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+//adapted from raytracing/output.comp, which I can't include
+//here because it declares many load/store outputs. -jdr
+uint makeOutputDesc( ushort2 coord )
+{
+    return uint(coord.x) | ( uint(coord.y)<<16 );
+}
+
+USE_INTERLOCKED_BUFFER(bCounters,0);
+USE_LOADSTORE_OBJECTINDEXBUFFER(bObjectIndices,1);
+USE_LOADSTORE_BUFFER(uint4,bIndirectHits,2);
+
+USE_BUFFER(uint,uIndexTranslationBuffer);
+
+uniform uint2	uGroupMeshRange;
+uniform uint2	uSectorOrigin, uSectorEnd;
+
+COMPUTE(8,8,1)
+{
+	//this shader converts bake hits into render ray hits,
+	//for use by the scenerender class. this allows
+	//for light baking, using toolbag's main renderer. -jdr
+	
+	uint2 pixelCoord = uSectorOrigin + DISPATCH_THREAD_ID.xy;
+	if( pixelCoord.x >= uSectorEnd.x || pixelCoord.y >= uSectorEnd.y )
+	{ return; }
+
+	vec2 packedHit = loadPackedHit( pixelCoord ).xy;
+
+	if( !hitMatchesGroup( packedHit, uGroupMeshRange.x, uGroupMeshRange.y ) )
+	{ return; }
+
+	BakeHit h;
+	if( loadIntersection( h, pixelCoord, packedHit ) )
+	{
+		uint index;
+		interlockedAdd( bCounters, RT_COUNTER_INDIRECTHITS, 1, index );
+
+		bObjectIndices[index] = uIndexTranslationBuffer[ h.hitMeshIndex ];
+	
+		RT_BUFFER0(bIndirectHits,index) = uint4(
+			makeOutputDesc( ushort2( DISPATCH_THREAD_ID.xy ) ),
+			~uint(0), //pathIndex
+			h.hitTriangleIndex,
+			packUnitVec2f( h.hitBarycenter.yz ) );
+
+		RT_BUFFER1(bIndirectHits,index) = uint4(
+			packVec2x3f( -h.hitNormal, vec3(1.0,1.0,1.0) ),
+			asuint( 1.0 ) );
+	}
+}

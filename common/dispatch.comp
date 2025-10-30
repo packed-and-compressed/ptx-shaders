@@ -1,0 +1,73 @@
+/*
+	This shader adjusts a single count (first int in the buffer)
+	into a 3-component count ready for compute shader dispatch.
+
+	This is useful in cases where one shader prepares a list
+	of elements and the resulting count needs to be used to
+	dispatch another shader with dispatchIndirect().
+*/
+
+USE_INTERLOCKED_BUFFER(bCounters,0);
+
+#ifdef DISPATCH_CALCARGS_OP
+	uniform uint3	uGroupSize;
+	uniform uint	uCountArgsOffset;
+	USE_INTERLOCKED_BUFFER(bArguments,1);
+#endif
+
+#ifdef DISPATCH_CLEAR_OP
+	#define NUM_THREADS 32
+	uniform uint	uClearOffset;
+	uniform uint	uClearCount;
+#else
+	#define NUM_THREADS 1
+#endif
+
+#define	MAX_GROUPS_PER_AXIS	65535
+
+uint	cdiv( uint a, uint b )
+{
+	//'conservative division' where result is always rounded up
+	uint r = a / b;
+	r += (r * b) < a ? 1 : 0;
+	return r;
+}
+
+COMPUTE(NUM_THREADS,1,1)
+{
+#ifdef DISPATCH_CALCARGS_OP
+#if NUM_THREADS > 1
+	if( DISPATCH_THREAD_ID.x == 0 )
+#endif
+	{
+		const uint total = interlockedLoad( bCounters, uCountArgsOffset );
+
+		uint3 r = uint3( cdiv( total, uGroupSize.x ), 1, 1 );
+		if( r.x > MAX_GROUPS_PER_AXIS )
+		{
+			uint f = cdiv( r.x, MAX_GROUPS_PER_AXIS );
+			r.x /= f;
+			r.y = cdiv( total, r.x * uGroupSize.x );
+			r.y = cdiv( r.y, uGroupSize.y );
+
+			if( r.y > MAX_GROUPS_PER_AXIS )
+			{
+				uint f = cdiv( r.y, MAX_GROUPS_PER_AXIS );
+				r.y /= f;
+				r.z = cdiv( total, r.x * uGroupSize.x * r.y * uGroupSize.y );
+				r.z = cdiv( r.z, uGroupSize.z );
+			}
+		}
+
+		interlockedStore3( bCounters,  uCountArgsOffset+1, r );
+		interlockedStore3( bArguments, uCountArgsOffset,   r );
+	}
+#endif
+
+#ifdef DISPATCH_CLEAR_OP
+	if( DISPATCH_THREAD_ID.x < uClearCount )
+	{
+		interlockedStore( bCounters, uClearOffset+DISPATCH_THREAD_ID.x, 0 );
+	}
+#endif
+}

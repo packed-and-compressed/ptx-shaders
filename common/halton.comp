@@ -1,0 +1,45 @@
+#ifndef MSET_HALTON_H
+#define MSET_HALTON_H
+
+//halton-23 sequence: a low descrepancy psuedorandom number generator
+//https://en.wikipedia.org/wiki/Halton_sequence
+vec2	halton23( uint v )
+{
+	vec2 result;
+
+	{
+		const uint base = 2;
+		float invBase = 1.0/2.0;
+		float invBaseN = 1.0;
+		uint inverse = 0;
+		uint value = v;
+		for( uint n; value > 0; value = n )
+		{
+			n = value / base;
+			uint d = value - n * base;
+			inverse = inverse * base + d;
+			invBaseN *= invBase;
+		}
+		result.x = float(inverse) * invBaseN;
+	}
+
+	{
+		const uint base = 3;
+		float invBase = 1.0/3.0;
+		float invBaseN = 1.0;
+		uint inverse = 0;
+		uint value = v;
+		for( uint n; value > 0; value = n )
+		{
+			n = value / base;
+			uint d = value - n * base;
+			inverse = inverse * base + d;
+			invBaseN *= invBase;
+		}
+		result.y = float(inverse) * invBaseN;
+	}
+
+	return result;
+}
+
+#endif

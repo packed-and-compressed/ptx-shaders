@@ -1,0 +1,74 @@
+#include "dilatePack.frag"
+
+#define GROUP_WIDTH	8
+
+USE_TEXTURE2D( tSource );
+USE_LOADSTORE_TEXTURE2D( float, tDestination, 0 );
+
+uniform int		uKernel;
+uniform int2	uImageSize;
+
+int2	wrap( int2 c )
+{
+	c.x =	(c.x >= uImageSize.x) ? c.x-uImageSize.x :
+			(c.x < 0) ? c.x+uImageSize.x :
+			c.x;
+	c.y =	(c.y >= uImageSize.y) ? c.y-uImageSize.y :
+			(c.y < 0) ? c.y+uImageSize.y :
+			c.y;
+	return c;
+}
+
+void	checkSample(	int2 centerCoord, int2 k,
+						inout int2 bestFind, inout uint bestFindFlags, inout float bestDistanceSquared )
+{
+	uint ld = asuint( imageLoad( tSource, wrap( centerCoord + k ) ).x );
+	if( ld & DILATION_SOLID )
+	{
+		int2 offset = k + unpackDilationOffset( ld );
+		float d2 = dot( vec2(offset), vec2(offset) );
+		if( d2 < bestDistanceSquared )
+		{
+			bestFind = offset;
+			bestFindFlags = ld & DILATION_SOLID;
+			bestDistanceSquared = d2;
+		}
+	}
+}
+
+//implementation of the Jump Flooding Algorithm (https://en.wikipedia.org/wiki/Jump_flooding_algorithm)
+COMPUTE(GROUP_WIDTH,GROUP_WIDTH,1)
+{
+	int2 pixelCoord = int2( DISPATCH_THREAD_ID.xy );
+	if( pixelCoord.x >= uImageSize.x || pixelCoord.y >= uImageSize.y )
+	{ return; }
+
+	uint sourceLoad = asuint( imageLoad( tSource, pixelCoord ).x );
+
+	int2 bestFind = unpackDilationOffset( sourceLoad );
+	uint bestFindFlags = sourceLoad & DILATION_SOLID;
+	float bestDistanceSquared = 1e20;
+	if( bestFindFlags & DILATION_SOLID )
+	{
+		bestDistanceSquared = dot( vec2(bestFind), vec2(bestFind) );
+	}
+
+	HINT_BRANCH
+	if( bestDistanceSquared > 0.0 )
+	{
+		//check 8 neighbors over sample kernel, taking the closest one if it's an improvement
+		checkSample( pixelCoord, int2(-uKernel, -uKernel), bestFind, bestFindFlags, bestDistanceSquared );
+		checkSample( pixelCoord, int2( 0,       -uKernel), bestFind, bestFindFlags, bestDistanceSquared );
+		checkSample( pixelCoord, int2( uKernel, -uKernel), bestFind, bestFindFlags, bestDistanceSquared );
+
+		checkSample( pixelCoord, int2(-uKernel,  0      ), bestFind, bestFindFlags, bestDistanceSquared );
+		checkSample( pixelCoord, int2( uKernel,  0      ), bestFind, bestFindFlags, bestDistanceSquared );
+
+		checkSample( pixelCoord, int2(-uKernel,  uKernel), bestFind, bestFindFlags, bestDistanceSquared );
+		checkSample( pixelCoord, int2( 0,        uKernel), bestFind, bestFindFlags, bestDistanceSquared );
+		checkSample( pixelCoord, int2( uKernel,  uKernel), bestFind, bestFindFlags, bestDistanceSquared );
+	}
+
+	uint packed = packDilation(bestFind,bestFindFlags);
+	imageStore( tDestination, uint2(pixelCoord), vec4( asfloat(packed), 0,0,0 ) );
+}

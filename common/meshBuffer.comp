@@ -1,0 +1,39 @@
+#ifndef MSET_MESH_BUFFER_H
+#define MSET_MESH_BUFFER_H
+
+#include "util.sh"
+#include "texcoord.sh"
+
+uint vertexIndexToMeshBufferOffset( uint vertexIndex, bool packed )
+{
+	if( packed )
+	{
+		return vertexIndex * 6;
+	}
+	else
+	{
+		return vertexIndex * 7;
+	}
+}
+
+uint vertexIndexToMeshBufferOffset( uint vertexIndex, float2 packedUVOffsets )
+{
+	return vertexIndexToMeshBufferOffset( vertexIndex, areUVsPacked( packedUVOffsets ) );
+}
+
+uint applyTangentOffsetToMeshBufferOffset( uint meshBufferOffset )
+{
+	return meshBufferOffset + 3;
+}
+
+uint applyUVOffsetToMeshBufferOffset( uint meshBufferOffset )
+{
+	return meshBufferOffset + 5;
+}
+
+float	unpackHandednessRaw( uint p )
+{
+	return float((p >> 30) & 0x3);
+}
+
+#endif

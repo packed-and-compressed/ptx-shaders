@@ -1,0 +1,51 @@
+#ifndef MSET_LDSAMPLER_HYBRID_COMP
+#define MSET_LDSAMPLER_HYBRID_COMP
+
+#include "data/shader/common/ldsampler.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/common.comp"
+
+uint ldsBaseDimension(
+	const uint		bounce,
+	const ushort	hybridPass )
+{
+	if (bounce == 0)
+	{
+		return 0;
+	}
+
+	// we have to make sure the dimension we access is correctly aligned for the bounce index and also hybrid pass that we are
+	// working on for the secondary hit, i.e. diffuse GI second bounce should have the same dimension and not overlap with
+	// specular or refraction
+	const uint secondaryBounce = uint( max( int( bounce ) - 1, 0 ) );
+	const uint hybridPassIdx = uint( max( int( hybridPass ) - 1, 0 ) );
+	return HYBRID_SAMPLE_PRIMARY_COUNT +
+			( HYBRID_SAMPLE_SECONDARY_COUNT * HYBRID_INDIRECT_PASS_COUNT * secondaryBounce ) +
+			( HYBRID_SAMPLE_SECONDARY_COUNT * uint( hybridPassIdx ) );
+}
+
+//dimension MUST be a multiple of 4
+vec4 ldsRandHybridVec4(
+	inout RNG	 rng,
+	const uint2  screenCoord,
+	uint		 dimension,
+	const uint	 bounce,
+	const ushort hybridPass,
+	const uint3  ldsParams )
+{
+	// we have to check the force fallback we have implemented on the host, if our sample index have exceeded
+	// 256, then we fall back to base dimension of 256, and hence we use LCG random numbers instead of LDS
+	const uint baseDimension = ldsParams.x < 256 ? ldsBaseDimension( bounce, hybridPass ) : 256;
+	dimension += baseDimension;
+	if( dimension <= 252 /* 256-4 */ )
+	{
+		return ldsRandVec4_Impl( screenCoord, dimension, ldsParams.y, asfloat( ldsParams.z ) );
+	}
+	else
+	{
+		//fall back to white noise
+		return rngNextVec4( rng );
+	}
+}
+
+#endif
