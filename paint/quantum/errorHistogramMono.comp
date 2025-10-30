@@ -1,0 +1,29 @@
+USE_TEXTURE2D(tTex1);
+USE_TEXTURE2D(tTex2);
+USE_TEXTURE2D(tLevelTex);
+
+USE_INTERLOCKED_BUFFER(bHistogram,0);
+
+COMPUTE(16,16,1)
+{
+	//check bounds
+	uint2 size; uint mipCount;
+	imageSize2D( tTex1, size.x, size.y, mipCount );
+	if( DISPATCH_THREAD_ID.x >= size.x || DISPATCH_THREAD_ID.y >= size.y )
+	{ return; }
+
+	//load color
+	vec4 v1 = imageLoad(tTex1, DISPATCH_THREAD_ID.xy);
+	vec4 v2 = imageLoad(tTex2, DISPATCH_THREAD_ID.xy);
+	vec4 tLevel = imageLoad(tLevelTex, DISPATCH_THREAD_ID.xy);
+	float difff = (v1.x*255.0-v2.x*255.0);
+	uint diff = uint( difff*difff );
+	
+	//convert color to integer bin value
+	uint bin = uint( floor( tLevel.x * 255.0 + 0.5 ) );
+	
+	//increment histogram values
+	uint prev;
+	interlockedAdd( bHistogram, bin * 2, diff, prev );
+	interlockedAdd( bHistogram, bin * 2+1, 1, prev );
+}
