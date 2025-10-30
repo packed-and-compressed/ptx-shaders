@@ -1,0 +1,33 @@
+#include "mesh.comp"
+
+USE_INTERLOCKED_BUFFER(bOutput,0);			//output index buffer
+uniform uint uWidth;		//just used for mapping thread IDs to tri index
+uniform uint uIndexCount;
+uniform uint uStartIndex;
+COMPUTE(16,16,1)
+{
+	uint triIndex = DISPATCH_THREAD_ID.x + DISPATCH_THREAD_ID.y * uWidth;
+	if(triIndex >= uIndexCount/3)
+	{ return; }
+	
+	uint3 verts = loadTriangle( triIndex + uStartIndex/3 );
+	Vertex v1 = loadVertex(verts.x);
+	Vertex v2 = loadVertex(verts.y);
+	Vertex v3 = loadVertex(verts.z);
+	
+	//TODO:  support UV outside of [0, 1]
+	vec2 uvmin = saturate(min(v1.texcoord, min(v2.texcoord, v3.texcoord)));
+	vec2 uvmax = saturate(max(v1.texcoord, max(v2.texcoord, v3.texcoord)));
+	int2 imin = int2(uvmin * vec2(3.999999, 7.999999));
+	int2 imax = int2(uvmax * vec2(3.999999, 7.999999));
+	int hit = 0;
+	int mask = 0;
+	for(int y = imin.y; y <= imax.y; y++)
+		for(int x = imin.x; x <= imax.x; x++)
+		{
+			int idx = x + y * 4;
+			mask = mask | (1 << idx);	//add this sector to our bitmask
+		}
+	
+	interlockedStore( bOutput, triIndex, mask);
+}

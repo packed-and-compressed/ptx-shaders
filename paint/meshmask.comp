@@ -1,0 +1,56 @@
+#include "mesh.comp"
+
+USE_LOADSTORE_BUFFER(uint, bOutput,0);			//output index buffer
+USE_INTERLOCKED_BUFFER(bOutputIndex,1);		//index for our output buffer
+
+uniform int		uSparseData[DIVISIONS_X * DIVISIONS_Y];					//sparse data (1 byte per division)
+uniform uint	uWidth;		//just used for mapping thread IDs to tri index
+uniform uint	uIndexCount;
+uniform uint	uStartIndex;
+uniform float	uPadding;	//used when we need a more generous sparse mesh
+uniform vec2 	uUDIMTile;
+
+COMPUTE(16, 16, 1)
+{
+	uint triIndex = DISPATCH_THREAD_ID.x + DISPATCH_THREAD_ID.y * uWidth;
+	if(triIndex >= uIndexCount/3)
+	{ return; }
+	
+	uint3 verts = loadTriangle( triIndex + uStartIndex/3 );
+	Vertex v1 = loadVertex(verts.x);
+	Vertex v2 = loadVertex(verts.y);
+	Vertex v3 = loadVertex(verts.z);
+
+	bool visible = false;
+
+	if( (uint)floor(v1.texcoord.x) == (uint)uUDIMTile.x && (uint)floor(v1.texcoord.y) == (uint)uUDIMTile.y )
+	{ 
+		v1.texcoord = v1.texcoord - uUDIMTile;
+		v2.texcoord = v2.texcoord - uUDIMTile;
+		v3.texcoord = v3.texcoord - uUDIMTile;
+
+		//TODO:  support UV outside of [0, 1]
+		vec2 uvmin = saturate(min(v1.texcoord, min(v2.texcoord, v3.texcoord)) - uPadding);
+		vec2 uvmax = saturate(max(v1.texcoord, max(v2.texcoord, v3.texcoord)) + uPadding);
+		float eps = 0.0001;	//make sure we never end up at 1.0, or we'll overrun our array
+		int2 imin = int2(uvmin.x * float(DIVISIONS_X) - eps, uvmin.y * float(DIVISIONS_Y) - eps);
+		int2 imax = int2(uvmax.x * float(DIVISIONS_X) - eps, uvmax.y * float(DIVISIONS_Y) - eps);
+		int hit = 0;
+		for(int y = imin.y; y <= imax.y; y++)
+		{
+			for(int x = imin.x; x <= imax.x; x++)
+			{
+				if(uSparseData[x + (DIVISIONS_Y-1-y) * DIVISIONS_X] != 0)
+				{ visible = true; }
+			}
+		}
+	}
+	
+	//write out the visibility state of the tri and, if it's visible, increment the tri count buffer
+	bOutput[triIndex] = uint(visible);
+	if(visible)
+	{
+		uint prev;
+		interlockedAdd( bOutputIndex, 0, 1, prev );	//increment our tri count buffer
+	}
+}

@@ -1,0 +1,210 @@
+#include "../../common/const.sh"
+#include "../../common/rng.comp"
+
+#include "data/shader/common/udim.sh"
+#include "data/shader/common/globalTextures.sh"
+
+#define BINDLESS
+#ifdef SEAMLESS
+	#include "skirtPadding.sh"
+#endif
+
+uniform float	uHeightScale;
+uniform vec2	uStep;
+uniform uint	uStepCount;
+uniform float	uInvPassCount; // 1/count
+
+USE_SAMPLER( sNormalSampler );
+uniform uint	uNormalMaps[UDIM_MAX_TILES_IN_SHAPE];
+uniform uint2	uProjectShape;
+uniform vec2	uUDIMTile;
+uniform vec2	uBufferSize;
+
+USE_LOADSTORE_TEXTURE2D(float, tAOMap, 0);
+
+void	resolveUDIMValues( vec2 texCoord, uint2 shape, out uint mapIndex )
+{
+	uint arrayOffset;
+	if( calculateUDIMArrayOffset( texCoord.xy, shape.x, shape.y, arrayOffset ) )
+	{ mapIndex = uNormalMaps[arrayOffset]; }
+	else
+	{ mapIndex = 0; }
+}
+
+vec3	sampleNormals( vec2 coord, out bool valid )
+{
+	uint mapIndex;
+	resolveUDIMValues( coord, uProjectShape, mapIndex );
+
+	vec3 n = vec3( 0.0f, 0.0f, 1.0f );
+	valid = false;
+	if( mapIndex )
+	{
+		vec2 s =  textureWithSamplerLod( resourceByIndex( tGlobalTextures, mapIndex ), sNormalSampler, coord, 0.0 ).xy;
+		valid = (s.x + s.y > 0.0);
+
+		n.xy = 2.0 * s - vec2( 1.0, 1.0 );
+		n.z = sqrt( saturate( 1.0 - dot(n.xy,n.xy) ) );
+	}
+	return n;
+}
+
+COMPUTE(8, 8, 1)
+{
+	// discard out of bounds threads
+	if( DISPATCH_THREAD_ID.x >= uBufferSize.x || DISPATCH_THREAD_ID.y >= uBufferSize.y )
+	{ return; }
+
+	uint2 imageCoord = uint2(DISPATCH_THREAD_ID.x, DISPATCH_THREAD_ID.y);
+	vec2 fBufferCoord = vec2( DISPATCH_THREAD_ID.xy ) / uBufferSize;
+
+	//early out: skip pixels outside UV island
+	#ifdef SEAMLESS
+		uint bufferAddress;
+		int pixelMapIndex = getRasterPixelMapIndex( fBufferCoord + uUDIMTile, bufferAddress );
+		if( pixelMapIndex == 0 )
+		{
+			imageStore( tAOMap, imageCoord, vec4( 1.0, 1.0, 1.0, 1.0 ) );
+			return;
+		}
+	#endif
+
+	//sample normal map
+	vec2 centerCoord = fBufferCoord + uUDIMTile;
+	vec3 centerNormal;
+	{
+		#ifdef SEAMLESS
+			if( pixelMapIndex < 0 )
+			{
+				//if we're shading a skirt pixel, "teleport" to the
+				//other side of the UV seam.
+				RasterSkirtPixelDesc skirt = getRasterSkirtPixelDesc( pixelMapIndex, bufferAddress );
+				centerCoord = skirt.remoteUV;
+			}
+		#endif
+
+		bool validNormals;
+		centerNormal = sampleNormals( centerCoord, validNormals );
+		if( !validNormals )
+		{
+			//still not sampling a valid normal? default to "flat"
+			centerNormal = vec3(0.0,0.0,1.0);
+		}
+
+		centerNormal.xy *= uHeightScale;
+		centerNormal = normalize(centerNormal);
+	}
+
+	//determine step direction
+	vec2 step = uStep;
+	{
+		RNG rng = rngInit( uint(DISPATCH_THREAD_ID.x), uint(DISPATCH_THREAD_ID.y) );
+		float rotation = (2.0 * PI) * uInvPassCount * rngNextFloat(rng);
+		float sinTheta, cosTheta;
+		sincos( rotation, sinTheta, cosTheta );
+		step =	step.x * vec2(cosTheta,sinTheta) +
+				step.y * vec2(-sinTheta,cosTheta);
+	}
+
+	//sample a line, finding the highest horizon
+	vec2 coord = centerCoord;
+	vec2 stepItr = step;
+	float height = 0.0;
+	vec3 horizon = vec3(0,0,-1);
+	mat3 reorient = mat3( 1,0,0, 0,1,0, 0,0,1 );
+	for( uint s=0; s<uStepCount; ++s )
+	{
+		coord += stepItr;
+
+		bool validNormals;
+		vec3 n = sampleNormals( coord, validNormals );
+		
+		#ifdef SEAMLESS
+			if( !validNormals )
+			{
+				uint bufferAddress;
+				int ix = getRasterPixelMapIndex( coord, bufferAddress );
+				if( ix < 0 )
+				{
+					RasterSkirtPixelDesc skirt = getRasterSkirtPixelDesc( ix, bufferAddress );
+					coord = skirt.remoteUV;
+					float sinTheta, cosTheta;
+					sincos( -skirt.tangentRotation, sinTheta, cosTheta );
+					stepItr =	stepItr.x * vec2(cosTheta,sinTheta) +
+								stepItr.y * vec2(-sinTheta,cosTheta);
+
+					n = sampleNormals( coord, validNormals );
+
+					#ifdef TANGENT_REORIENTATION
+						mat3 r = transpose( getRasterSkirtReorientation( ix, bufferAddress ) );
+						reorient = mul( r, reorient );
+
+						if( mul( reorient, vec3(0,0,1) ).z < 0.8 )
+						{
+							//We simply reject UV seams with 'hard' edges, where
+							//the tangent space reorients abruptly off the normal plane.
+							//This avoids embarassing hard-to-fix artifacts in our
+							//tangent-space AO algorithm that are making everyone upset.
+							//Perhaps down the line a better method of solving this can
+							//be developed. -jdr
+							break;
+						}
+					#endif
+				}
+			}
+		#endif
+		
+		#ifdef TANGENT_REORIENTATION
+			vec2 gradient = n.z > 0.0 ? -n.xy / n.z : vec2(0,0);
+			float rise = dot( stepItr, gradient );
+			vec3 p = mul( reorient, vec3( stepItr.xy, rise ) );
+			height += p.z * uHeightScale;
+		#else
+			if( n.z > 0 )
+			{
+				vec2 gradient = -n.xy / n.z;
+				height += dot( stepItr, gradient ) * uHeightScale;
+			}
+		#endif
+
+		float heightAtten = sqrt( 1.0 - float(s)/float(uStepCount) );
+		vec3 h = normalize( vec3( float(s+1)*step, height * heightAtten ) );
+		if( h.z > horizon.z )
+		{ horizon = h; }
+	}
+
+	//compute visibility
+	float visibility;
+	{
+	#if 0
+		//HBAO (Bavoil et al)
+		vec3 directionV = vec3( normalize(step), 0.0 );
+		float sinH = horizon.z;
+		float sinT = -dot( centerNormal, directionV );
+		visibility = 1.0 - (sinH - sinT);
+
+	#else
+		//GTAO method (Jimenez et al)
+		vec2 stepUnit = normalize(step);
+		vec3 viewV = vec3( 0, 0, 1 );
+		vec3 directionV = vec3( stepUnit, 0.0 );
+		vec3 orthoDirectionV = directionV - dot( directionV, viewV ) * viewV;
+		vec3 axisV = cross( directionV, viewV );
+		vec3 projNormalV = centerNormal - axisV * dot( centerNormal, axisV );
+
+		float sgnN = sign( dot( orthoDirectionV, projNormalV ) );
+		float cosN = saturate( dot( projNormalV, viewV ) / length( projNormalV ) );
+		float n = sgnN * acos( cosN );
+
+		float h = n + clamp( acos( horizon.z ) - n, - PI / 2, PI / 2 );
+		visibility = length( projNormalV ) * ( cosN + 2.0 * h * sin( n ) - cos( 2.0 * h - n ) ) * 0.5;
+
+	#endif
+	}
+	
+	visibility *= uInvPassCount;
+	vec4 src = imageLoadRW( tAOMap, imageCoord );
+	
+	visibility += src.r * src.a; 
+	imageStore( tAOMap, imageCoord, vec4( visibility, visibility, visibility, 1.0 ) );
+}

@@ -1,0 +1,42 @@
+#include "../paint/layer/layernoise.sh"
+
+USE_TEXTURE2D_NOSAMPLER( tSmearUVTriangle );
+
+USE_LOADSTORE_TEXTURE2D(float, tIndexMap, 0);
+USE_INTERLOCKED_BUFFER(bCounter,1);
+
+uniform int2 uBufferSize;
+
+COMPUTE(8, 8, 1)
+{
+	// discard out of bounds threads
+	if( DISPATCH_THREAD_ID.x >= uBufferSize.x || DISPATCH_THREAD_ID.y >= uBufferSize.y )
+	{ return; }
+
+	uint2 imageCoord = uint2(DISPATCH_THREAD_ID.x, DISPATCH_THREAD_ID.y);
+	vec4 smearUVTriangle = imageLoad(tSmearUVTriangle, imageCoord);
+	if( smearUVTriangle.z > 0 )
+	{
+		//island raster pixel
+		uint mapIndex = 0;
+		interlockedAdd( bCounter, 0, 1, mapIndex );
+		int ivalue = ((int)mapIndex)+1;
+		float fvalue = asfloat(ivalue);
+		imageStore(tIndexMap, imageCoord, fvalue);
+	}
+	else if( smearUVTriangle.z < 0 )
+	{
+		//skirt pixel
+		uint mapIndex = 0;
+		interlockedAdd( bCounter, 1, 1, mapIndex );
+		int ivalue = ((int)mapIndex)+1;
+		float fvalue = asfloat(-ivalue);
+		imageStore(tIndexMap, imageCoord, fvalue);
+	}
+	else
+	{
+		//blank pixel
+		imageStore(tIndexMap, imageCoord, 0.0f);
+	}
+
+}

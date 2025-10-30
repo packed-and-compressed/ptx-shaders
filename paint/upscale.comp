@@ -1,0 +1,17 @@
+USE_TEXTURE2D( tSrc );
+USE_LOADSTORE_TEXTURE2D( float, tDst, 0 );
+
+uniform ivec2 uDstResolution;
+
+COMPUTE( 16, 16, 1 )
+{
+	if ( any( DISPATCH_THREAD_ID.xy >= uvec2( uDstResolution.xy ) ) )
+	{
+		// discard any thread out of texture bounds
+		return;
+	}
+
+	vec2 UV = vec2( DISPATCH_THREAD_ID.xy ) / vec2( uDstResolution );
+	vec4 srcColor = texture2DLod( tSrc, UV, 0.0 );
+    imageStore( tDst, DISPATCH_THREAD_ID.xy, srcColor );
+}

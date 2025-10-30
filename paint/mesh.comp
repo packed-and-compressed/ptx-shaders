@@ -1,0 +1,102 @@
+#ifndef MSET_MESH_COMP
+#define MSET_MESH_COMP
+
+#include <data/shader/common/meshBuffer.comp>
+#include <data/shader/common/tangentbasis.sh>
+
+//random mesh attribute access
+
+struct	Vertex
+{
+	vec3	position;
+	vec3	tangent;
+	vec3	bitangent;
+	vec3	normal;
+	vec2	texcoord;
+	vec2	texcoord2;
+	vec4	color;
+};
+
+USE_RAWBUFFER(bMeshVertices);
+USE_RAWBUFFER(bMeshIndices);
+uniform uint uMeshIndices16bit;
+uniform uint uMeshTriangleOffset;
+uniform uint uMeshFromCurves;
+uniform vec2 uMeshIntersectionTexCoord0Offsets;
+
+#ifdef MESH_VERTEX_COLOR
+USE_RAWBUFFER(bMeshVertexColors);
+uniform uint uMeshVertexColors;
+#endif
+
+Vertex	loadVertex( uint index )
+{
+	uint vindex = vertexIndexToMeshBufferOffset( index, uMeshIntersectionTexCoord0Offsets );
+	uint4 line1 = rawLoad4(bMeshVertices,vindex);
+	uint3 line2;
+	if( areUVsPacked( uMeshIntersectionTexCoord0Offsets ) )
+	{
+		line2.xy = rawLoad2(bMeshVertices,vindex+4);
+		line2.z = 0.0;
+	}
+	else
+	{
+		line2 = rawLoad3(bMeshVertices,vindex+4);
+	}
+
+	Vertex v;
+	v.position = asfloat(line1.xyz);
+	v.tangent = decodeUint101010NormalizedRaw(line1.w);
+
+	float handedness = unpackHandednessRaw(line1.w);
+	v.normal = decodeUint101010NormalizedRaw(line2.x);
+	v.bitangent = reconstructBitangent( v.tangent, v.normal, handedness );
+	if( areUVsPacked( uMeshIntersectionTexCoord0Offsets ) )
+	{
+		v.texcoord = decodeUVsRaw( line2.y, uMeshIntersectionTexCoord0Offsets );
+	}
+	else
+	{
+		v.texcoord = asfloat(line2.yz);
+	}
+
+	v.color = vec4(1.0,1.0,1.0,1.0);
+	v.texcoord2 = v.texcoord;
+
+	#ifdef MESH_VERTEX_COLOR
+	if( uMeshVertexColors )
+	{
+		uint c = rawLoad( bMeshVertexColors, index );
+		v.color.r = float((c    ) & 0xFF);
+		v.color.g = float((c>> 8) & 0xFF);
+		v.color.b = float((c>>16) & 0xFF);
+		v.color.a = float((c>>24)       );
+		v.color *= 1.0/255.0;
+	}
+	#endif
+
+	return v;
+}
+
+uint3	loadTriangle( uint index )
+{
+	index += uMeshTriangleOffset;
+	index += index + index;
+	if( uMeshIndices16bit )
+	{
+		//16-bit load
+		uint r = index & 1;
+		index >>= 1;
+		uint2 words = rawLoad2( bMeshIndices, index );
+		return	r > 0 ?
+				uint3( words.x >> 16, words.y & 0xFFFF, words.y >> 16 ) :
+				uint3( words.x & 0xFFFF, words.x >> 16, words.y & 0xFFFF );
+	}
+	else
+	{
+		//32-bit load
+		return rawLoad3( bMeshIndices, index );
+	}
+}
+
+#endif
