@@ -1,0 +1,13 @@
+#if defined(TraceAcceptFirstHit)
+#	define BVH_RESULT		bool
+#	define BVH_RETURN_HIT	return true
+#	define BVH_RETURN_MISS	return false
+#	define BVH_TCALL(func)	if( func ) { return true; }
+#else
+#	define BVH_RESULT		void
+#	define BVH_RETURN_HIT	return
+#	define BVH_RETURN_MISS	return
+#	define BVH_TCALL(func)	func
+#endif
+
+#include "bvhtrace2.comp"

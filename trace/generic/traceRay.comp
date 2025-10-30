@@ -1,0 +1,115 @@
+#include "bvhtrace.comp"
+
+#define RT_RAYTYPE_PRIMARY			0x02 //matches camera visible
+#define RT_RAYTYPE_PRIMARY_CURVES	0x04 //matches camera visible curves
+#define RT_RAYTYPE_SECONDARY		0x08 //matches shadow casters
+#define RT_RAYTYPE_BAKE				0xFF //matches all
+#define RT_RAYTYPE_ANY				0xFF //matches all
+
+typedef uint Traceable;
+#define      SceneTraceable                 ( ~uint(0) )
+
+#if defined(TraceObject)
+#define      ObjectTraceable( objectIndex ) ( objectIndex )
+#define      isObjectTraceable( traceable ) ( traceable != ~uint(0) )
+#endif
+
+struct Ray
+{
+    vec3  origin;
+    vec3  direction;
+    float minT, maxT;
+};
+
+struct RayHit
+{
+    uint  objectIndex;
+    uint  triangleIndex;
+    vec2  triangleCoords;
+    float distance;
+};
+
+struct RayPayload
+{
+#if defined(TraceTransparencyDither)
+	RNG rng;
+#endif
+#if defined(TraceSubsurfaceDiffusion)
+	uint hitIndices;
+#endif
+};
+
+bool traceRay( Traceable traceable, uint rayType, Ray ray,
+               inout RayPayload payload, out RayHit hit )
+{
+    BVHRayHit bvhHit;
+    bvhHit.coords = vec2( 0.0, 0.0 );
+    bvhHit.tmin = ray.minT;
+    bvhHit.tmax = ray.maxT;
+    bvhHit.triangleIndex = ~uint(0);
+    bvhHit.objectIndex = traceable;
+    bvhHit.flags = rayType;
+#if defined(TraceTransparencyDither)
+    bvhHit.rng = payload.rng;
+#endif
+#if defined(TraceSubsurfaceDiffusion)
+    bvhHit.hitIndices = payload.hitIndices;
+#endif
+
+    BVHRay bvhRay = buildRayBVH( ray.origin, ray.direction );
+
+#if defined(TraceObject)
+    bvhHit.objectFilter = isObjectTraceable( traceable );
+    HINT_BRANCH
+    if( bvhHit.objectFilter )
+    {
+		BVHSubmesh submesh = RT_BVHSubmeshRefs[bvhHit.objectIndex];
+		traverseBottomLevelBVH( bvhRay, bvhHit, submesh.meshIndex, submesh.submeshOffset );
+    }
+    else
+#endif
+    {
+        traverseTopLevelBVH( bvhRay, bvhHit );
+    }
+    
+#if defined(TraceTransparencyDither)
+    payload.rng = bvhHit.rng;
+#endif    
+#if defined(TraceSubsurfaceDiffusion)
+    payload.hitIndices = bvhHit.hitIndices;
+#endif
+
+    hit.objectIndex    = bvhHit.objectIndex;
+    hit.triangleIndex  = bvhHit.triangleIndex;
+    hit.triangleCoords = bvhHit.coords;
+    hit.distance       = bvhHit.tmax;
+    return hit.distance < ray.maxT;
+}
+
+bool traceRay( Traceable traceable, uint rayType, Ray ray,
+			   inout RNG rng, out RayHit hit )
+{
+	RayPayload payload;
+	#if defined(TraceTransparencyDither)
+		payload.rng = rng;
+	#endif
+	bool occluded = traceRay( traceable, rayType, ray, payload, hit );
+	#if defined(TraceTransparencyDither)
+		rng = payload.rng;
+	#endif
+	return occluded;
+}
+
+bool traceRay( Traceable traceable, uint rayType, Ray ray,
+               inout RayPayload payload )
+{
+    RayHit hit;
+	return traceRay( traceable, rayType, ray, payload, hit );
+}
+
+bool traceRay( Traceable traceable, uint rayType, Ray ray,
+			   inout RNG rng )
+{
+	RayHit hit;
+	return traceRay( traceable, rayType, ray, rng, hit );
+}

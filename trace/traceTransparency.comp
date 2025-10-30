@@ -1,0 +1,451 @@
+#include "../common/packed.sh"
+#include "../common/util.sh"
+#include "../common/globalTextures.sh"
+#include "../mat/layerBlendOperators.frag"
+#include "../mat/mesh.comp"
+
+#define tTransparencyAtlas tGlobalTextures
+#define tCompositorAtlas tGlobalTextures
+uniform uint uTransparencyAtlasBaseIndex;
+uniform uint uTransparencyAtlasCompositorBaseIndex;
+USE_SAMPLER(sTransparencySamplerRepeat);
+USE_SAMPLER(sTransparencySamplerClamp);
+
+USE_BUFFER(uint4,bTransparencySampleDescs);
+
+#if defined(TraceTransparencyLayers)
+USE_STRUCTUREDBUFFER(MeshBinding,bTransparencyMeshes);
+#endif //TraceTransparencyLayers
+
+#define TRANSPARENCY_SUBROUTINE_NONE	0x00
+#define TRANSPARENCY_SUBROUTINE_CUTOUT	0x01
+#define TRANSPARENCY_SUBROUTINE_DITHER	0x02
+
+#define TRANSPARENCY_FLAG_SAMPLEDESC	0x80000000
+#define TRANSPARENCY_FLAG_TRIPLANAR		0x40000000
+
+struct TransparencyFragmentState
+{
+	vec4 uv; //{UV0, UV1}
+	vec4 color;
+};
+
+#if defined(TraceTransparencyLayers)
+template<bool EnableUV0, bool EnableUV1, bool EnableVertexColor, bool HasBaseUV>
+void loadTransparencyVertexAttribs( inout TransparencyFragmentState fs, ushort layerModeData, vec2 hitCoord, uint objectIndex, uint triangleIndex )
+{
+	const bool baseHasPrimaryUVs   = HasBaseUV && !bool(layerModeData & 0x10); //valid UV0 in base?
+	const bool baseHasSecondaryUVs = HasBaseUV &&  bool(layerModeData & 0x10); //valid UV1 in base?
+	const bool needsPrimaryUVs     = bool(layerModeData & 0x04) && !baseHasPrimaryUVs;   //is UV0 bit set but we don't have valid UV0 in base?
+	const bool needsSecondaryUVs   = bool(layerModeData & 0x08) && !baseHasSecondaryUVs; //is UV1 bit set but we don't have valid UV1 in base?
+	const bool needsVertexColors   = (layerModeData & 0x03) == 2; //is vertex color mode?
+
+	if( needsPrimaryUVs || needsSecondaryUVs || needsVertexColors )
+	{
+		MeshBinding mesh = bTransparencyMeshes[objectIndex];
+		bool hasSecondaryUVs = mesh.triangleOffsetAndFlags & MESH_FLAG_SECONDARYUVS;
+		bool hasVertexColors = mesh.triangleOffsetAndFlags & MESH_FLAG_VERTEXCOLORS;
+
+		bool loadPrimaryUVs	  = EnableUV0 && needsPrimaryUVs;
+		bool loadSecondaryUVs = EnableUV1 && needsSecondaryUVs && hasSecondaryUVs;
+		bool loadVertexColors = EnableVertexColor && needsVertexColors && hasVertexColors;
+
+		if( loadPrimaryUVs || loadSecondaryUVs || loadVertexColors )
+		{
+			uint3 tri = loadTriangle( mesh, triangleIndex );
+			if( loadPrimaryUVs )
+			{
+				vec2 uv0 = meshLoadVertexTexcoord( mesh, tri.x );
+				vec2 uv1 = meshLoadVertexTexcoord( mesh, tri.y );
+				vec2 uv2 = meshLoadVertexTexcoord( mesh, tri.z );
+				fs.uv.xy = interpolateVertexAttribute( hitCoord, uv0, uv1, uv2 );
+				if( !HasBaseUV )
+				{
+					//fill UV1 with UV0 in case UV1 doesn't exist
+					fs.uv.zw = fs.uv.xy;
+				}
+			}
+			if( loadSecondaryUVs )
+			{
+				vec2 uv0 = meshLoadVertexSecondaryTexcoord( mesh, tri.x );
+				vec2 uv1 = meshLoadVertexSecondaryTexcoord( mesh, tri.y );
+				vec2 uv2 = meshLoadVertexSecondaryTexcoord( mesh, tri.z );
+				fs.uv.zw = interpolateVertexAttribute( hitCoord, uv0, uv1, uv2 );
+			}
+			if( loadVertexColors )
+			{
+				vec4 vc0 = meshLoadVertexColor( mesh, tri.x );
+				vec4 vc1 = meshLoadVertexColor( mesh, tri.y );
+				vec4 vc2 = meshLoadVertexColor( mesh, tri.z );
+				fs.color = interpolateVertexAttribute( hitCoord, vc0, vc1, vc2 );
+			}
+		}
+	}
+}
+
+void loadTransparencyVertexAttribsUV( inout TransparencyFragmentState fs, ushort layerModeData, vec2 hitCoord, uint objectIndex, uint triangleIndex )
+{
+	const bool EnableUV0         = true;
+	const bool EnableUV1         = true;
+	const bool EnableVertexColor = TraceTransparencyLayersVertexColor;
+	loadTransparencyVertexAttribs<EnableUV0, EnableUV1, EnableVertexColor, true>( fs, layerModeData, hitCoord, objectIndex, triangleIndex );
+}
+
+#if TraceTransparencyLayersMask
+float GetBlendingCoefficientMask( TransparencyFragmentState fs, uint compositorData, bool uvClamp, bool uvMirror )
+{
+	const uint maskMapOffset   = compositorData & 0xFFFFF;
+	const bool useSecondaryUVs = compositorData & 0x100000; //20th bit encodes UV set
+    
+	uint maskMapIndex = uTransparencyAtlasCompositorBaseIndex + maskMapOffset;
+    vec2 uv = useSecondaryUVs ? fs.uv.zw : fs.uv.xy;
+    if( uvMirror )
+    {
+        uv = wrapMirroredUV( uv );
+    }
+    if( uvClamp )
+    {
+        return textureWithSamplerLod( resourceByIndex( tCompositorAtlas, maskMapIndex ), sTransparencySamplerClamp, uv, 0.0 ).r;
+    }
+	else
+    {
+        return textureWithSamplerLod( resourceByIndex( tCompositorAtlas, maskMapIndex ), sTransparencySamplerRepeat, uv, 0.0 ).r;
+    }
+}
+#endif //TraceTransparencyLayersMask
+
+#if TraceTransparencyLayersVertexColor
+float GetBlendingCoefficientVertexColor( TransparencyFragmentState fs, uint compositorData )
+{
+    float value = 1.0;
+    switch( compositorData )
+    {
+		case 0: value = fs.color.r; break;
+		case 1: value = fs.color.g; break;
+		case 2: value = fs.color.b; break;
+		case 3: value = fs.color.a; break;
+	}
+    return value;
+}
+#endif // TraceTransparencyLayersVertexColor
+
+#if TraceTransparencyLayersHeight
+float GetBlendingCoefficientHeight( TransparencyFragmentState fs, ushort layerIndex, uint compositorData, bool uvClamp, bool uvMirror )
+{
+	const uint   heightMapOffset = compositorData & 0xFFFFF;
+	const ushort layerScale      = ushort( (compositorData >> 20) & 0x7F );
+	
+    uint heightMapIndex = uTransparencyAtlasCompositorBaseIndex + heightMapOffset;
+    vec2 uv = fs.uv.xy;
+    if( uvMirror )
+    {
+        uv = wrapMirroredUV( uv );
+    }
+    float value = 0.0;
+    if( uvClamp )
+    {
+        value = textureWithSamplerLod( resourceByIndex( tCompositorAtlas, heightMapIndex ), sTransparencySamplerClamp, uv, 0.0 ).r;
+    }
+	else
+    {
+        value = textureWithSamplerLod( resourceByIndex( tCompositorAtlas, heightMapIndex ), sTransparencySamplerRepeat, uv, 0.0 ).r;
+    }
+    return saturate( value * layerScale - layerIndex );
+}
+#endif //TraceTransparencyLayersHeight
+
+float GetBlendingCoefficient( TransparencyFragmentState fs, ushort layerModeData, ushort layerIndex, uint compositorData, bool uvClamp, bool uvMirror )
+{
+	ushort layerMode = layerModeData & 0x03;
+    switch( layerMode )
+    {
+		default: //should allow the compiler to optimize-out branch on layerMode when only one compositor type is enabled
+	#if TraceTransparencyLayersMask
+        case 1: // MATERIAL_LAYERING_MODE_MASK
+            return GetBlendingCoefficientMask( fs, compositorData, uvClamp, uvMirror );
+	#endif
+	#if TraceTransparencyLayersVertexColor
+        case 2: // MATERIAL_LAYERING_MODE_VERTEX_COLOR
+            return GetBlendingCoefficientVertexColor( fs, compositorData );
+	#endif
+	#if TraceTransparencyLayersHeight
+        case 3: // MATERIAL_LAYERING_MODE_HEIGHT
+            return GetBlendingCoefficientHeight( fs, layerIndex, compositorData, uvClamp, uvMirror );
+	#endif
+    }
+}
+
+float BlendAlphaValues( uint layerData, float source, in float dest, float blendingCoefficient )
+{
+	uint blendOperator = (layerData >> 27) & 0xF;
+    switch( blendOperator )
+    {
+        default:
+        case MATERIAL_LAYER_BLENDING_MODE_DISABLED:
+            return DisabledBlendOperator( source, dest, blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_STANDARD:
+            return AlphaBlendOperator( (float)1.0, dest, source * blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_ADD:
+            return AddBlendOperator( source, dest, blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_MULTIPLY:
+            return MultiplyBlendOperator( source, dest, blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_OVERLAY:
+            return OverlayBlendOperator( source, dest, blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_SCREEN:
+            return ScreenBlendOperator( source, dest, blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_DARKEN:
+            return DarkenBlendOperator( source, dest, blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_COLOR_DODGE:
+            return ColorDodgeBlendOperator( source, dest, blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_COLOR_BURN:
+            return ColorBurnBlendOperator( source, dest, blendingCoefficient );
+        case MATERIAL_LAYER_BLENDING_MODE_LINEAR_BURN:
+            return LinearBurnBlendOperator( source, dest, blendingCoefficient );
+    }
+}
+#endif //TraceTransparencyLayers
+
+void decodeTransparencyLayersInfo( uint data, out ushort layerDescOffset, out ushort layerModeData, out float threshold )
+{
+	layerDescOffset = ushort( data & 0x7FFF );
+	layerModeData = ushort( (data >> 15) & 0x1F );
+	threshold = float(data >> 20) / 4095.0;
+}
+
+vec2 sampleTransparencyUV( vec2 hitCoord, uint triangleIndex, uint transparencyIndex, uint objectIndex, uint3 sampleCoord, bool flagSampleDesc )
+{
+	vec2 uv = vec2( f16tof32(sampleCoord.x), f16tof32(sampleCoord.x>>16) ) * (1.0 - hitCoord.x - hitCoord.y)
+			+ vec2( f16tof32(sampleCoord.y), f16tof32(sampleCoord.y>>16) ) * hitCoord.x
+			+ vec2( f16tof32(sampleCoord.z), f16tof32(sampleCoord.z>>16) ) * hitCoord.y;
+	
+	bool flagClamp  = false;
+	bool flagMirror = false;
+
+	ushort layerDescOffset = 0;
+	ushort layerModeData = 0;
+	float  threshold = 0.5;
+
+	TransparencyFragmentState fs;
+	fs.uv    = vec4( uv, uv );
+	fs.color = vec4( 1.0, 1.0, 1.0, 1.0);
+	
+	uint baseTransparencyIndex = transparencyIndex;
+	if( flagSampleDesc )
+	{
+		uint4 desc = bTransparencySampleDescs[objectIndex];
+		
+	#if defined(TraceTransparencyUDIM)
+		if( (desc.x & 0xFFFF0000) == 0x7E000000 )
+		{
+			//UDIM mode
+			flagClamp = true;
+			short2 udimShape = short2( desc.x & 0xFF, (desc.x >> 8) & 0xFF );
+			short2 udimTile  = short2( floor( fs.uv.xy ) );
+			uv = frac( fs.uv.xy );
+			HINT_FLATTEN if( udimTile.x < udimShape.x && udimTile.y < udimShape.y )
+			{
+				//offset texture index based on UDIM tile (default out-of-bounds texture is at offset 0 so add 1)
+				transparencyIndex += 1 + udimTile.y * udimShape.x + udimTile.x;
+			}
+			baseTransparencyIndex += udimShape.x * udimShape.y;
+		}
+		else
+	#endif
+		{
+			//UV mode
+			flagClamp  = desc.x & 0x8000;
+			flagMirror = desc.x & 0x80000000;
+			uv = transformUV( fs.uv.xy, uint3( desc.x & 0x7FFF7FFF, desc.yz ) );
+			uv = flagMirror ? wrapMirroredUV( uv ) : uv;
+		}
+
+	#if defined(TraceTransparencyLayers)
+		decodeTransparencyLayersInfo( desc.w, layerDescOffset, layerModeData, threshold );
+	#endif
+	}
+
+	float finalAlpha;
+	uint  alphaMapIndex = uTransparencyAtlasBaseIndex + transparencyIndex;
+	if( flagClamp ) 
+	{
+		finalAlpha = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerClamp, uv, 0.0 ).r;
+	}
+	else
+	{
+		finalAlpha = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerRepeat, uv, 0.0 ).r;
+	}
+
+#if defined(TraceTransparencyLayers)
+	if( layerDescOffset > 0 )
+	{
+		loadTransparencyVertexAttribsUV( fs, layerModeData, hitCoord, objectIndex, triangleIndex );
+
+		uint layerDescIndex = objectIndex + layerDescOffset;
+		bool layerHasNext   = true;
+		for( ushort layerIndex = 0; layerHasNext; ++layerIndex, ++layerDescIndex )
+		{
+			transparencyIndex     = baseTransparencyIndex + 1;
+			baseTransparencyIndex = transparencyIndex;
+
+			uint4 desc = bTransparencySampleDescs[layerDescIndex];
+			uint  layerData = desc.w;
+			
+		#if defined(TraceTransparencyUDIM)
+			if( (desc.x & 0xFFFF0000) == 0x7E000000 )
+			{
+				//UDIM mode
+				flagClamp = true;
+				short2 udimShape = short2( desc.x & 0xFF, (desc.x >> 8) & 0xFF );
+				short2 udimTile  = short2( floor( fs.uv.xy ) );
+				uv = frac( fs.uv.xy );
+				HINT_FLATTEN if( udimTile.x < udimShape.x && udimTile.y < udimShape.y )
+				{
+					//offset texture index based on UDIM tile (default out-of-bounds texture is at offset 0 so add 1)
+					transparencyIndex += 1 + udimTile.y * udimShape.x + udimTile.x;
+				}
+				baseTransparencyIndex += udimShape.x * udimShape.y;
+			}
+			else
+		#endif
+			{
+				//UV mode
+				flagClamp  = desc.x & 0x8000;
+				flagMirror = desc.x & 0x80000000;
+				bool useSecondaryUVs = (layerData >> 26) & 0x01;
+				uv = transformUV( useSecondaryUVs ? fs.uv.zw : fs.uv.xy, uint3( desc.x & 0x7FFF7FFF, desc.yz ) );
+				uv = flagMirror ? wrapMirroredUV( uv ) : uv;
+			}
+
+			float layerAlpha;
+			uint  alphaMapIndex = uTransparencyAtlasBaseIndex + transparencyIndex;
+			if( flagClamp ) 
+			{
+				layerAlpha = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerClamp, uv, 0.0 ).r;
+			}
+			else
+			{
+				layerAlpha = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerRepeat, uv, 0.0 ).r;
+			}
+			
+			float blendingCoefficient = GetBlendingCoefficient( fs, layerModeData, layerIndex, layerData, flagClamp, flagMirror );
+			finalAlpha = BlendAlphaValues( layerData, layerAlpha, finalAlpha, blendingCoefficient );
+			layerHasNext = layerData & 0x80000000;
+		}
+	}
+#endif
+	return vec2( finalAlpha, threshold );
+}
+
+#if defined(TraceTransparencyTriplanar)
+struct TransparencyProjector
+{
+	packed_mat3x4 transform;
+	packed_mat3x4 rotation;
+};
+USE_STRUCTUREDBUFFER(TransparencyProjector,bTransparencyProjectors);
+
+#if defined(TraceTransparencyLayers)
+void loadTransparencyVertexAttribsTriplanar( inout TransparencyFragmentState fs, ushort layerModeData, vec2 hitCoord, uint objectIndex, uint triangleIndex )
+{
+	const bool EnableUV0         = TraceTransparencyLayersMask || TraceTransparencyLayersHeight;
+	const bool EnableUV1         = TraceTransparencyLayersMask;
+	const bool EnableVertexColor = TraceTransparencyLayersVertexColor;
+	loadTransparencyVertexAttribs<EnableUV0, EnableUV1, EnableVertexColor, false>( fs, layerModeData, hitCoord, objectIndex, triangleIndex );
+}
+#endif
+
+vec2 sampleTransparencyTriplanar( vec2 hitCoord, uint triangleIndex, vec3 Pobj, uint transparencyIndex, uint objectIndex, uint3 sampleCoord, bool flagSampleDesc )
+{
+	vec3 N0   = decodeUint101010NormalizedRaw( sampleCoord.x );
+	vec3 N1   = decodeUint101010NormalizedRaw( sampleCoord.y );
+	vec3 N2   = decodeUint101010NormalizedRaw( sampleCoord.z );
+	vec3 Nobj = N0 * saturate(1.0 - hitCoord.x - hitCoord.y) + N1 * hitCoord.x + N2 * hitCoord.y;
+
+	TransparencyProjector projector = bTransparencyProjectors[objectIndex];
+	vec3 P = mulPoint( unpack(projector.transform), Pobj );
+		 P = 0.5 * vec3(P.x, P.y, -P.z) + vec3(0.5, 0.5, 0.5);
+	mat3x4 projectorRotation = unpack(projector.rotation);
+	vec3 N = normalize( mulVec( submatrix3x3( projectorRotation ), Nobj ) );
+
+	vec2 uvX = P.zy * vec2( N.x > 0.0 ? 1.0 : -1.0, 1.0 );
+	vec2 uvY = P.xz * vec2( N.y > 0.0 ? 1.0 : -1.0, 1.0 );
+	vec2 uvZ = P.xy * vec2( N.z > 0.0 ? 1.0 : -1.0, 1.0 );
+
+	ushort layerDescOffset = 0;
+	ushort layerModeData = 0;
+	float  threshold = 0.5;
+
+	if( flagSampleDesc )
+	{
+		uint4 desc = bTransparencySampleDescs[objectIndex];
+		uvX        = transformUV( uvX, desc.xyz );
+		uvY        = transformUV( uvY, desc.xyz );
+		uvZ        = transformUV( uvZ, desc.xyz );
+
+		//always decode layers info for triplanar since it needs threshold even in non-layered case
+		decodeTransparencyLayersInfo( desc.w, layerDescOffset, layerModeData, threshold );
+	}
+
+	float fadeExp = col3_xyz(projectorRotation)[0];
+	vec3  fade    = pow( abs(N), fadeExp );
+		  fade   *= rcp( fade.x + fade.y + fade.z ); //normalize
+
+	uint  alphaMapIndex = uTransparencyAtlasBaseIndex + transparencyIndex;
+	vec3  alpha;
+	alpha.x = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerRepeat, uvX, 0.0 ).r;
+	alpha.y = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerRepeat, uvY, 0.0 ).r;
+	alpha.z = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerRepeat, uvZ, 0.0 ).r;
+
+	float finalAlpha = dot( alpha, fade );
+
+#if defined(TraceTransparencyLayers)
+	if( layerDescOffset > 0 )
+	{
+		TransparencyFragmentState fs;
+		fs.uv    = vec4( 0.0, 0.0, 0.0, 0.0 );
+		fs.color = vec4( 1.0, 1.0, 1.0, 1.0 );
+		
+		loadTransparencyVertexAttribsTriplanar( fs, layerModeData, hitCoord, objectIndex, triangleIndex );
+		
+		uint layerDescIndex = objectIndex + layerDescOffset;
+		bool layerHasNext   = true;
+		for( ushort layerIndex = 0; layerHasNext; ++layerIndex, ++layerDescIndex )
+		{
+			transparencyIndex++;
+
+			projector = bTransparencyProjectors[layerDescIndex];
+			P = mulPoint( unpack(projector.transform), Pobj );
+			P = 0.5 * vec3(P.x, P.y, -P.z) + vec3(0.5, 0.5, 0.5);
+			projectorRotation = unpack(projector.rotation);
+			N = normalize( mulVec( submatrix3x3( projectorRotation ), Nobj ) );
+
+			uvX = P.zy * vec2( N.x > 0.0 ? 1.0 : -1.0, 1.0 );
+			uvY = P.xz * vec2( N.y > 0.0 ? 1.0 : -1.0, 1.0 );
+			uvZ = P.xy * vec2( N.z > 0.0 ? 1.0 : -1.0, 1.0 );
+
+			uint4 desc = bTransparencySampleDescs[layerDescIndex];
+			uvX	       = transformUV( uvX, desc.xyz );
+			uvY	       = transformUV( uvY, desc.xyz );
+			uvZ	       = transformUV( uvZ, desc.xyz );
+
+			fadeExp = col3_xyz(projectorRotation)[0];
+			fade    = pow( abs(N), fadeExp );
+			fade   *= rcp( fade.x + fade.y + fade.z ); //normalize
+
+			alphaMapIndex = uTransparencyAtlasBaseIndex + transparencyIndex;
+			alpha.x = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerRepeat, uvX, 0.0 ).r;
+			alpha.y = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerRepeat, uvY, 0.0 ).r;
+			alpha.z = textureWithSamplerLod( resourceByIndex(tTransparencyAtlas,alphaMapIndex), sTransparencySamplerRepeat, uvZ, 0.0 ).r;
+			
+			float layerAlpha = dot( alpha, fade );
+
+			uint  layerData = desc.w;
+			float blendingCoefficient = GetBlendingCoefficient( fs, layerModeData, layerIndex, layerData, false, false );
+			finalAlpha = BlendAlphaValues( layerData, layerAlpha, finalAlpha, blendingCoefficient );
+			layerHasNext = layerData & 0x80000000;
+		}
+	}
+#endif //TraceTransparencyLayers
+	return vec2( finalAlpha, threshold );
+}
+#endif //TraceTransparencyTriplanar

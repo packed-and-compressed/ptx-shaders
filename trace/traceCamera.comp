@@ -1,0 +1,144 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/ldsampler.comp"
+#include "data/shader/common/colorspace.sh"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/lens/disklens.comp"
+#include "data/shader/scene/raytracing/lens/imagelens.comp"
+
+USE_INTERLOCKED_BUFFER(bCounters,0);
+USE_LOADSTORE_OBJECTINDEXBUFFER(bObjectIndices,1);
+USE_LOADSTORE_BUFFER(uint,bHitIndices,2);
+USE_LOADSTORE_BUFFER(uint4,bIndirectHits,3);
+
+#define RT_FEATURES_TEXTURE //enable feature output
+#define RT_RADIANCE_ATTACHMENT 4
+#define RT_FEATURES_ATTACHMENT 5
+#include "data/shader/scene/raytracing/output.comp"
+
+uniform uint	uCameraMode;
+uniform uint2	uScreenSize;
+uniform vec2	uInvScreenSize;
+uniform mat4	uInvView;
+uniform mat4	uInvProjection;
+uniform uint	uNoiseSeed;
+uniform uint	uOutputFeatures;
+uniform vec4	uLensParams;   //{ radius, focusDistance, invRatio, shape }
+uniform vec2	uLensRotation; //{ cos(angle), sin(angle) }
+
+#if defined(TraceMissBackdrop)
+	USE_TEXTURE2D(tBackdrop);
+	uniform mat4  uBackdropProjection;
+#endif
+
+#include "traceMiss.comp"
+
+COMPUTE(8,8,1)
+{
+	if( DISPATCH_THREAD_ID.x >= uScreenSize.x || DISPATCH_THREAD_ID.y >= uScreenSize.y )
+	{ return; }
+	
+	uint outputDesc    = makeOutputDesc( ushort2( DISPATCH_THREAD_ID.xy ), RT_RADIANCE_DIRECT );
+	vec2 screenCoord   = ( vec2(DISPATCH_THREAD_ID.xy) + vec2( 0.5, 0.5 ) ) * uInvScreenSize;
+	vec2 backdropCoord = screenCoord;
+			
+	RNG rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+
+#ifdef RENDERTARGET_Y_DOWN
+	vec2 ndcCoord = vec2( 2.0, -2.0 ) * ( screenCoord - vec2( 0.5, 0.5 ) );
+#else
+	vec2 ndcCoord = vec2( 2.0,  2.0 ) * ( screenCoord - vec2( 0.5, 0.5 ) );
+#endif
+	vec4 nearPlaneCoord = mulPoint( uInvProjection, vec3( ndcCoord, 0.0 ) );
+	
+	Ray ray;
+	ray.minT = 0.0;
+	ray.maxT = INFINITY;
+	if( uCameraMode == 0 )
+	{
+		//infinite perspective projection
+		ray.origin    = vec3( 0.0, 0.0, 0.0 );
+		ray.direction = normalize( nearPlaneCoord.xyz / nearPlaneCoord.w );
+
+		if( uLensParams.x > 0.0 )
+		{
+			vec4 r = ldsRandVec4( rng, DISPATCH_THREAD_ID.xy, 0 );
+			vec2 lensUV;
+			if( uLensParams.w > 0 )
+			{
+				lensUV = sampleLensDisk( r.xy, uLensParams.x );
+			}
+			else
+			{
+				vec2 uv = sampleLensImage( r, uLensParams.x );
+				lensUV.x = uv.x * uLensRotation.x - uv.y * uLensRotation.y;
+				lensUV.y = uv.x * uLensRotation.y + uv.y * uLensRotation.x;
+			}
+			lensUV.x *= uLensParams.z;
+
+			float focusT  = uLensParams.y * rcp( ray.direction.z );
+			vec3  focusP  = focusT * ray.direction;
+			
+			ray.origin    = vec3( lensUV, 0.0 );
+			ray.direction = normalize( focusP - ray.origin );
+
+			#if defined(TraceMissBackdrop)
+			{
+				vec4 backdropProj = mulPoint( uBackdropProjection, ray.direction );
+				backdropCoord = backdropProj.xy / backdropProj.w;
+				backdropCoord = 0.5 * vec2( backdropCoord.x + 1.0, -backdropCoord.y + 1.0 );
+			}
+			#endif
+		}
+	}
+	else
+	{
+		//ortho projection
+		ray.origin    = nearPlaneCoord.xyz;
+		ray.direction = vec3( 0.0, 0.0, -1.0 );
+	}
+
+	ray.origin    = mulPoint( uInvView, ray.origin ).xyz;
+	ray.direction = mulVec( uInvView, ray.direction );
+
+	RayHit hit;
+	RayPayload payload;
+	#if defined(TraceTransparencyDither)
+		payload.rng = rng;
+	#endif
+	if( traceRay( SceneTraceable, RT_RAYTYPE_PRIMARY, ray, payload, hit ) )
+	{
+		uint index;
+		interlockedAdd( bCounters, RT_COUNTER_INDIRECTHITS, 1, index );
+		bObjectIndices[index] = hit.objectIndex;
+		bHitIndices[index] = index;
+		RT_BUFFER0(bIndirectHits,index) = uint4( 
+			outputDesc,
+			~uint(0), //pathIndex
+			hit.triangleIndex,
+			packUnitVec2f( hit.triangleCoords ) );
+		RT_BUFFER1(bIndirectHits,index) = uint4(
+			packVec2x3f( ray.direction, vec3(1.0,1.0,1.0) ),
+			asuint( hit.distance ) );
+	}
+#if defined(TraceMiss)
+	else
+	{
+		vec3 missRadiance = TraceMiss( ray.direction );
+		#if defined(TraceMissBackdrop)
+		{
+			vec4 backdrop = texture2DLod( tBackdrop, backdropCoord, 0.0 );
+			missRadiance  = missRadiance * (1.0 - backdrop.a) + backdrop.rgb;
+		}
+		#endif
+		radianceStore( outputDesc, half4((half3)missRadiance, 0.0) );
+		if( uOutputFeatures )
+		{
+			ushort2 outputCoord = makeOutputCoord( outputDesc );
+			vec3 albedo = linearTosRGB( missRadiance );
+			featureStore( RT_FEATURE_ALBEDO, outputCoord, half4((half3)albedo, 0.0) );
+			featureStore( RT_FEATURE_NORMAL, outputCoord, half4(0.0, 0.0, 0.0, 0.0) );
+		}
+	}
+#endif
+}

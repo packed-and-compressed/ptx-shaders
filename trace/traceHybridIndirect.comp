@@ -1,0 +1,303 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/mat/state.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/common.comp"
+#include "data/shader/scene/raytracing/lights/distantlight.comp"
+#include "data/shader/scene/raytracing/lights/pointlight.comp"
+#include "data/shader/scene/raytracing/lights/skylight.comp"
+
+USE_BUFFER( uint4, bInPathStates0 );
+USE_BUFFER( uint4, bInPathStates1 );
+USE_BUFFER( uint, bRaysIdx );
+USE_BUFFER( uint, bSpatialHashCheckSum );
+
+USE_INTERLOCKED_BUFFER( bCounters, 0 );
+USE_LOADSTORE_BUFFER( uint4, bIntersections, 1 );
+USE_LOADSTORE_OBJECTINDEXBUFFER( bObjectIndices, 2 );
+USE_LOADSTORE_BUFFER( uint, bHitIndices, 3 );
+USE_LOADSTORE_BUFFER( uint4, bMisses, 4 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates0, 5 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates1, 6 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRGI, 7 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRSpecular, 8 );
+USE_LOADSTORE_BUFFER( uint4, bSpatialHashIndirectBuffer, 9 );
+USE_LOADSTORE_TEXTURE2D( float, tRefractionRadiance, 10 );
+#define RT_RADIANCE_ATTACHMENT 11
+#include "../scene/raytracing/output.comp"
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 12 );
+#endif
+
+uniform uint2 uScreenSize;
+uniform uint  uNoiseSeed;
+uniform float uDirectClamp;
+uniform float uIndirectClamp;
+
+uniform uint  uBounce;
+uniform uint3 uBounceCount;//{diffuse, specular, transmission}}
+
+void getPathStates(
+	const uint		pixelIdx,
+	inout uint4		pathState0, 
+	inout uint4		pathState1 )
+{
+	pathState0 = HYBRID_PATHSTATE_BUFFER( bInPathStates0, pixelIdx );
+	pathState1 = HYBRID_PATHSTATE_BUFFER( bInPathStates1, pixelIdx );
+}
+
+void writePathStates(
+	const uint		index,
+	inout uint4		pathState0, 
+	inout uint4		pathState1 )
+{
+	HYBRID_PATHSTATE_BUFFER( bPathStates0, index ) = pathState0;
+	HYBRID_PATHSTATE_BUFFER( bPathStates1, index ) = pathState1;
+}
+
+
+COMPUTE(64,1,1)
+{
+	uint2 numRays = interlockedLoad2( bCounters, HYBRID_COUNTER_GI_RAYS );
+	uint  id = 64 * numRays.y * DISPATCH_THREAD_ID.y + DISPATCH_THREAD_ID.x;
+	if( id >= numRays.x )
+	{
+		return;
+	}
+
+	const uint	outputDesc = HYBRID_RAY_BUFFER0( bRaysIdx, id );
+
+	if( ( outputDesc & RT_RAYFLAG_SUBSURFACE ) != 0 )
+	{
+		return;
+	}
+
+	const uint2 outputCoord = uint2( makeOutputCoord( outputDesc ) );
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+	
+	const ushort hybridPass = ushort( ( outputDesc & HYBRID_OUTPUT_TYPE ) >> 13 );
+	
+	uint4 pathState0, pathState1;
+	getPathStates( id, pathState0, pathState1 );
+
+	float		brdfPdf;
+	Ray			ray;
+	vec3		radiance;
+
+	uint4 restirData0 = uint4( 0, 0, 0, 0 );
+	if( hybridPass == HYBRID_DIFFUSE_GI || hybridPass == HYBRID_REFRACTION )
+	{
+		restirData0 = imageLoadRWArray( tReSTIRGI, outputCoord, 0 );
+		unpackVec2x3f( restirData0.xyz, ray.direction, radiance );
+		brdfPdf = asfloat( restirData0.w );
+	}
+	else if( hybridPass == HYBRID_SPECULAR )
+	{
+		restirData0 = imageLoadRWArray( tReSTIRSpecular, outputCoord, 0 );
+		unpackVec2x3f( restirData0.xyz, ray.direction, radiance );
+		brdfPdf = asfloat( restirData0.w );
+	}
+	ray.origin = asfloat( pathState1.xyz );
+
+	ray.minT = 0.0f;
+	ray.maxT = INFINITY;
+
+	if( length(ray.direction) == 0.0f )
+	{
+		return;
+	}
+
+	RayHit	   hit;
+	RayPayload payload;
+#if defined( TraceTransparencyDither )
+	payload.rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+#endif
+	const bool isOccluded = traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+	const float recordDist = isOccluded ? hit.distance : -1.0f;
+	const uint	packedCoords = packUnitVec2f( hit.triangleCoords );
+
+	if(isOccluded)
+	{
+		const uint pathBits = pathState0.w;
+		const bool hairBCSDF = (pathState0.w & HYBRID_PATH_HAIR) != 0;
+		bool continuePath = false;
+		if( ( pathBits & RT_PATHFLAG_TRANSMISSION ) != 0 )
+		{
+			continuePath |= ( uBounce < uBounceCount[2] );
+		}
+		else if( ( pathBits & RT_PATHFLAG_DIFFUSE ) != 0 )
+		{
+			continuePath |= ( uBounce < uBounceCount[0] );
+		}
+		else
+		{
+			continuePath |= ( uBounce < uBounceCount[1] );
+		}
+
+		if( continuePath )
+		{
+			int index;
+			interlockedAdd( bCounters, HYBRID_COUNTER_GI_HITS, 1, index );
+			bObjectIndices[index] = hit.objectIndex;
+			bHitIndices[index] = index;
+			HYBRID_INTERSECTION_BUFFER0( bIntersections, index ) = uint4( asuint( recordDist ), outputDesc, hit.triangleIndex, packedCoords );
+			writePathStates( index, pathState0, pathState1 );
+		}
+	}
+	else
+	{
+		uint index;
+		interlockedAdd( bCounters, HYBRID_COUNTER_MISS_DIFFUSE, 1, index );
+		bMisses[index] = uint4( outputDesc, pathState0.x, pathState0.y, pathState0.w );
+	}
+
+	if( brdfPdf < 1e-8f )
+	{
+		return;
+	}
+	const vec3	throughput = unpackVec4f( pathState0.xy ).xyz;
+	
+#if defined( SceneHasAreaLights ) || defined( SceneHasDistantLights )
+	LightSampleState ls;
+	ls.L = ray.direction;
+	ls.radiance = vec3( 0.0, 0.0, 0.0 );
+	// restrict max distance the light can be based on the bsdf indirect ray intersection
+	ls.distance = isOccluded ? hit.distance : INFINITY;
+	ls.pdf = 0.0;
+
+	vec3		indirectRadiance = vec3( 0.0, 0.0, 0.0 );
+	const uint	pathFlags = pathState0.w;
+	const bool	allowSkySampling = ( pathFlags & HYBRID_PATH_ALLOW_SKY_SAMPLE ) > 0;
+	const float pdfChooseDynamic = allowSkySampling ? uLightChoosePDF.y : uLightChoosePDF.z;
+
+	RNG rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+
+#ifdef SceneHasAreaLights
+	// trace and evaluate omni & spot lights
+	for( int i = 0; i < uLightCountPoint; ++i )
+	{
+		bool hasArea = i < 32 ? uLightAreaMask.x & ( 1u << i )
+							  : uLightAreaMask.y & ( 1u << ( i - 32 ) );
+		if( hasArea )
+		{
+			LightParamsRT lp = computePointLightParams( i, ray.origin );
+			float		  peval = saturate( maxcomp( lp.color ) );// probability of evaluation given fade factors
+			if( rngNextFloat( rng ) < peval )
+			{
+				lp.color *= rcp( peval );
+				evaluateLight_Point( lp, ray.origin, abs( ls.distance ), ls );
+			}
+		}
+	}
+
+	// hit light
+	if( ls.distance < INFINITY )
+	{
+		HINT_FLATTEN if( ls.pdf > 0.0 )
+		{
+			ls.pdf *= pdfChooseDynamic;
+			// this MIS function differs to RT because division by brdf pdf
+			// is already accounted for in path throughput
+			const vec3 radiancePoint = ls.radiance * misWeight( brdfPdf, ls.pdf );
+			HINT_FLATTEN
+			if( ls.distance >= 0.0 )
+			{
+				indirectRadiance += radiancePoint;
+			}
+		}
+	}
+	else
+#endif
+	{
+	#ifdef SceneHasDistantLights
+		//evaluate all distant lights
+		for( int i=uLightCountPoint; i<uLightCountTotal; ++i )
+		{
+			LightParamsRT lp = computeDistantLightParams( i, ray.origin );
+			evaluateLight_Distant( lp, ls );
+			HINT_FLATTEN if( ls.pdf > 0.0 )
+			{
+				ls.pdf *= pdfChooseDynamic;
+				// this MIS function differs to RT because division by brdf pdf 
+				// is already accounted for in path throughput
+				const vec3 radianceDistant = ls.radiance * misWeight( brdfPdf, ls.pdf );
+				indirectRadiance += radianceDistant;
+			}
+		}
+	#endif
+	}
+	
+	indirectRadiance *= throughput;
+
+	if( hybridPass == HYBRID_SPECULAR )
+	{
+	
+		vec3 result = radiance + indirectRadiance;
+		result = clamp( result, 0.0f, uIndirectClamp );
+		restirData0.xyz = packVec2x3f( ray.direction, result );
+		imageStoreArray( tReSTIRSpecular, outputCoord, 0, restirData0 );
+		return;
+	}
+
+	if( hybridPass == HYBRID_DIFFUSE_GI || hybridPass == HYBRID_REFRACTION )
+	{
+		bool	   addRadianceContribution = true;
+		if( hybridPass == HYBRID_REFRACTION )
+		{
+			const uint pathBits = pathState0.w;
+			const bool nonShadowCaster = ( ( pathBits & HYBRID_PATH_REFRACTION_NON_SHADOW_CAST ) > 0 );
+			const bool hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+			const bool hasRecordedSamplePt = ( ( pathBits & HYBRID_PATH_REFRACTION_SAMPLE_POINT ) > 0 );
+			// for refraction:
+			// 1. if we have recorded visible point and sample point already then this is a fully valid reservoir
+			//    and we just add the radiance to the current reservoir
+			// 2. if this is not a shadow caster object, then this is often used as a glass, and we know for sure
+			//    there is no TIR or transmission exit hit for this object, so we know that this is going to be 
+			//    the radiance contribution in the refracted image, i.e. other components in the scene, and so 
+			//    this is safe to add it to the reservoir
+			addRadianceContribution = addRadianceContribution && 
+				( ( nonShadowCaster && uBounce > 1 ) || 
+					( hasRecordedVisiblePt && hasRecordedSamplePt ) );
+		}
+	
+		if (addRadianceContribution)
+		{
+			vec3 result = radiance + indirectRadiance;
+			result = clamp( result, 0.0f, uIndirectClamp );
+			restirData0.xyz = packVec2x3f( ray.direction, result );
+			imageStoreArray( tReSTIRGI, outputCoord, 0, restirData0 );
+		}
+		else
+		{
+			if( hybridPass == HYBRID_REFRACTION )
+			{
+				vec4 currentRadiance = vec4( imageLoadRW( tRefractionRadiance, outputCoord ) );
+				currentRadiance += vec4( indirectRadiance, 0.0f );
+				currentRadiance = clamp( currentRadiance, 0.0f, 65504.0f );
+				currentRadiance = clamp( currentRadiance, 0.0f, uIndirectClamp );
+				imageStore( tRefractionRadiance, outputCoord, currentRadiance );
+			}
+		}
+
+		// have to fill in the rest of the direct light for diffuse into the radiance cache (direct light only a portion)
+		if( hybridPass == HYBRID_DIFFUSE_GI )
+		{
+			const uint cellIdx = bSpatialHashIndirectBuffer[pixelIdx].w;
+			if( uBounce < 2 && cellIdx != ~uint( 0 ) )
+			{
+				// throughput from previous bounce only (not counting the vertices before this)
+				vec3 radiance, previousThroughput;
+				unpackVec2x3f( bSpatialHashIndirectBuffer[pixelIdx].xyz, radiance, previousThroughput );
+				vec3 indirectDiffuseRadiance = previousThroughput * indirectRadiance;
+
+				// clamping
+				const float clampVal = uBounce == 0 ? uDirectClamp : uIndirectClamp;
+				indirectDiffuseRadiance = clamp( indirectDiffuseRadiance, vec3( 0, 0, 0 ), vec3( clampVal, clampVal, clampVal ) );
+
+				radiance += indirectDiffuseRadiance;
+				radiance = clamp( radiance, 0.0f, uIndirectClamp );
+				bSpatialHashIndirectBuffer[pixelIdx].xyz = packVec2x3f( radiance, previousThroughput );
+			}
+		}
+	}
+#endif
+}

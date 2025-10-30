@@ -1,0 +1,76 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+USE_BUFFER(uint4,bIndirectRays);
+
+USE_INTERLOCKED_BUFFER(bCounters,0);
+USE_LOADSTORE_OBJECTINDEXBUFFER(bObjectIndices,1);
+USE_LOADSTORE_BUFFER(uint,bHitIndices,2);
+USE_LOADSTORE_BUFFER(uint4,bIndirectHits,3);
+
+#define RT_RADIANCE_ATTACHMENT 4
+#include "data/shader/scene/raytracing/output.comp"
+
+uniform uint uNoiseSeed;
+
+COMPUTE(64,1,1)
+{
+	uint2 numRays = interlockedLoad2( bCounters, RT_COUNTER_INDIRECTRAYS );
+	uint id = 64 * numRays.y * DISPATCH_THREAD_ID.y + DISPATCH_THREAD_ID.x;
+	if( id >= numRays.x )
+	{ return; }
+	
+	uint4 rayData0 = RT_BUFFER0(bIndirectRays,id);
+	uint4 rayData1 = RT_BUFFER1(bIndirectRays,id);
+
+	Ray  ray;
+	vec3 rayRadiance;
+	unpackVec2x3f( rayData1.xyz, ray.direction, rayRadiance );
+	ray.origin = asfloat(rayData0.xyz);
+	ray.minT   = 0.0;
+	ray.maxT   = INFINITY;
+
+	uint outputDesc      = rayData0.w;	
+	bool isShadowCatcher = outputDesc & RT_RAYFLAG_SHADOWCATCHER;
+	bool isOccluded      = false;
+	
+	RayHit hit;
+	RayPayload payload;
+	#if defined(TraceTransparencyDither)
+		payload.rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+	#endif
+	isOccluded = traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+	if( isOccluded )
+	{
+		uint index;
+		interlockedAdd( bCounters, RT_COUNTER_INDIRECTHITS, 1, index );
+		bObjectIndices[index] = hit.objectIndex;
+		bHitIndices[index] = index;
+		RT_BUFFER0(bIndirectHits,index) = uint4( 
+			outputDesc,
+			id, //pathIndex
+			hit.triangleIndex,
+			packUnitVec2f( hit.triangleCoords ) );
+		RT_BUFFER1(bIndirectHits,index) = uint4(
+			packVec2x3f( ray.direction, vec3(1.0,1.0,1.0) ),
+			asuint( hit.distance ) );
+	}
+
+	if( isShadowCatcher )
+	{
+		//shadow catcher: modulate by shadow opacity if occluded
+		if( isOccluded )
+		{
+			//indirect shadow is always fully opaque
+			radianceStore( outputDesc, half4(0.0, 0.0, 0.0, 1.0) );
+		}
+	}
+	else
+	{
+		float misLightDistance = asfloat(rayData1.w);
+		if( misLightDistance <= hit.distance )
+		{
+			radianceAdd( outputDesc, half3(rayRadiance) );
+		}
+	}
+}

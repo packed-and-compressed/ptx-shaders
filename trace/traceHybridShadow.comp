@@ -1,0 +1,164 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+USE_RAWBUFFER( bCounters );
+USE_BUFFER( uint4, bShadowRaysIdx );
+
+#if defined( PRIMARY_DL )
+	USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIR, 0 );
+#else
+	USE_LOADSTORE_BUFFER( uint4, bShadowRay, 0 );
+#endif
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRGI, 1 );
+USE_LOADSTORE_TEXTURE2DARRAY( uint, tReSTIRSpecular, 2 );
+USE_LOADSTORE_BUFFER( uint4, bSpatialHashIndirectBuffer0, 3 );
+USE_LOADSTORE_TEXTURE2D( float, tRefractionRadiance, 4 );
+#define RT_RADIANCE_ATTACHMENT 5
+#include "../scene/raytracing/output.comp"
+#ifdef HYBRID_DEBUG
+USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 6 );
+#endif
+
+uniform uint2 uScreenSize;
+uniform uint  uNoiseSeed;
+uniform uint  uBounce;
+
+COMPUTE(64,1,1)
+{
+	uint2 numRays = rawLoad2( bCounters, HYBRID_COUNTER_LIGHT_RAYS );
+	uint  id = 64 * numRays.y * DISPATCH_THREAD_ID.y + DISPATCH_THREAD_ID.x;
+	if( id >= numRays.x )
+	{
+		return;
+	}
+	
+	const uint4	shadowRayData = HYBRID_RAY_BUFFER0( bShadowRaysIdx, id );
+	const uint	outputDesc = shadowRayData.x;
+	const bool	isShadowCatcher = ( outputDesc & RT_RAYFLAG_SHADOWCATCHER ) != 0;
+	const uint2 outputCoord = uint2( makeOutputCoord( outputDesc ) );
+	const uint	pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+	
+	const ushort hybridPass = ushort( ( outputDesc & HYBRID_OUTPUT_TYPE ) >> 13 );
+#ifdef SECONDARY_DL
+	const bool   isRefractionPass = hybridPass == HYBRID_REFRACTION;
+#else
+	const bool   isRefractionPass = false;
+#endif
+
+	Ray	ray;
+	vec3		radiance;
+	// use ReSTIR buffer for shadow tracing
+#ifdef SECONDARY_DL
+	const uint4 restirData0 = HYBRID_RAY_BUFFER0( bShadowRay, id );
+#else
+	uint4 restirData0 = imageLoadRWArray( tReSTIR, outputCoord, 0 );;
+	uint4 restirData1 = imageLoadRWArray( tReSTIR, outputCoord, 1 );;
+#endif
+	unpackVec2x3f( restirData0.xyz, ray.direction, radiance );
+	ray.direction = normalize( ray.direction );
+	ray.maxT = asfloat( restirData0.w );
+#ifdef SECONDARY_DL
+	// for secondary hit light ray we store the origin because path state's origin is for BSDF
+	// and therecould be issue where BSDF sampled hemisphere is opposite to direct light sampled hemisphere
+	ray.origin = asfloat( HYBRID_RAY_BUFFER1( bShadowRay, id ).xyz );
+#else
+	ray.origin = asfloat( shadowRayData.yzw );
+#endif
+	ray.minT = 0.0f;
+
+	RayHit		hit;
+	RayPayload	payload;
+	bool		isOccluded = false;
+	if( length( ray.direction ) > 0.0f && ray.maxT > 0.0f )
+	{
+		// trace
+	#if defined( TraceTransparencyDither )
+		payload.rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+	#endif
+		isOccluded = traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+	}
+
+	bool addRadianceContribution = true;
+
+#if defined( PRIMARY_DL ) 
+	if( isOccluded )
+	{
+		// set initial sample weight and sample count to 0
+		// this is because it is an invalid sample
+		restirData1.x = asuint( 0.0f );
+		imageStoreArray( tReSTIR, outputCoord, 1, restirData1 );
+
+		// if shadow catcher then we write directly to radiance buffer
+		if( isShadowCatcher )
+		{
+			// read shadow's opacity value (alpha)
+			const float shadowAlpha = radiance.x;
+			radianceStore( ushort( HYBRID_CHANNEL_DIRECT_LIGHT ), ushort2( outputCoord ), half4( 0.0f, 0.0f, 0.0f, shadowAlpha ) );
+		}
+	}
+#else 
+	if( isRefractionPass )
+	{
+		const uint pathBits = shadowRayData.w;
+		const bool nonShadowCaster = ( ( pathBits & HYBRID_PATH_REFRACTION_NON_SHADOW_CAST ) > 0 );
+		const bool hasRecordedVisiblePt = ( ( pathBits & HYBRID_PATH_REFRACTION_VISIBLE_POINT ) > 0 );
+		const bool hasRecordedSamplePt = ( ( pathBits & HYBRID_PATH_REFRACTION_SAMPLE_POINT ) > 0 );
+		// for refraction:
+		// 1. if we have recorded visible point and sample point already then this is a fully valid reservoir
+		//    and we just add the radiance to the current reservoir
+		// 2. if this is not a shadow caster object, then this is often used as a glass, and we know for sure
+		//    there is no TIR or transmission exit hit for this object, so we know that this is going to be 
+		//    the radiance contribution in the refracted image, i.e. other components in the scene, and so 
+		//    this is safe to add it to the reservoir
+		addRadianceContribution = addRadianceContribution &&
+								  ( ( nonShadowCaster && uBounce > 1 ) ||
+									( hasRecordedVisiblePt && hasRecordedSamplePt ) );
+	}
+
+	// handle radiance contribution
+	if( !isOccluded )
+	{
+		if( addRadianceContribution )
+		{
+			if( hybridPass == HYBRID_DIFFUSE_GI || hybridPass == HYBRID_REFRACTION )
+			{
+				uint4 restirGIData0 = imageLoadRWArray( tReSTIRGI, outputCoord, 0 );
+				uint4 restirGIData1 = imageLoadRWArray( tReSTIRGI, outputCoord, 1 );
+				// if not occluded then we add radiance to path radiance
+				vec3 dir, pathRadiance;
+				unpackVec2x3f( restirGIData0.xyz, dir, pathRadiance );
+				restirGIData0.xyz = uint3( asuint( packVec2x3f( dir, pathRadiance + radiance ) ) );
+				imageStoreArray( tReSTIRGI, outputCoord, 0, restirGIData0 );
+			}
+			else
+			{
+				uint4 restirGIData0 = imageLoadRWArray( tReSTIRSpecular, outputCoord, 0 );
+				uint4 restirGIData1 = imageLoadRWArray( tReSTIRSpecular, outputCoord, 1 );
+				// if not occluded then we add radiance to path radiance
+				vec3 dir, pathRadiance;
+				unpackVec2x3f( restirGIData0.xyz, dir, pathRadiance );
+				restirGIData0.xyz = uint3( asuint( packVec2x3f( dir, pathRadiance + radiance ) ) );
+				imageStoreArray( tReSTIRSpecular, outputCoord, 0, restirGIData0 );
+			}
+		}
+		else
+		{
+			if( isRefractionPass )
+			{
+				vec4 currentRadiance = vec4( imageLoadRW( tRefractionRadiance, outputCoord ) );
+				currentRadiance += vec4( radiance, 0.0f );
+				currentRadiance = clamp( currentRadiance, 0.0f, 65504.0f );
+				imageStore( tRefractionRadiance, outputCoord, currentRadiance );
+			}
+		}
+	}
+
+	const uint cellIdx = bSpatialHashIndirectBuffer0[pixelIdx].w;
+	if( isOccluded && cellIdx != ~uint( 0 ) )
+	{
+		// if occluded then make sure we do not add this radiance to the radiance cache
+		bSpatialHashIndirectBuffer0[pixelIdx].xyz = packVec2x3f( vec3( 0, 0, 0 ), vec3( 0, 0, 0 ) );
+	}
+#endif
+}

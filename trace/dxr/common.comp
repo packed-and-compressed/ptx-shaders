@@ -1,0 +1,12 @@
+struct DXRInstanceData
+{
+	//packed transparency/texcord buffer index:
+	// 2bits : transparency subroutine ID
+	// 15bits: transparency atlas slice
+	// 15bits: sample coord buffer index
+	uint transparency_sampleCoordBuffer;
+	//packed sampleDesc flag/BLAS geometry base triangle offset:
+	// 1bit  : transparency sample desc flag
+	// 31bits: BLAS triangle offset
+	uint sampleDesc_triangleOffset;
+};

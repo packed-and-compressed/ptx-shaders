@@ -1,0 +1,128 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/tangentbasis.sh"
+#include "data/shader/common/rng.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/medium/phase.comp"
+
+USE_BUFFER( uint4, bRayBuffer );
+USE_BUFFER( uint, bRaysIdx );
+USE_BUFFER( uint4, bInPathStates0 );
+USE_BUFFER( uint4, bInPathStates1 );
+
+USE_INTERLOCKED_BUFFER( bCounters, 0 );
+USE_LOADSTORE_BUFFER( uint4, bIntersections, 1 );
+USE_LOADSTORE_OBJECTINDEXBUFFER( bObjectIndices, 2 );
+USE_LOADSTORE_BUFFER( uint, bHitIndices, 3 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates0, 4 );
+USE_LOADSTORE_BUFFER( uint4, bPathStates1, 5 );
+#define RT_RADIANCE_ATTACHMENT 6
+#include "../scene/raytracing/output.comp"
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 7 );
+#endif
+
+uniform uint  uNoiseSeed;
+uniform uint2 uScreenSize;
+uniform uint  uHitCounter;
+
+uniform uint  uBounce;
+uniform uint3 uBounceCount;//{diffuse, specular, transmission}}
+
+void getPathStates(
+	const uint		pixelIdx,
+	inout uint4		pathState0, 
+	inout uint4		pathState1 )
+{
+	pathState0 = HYBRID_PATHSTATE_BUFFER( bInPathStates0, pixelIdx );
+	pathState1 = HYBRID_PATHSTATE_BUFFER( bInPathStates1, pixelIdx );
+}
+
+void writePathStates(
+	const uint		index,
+	inout uint4		pathState0, 
+	inout uint4		pathState1 )
+{
+	HYBRID_PATHSTATE_BUFFER( bPathStates0, index ) = pathState0;
+	HYBRID_PATHSTATE_BUFFER( bPathStates1, index ) = pathState1;
+}
+
+COMPUTE( 64, 1, 1 )
+{
+	uint2 numRays = interlockedLoad2( bCounters, HYBRID_COUNTER_GI_RAYS );
+	uint  id = 64 * numRays.y * DISPATCH_THREAD_ID.y + DISPATCH_THREAD_ID.x;
+	if( id >= numRays.x )
+	{
+		return;
+	}
+	const uint	outputDesc = HYBRID_RAY_BUFFER0( bRaysIdx, id );
+	
+	if( !( outputDesc & RT_RAYFLAG_SUBSURFACE ) )
+	{
+		return;
+	}
+	const uint2  outputCoord = uint2( makeOutputCoord( outputDesc ) );
+	const uint	 pixelIdx = outputCoord.y * uScreenSize.x + outputCoord.x;
+	const ushort hybridPass = ushort( ( outputDesc & HYBRID_OUTPUT_TYPE ) >> 13 );
+	
+	uint4 pathState0, pathState1;
+	getPathStates( id, pathState0, pathState1 );
+
+	Ray			ray;
+	ray.direction = unpackVec3f( HYBRID_RAY_BUFFER1( bRayBuffer, id ).xy );
+	ray.origin = asfloat( HYBRID_RAY_BUFFER0( bRayBuffer, id ).xyz );
+	ray.minT = 0.0f;
+	ray.maxT = asfloat( HYBRID_RAY_BUFFER1( bRayBuffer, id ).z );
+	
+	if( length( ray.direction ) == 0.0f )
+	{
+		return;
+	}
+
+	RNG		   rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+	Traceable  traceable = ObjectTraceable( HYBRID_RAY_BUFFER1( bRayBuffer, id ).w );
+
+	// declare the resulting hit and hit distance
+	RayHit	   hit;
+	float	   hitDistance = INFINITY;
+
+	//trace 1st probe ray to count intersections
+	//TODO: use reservoir sampling to select random intersection during first traversal and thus avoid casting second probe ray ~ms
+	RayPayload payload;
+	payload.hitIndices  = 0xFFFF0000;
+	#if defined(TraceTransparencyDither)
+		payload.rng = rng;
+	#endif
+	traceRay( traceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+	#if defined(TraceTransparencyDither)
+		rng = payload.rng;
+	#endif
+		
+	//there could be more than 1 intersection within the probe, and in this case we keep a hit count
+	//and we randomly sample from the hit list, and make sure we trace a ray with intersection that is
+	//matched with the hit index we have sampled below with the hit count
+	uint hitCount = payload.hitIndices & 0xFFFF;
+	if( hitCount > 0 )
+	{
+		//choose random intersection
+		uint hitSelected = min( uint(rngNextFloat( rng ) * hitCount), hitCount-1 );
+		//trace 2nd probe ray to record selected intersection
+		payload.hitIndices = hitSelected << 16;
+		#if defined(TraceTransparencyDither)
+			payload.rng = rng;
+		#endif
+		traceRay( traceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+		//store intersection count in hit distance
+		hitDistance = hitCount;
+	}
+	
+	if( hitDistance < INFINITY )
+	{
+		uint index;
+		interlockedAdd( bCounters, uHitCounter, 1, index );
+		bObjectIndices[index] = hit.objectIndex;
+		bHitIndices[index] = index;
+		HYBRID_INTERSECTION_BUFFER0( bIntersections, index ) = uint4( asuint( hitDistance ), outputDesc | RT_RAYFLAG_SUBSURFACE, hit.triangleIndex, packUnitVec2f( hit.triangleCoords ) );
+		writePathStates( index, pathState0, pathState1 );
+	}
+}

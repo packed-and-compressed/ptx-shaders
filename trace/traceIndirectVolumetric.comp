@@ -1,0 +1,228 @@
+#include "data/shader/common/util.sh"
+#include "data/shader/common/tangentbasis.sh"
+#include "data/shader/common/rng.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+#include "data/shader/scene/raytracing/medium/phase.comp"
+
+USE_BUFFER(uint4,bIndirectRays);
+USE_BUFFER(uint4,bPathState);
+
+USE_INTERLOCKED_BUFFER(bCounters,0);
+USE_LOADSTORE_OBJECTINDEXBUFFER(bObjectIndices,1);
+USE_LOADSTORE_BUFFER(uint,bHitIndices,2);
+USE_LOADSTORE_BUFFER(uint4,bIndirectHits,3);
+
+#define RT_RADIANCE_ATTACHMENT 4
+#include "data/shader/scene/raytracing/output.comp"
+
+uniform uint uNoiseSeed;
+
+COMPUTE(64,1,1)
+{
+	uint2 numRays = interlockedLoad2( bCounters, RT_COUNTER_INDIRECTRAYS );
+	uint id = 64 * numRays.y * DISPATCH_THREAD_ID.y + DISPATCH_THREAD_ID.x;
+	if( id >= numRays.x )
+	{ return; }
+
+	uint4 rayData0 = RT_BUFFER0(bIndirectRays,id);
+	uint4 rayData1 = RT_BUFFER1(bIndirectRays,id);
+
+	Ray ray;
+	ray.origin = asfloat(rayData0.xyz);
+	ray.minT   = 0.0;
+	ray.maxT   = INFINITY;
+
+	uint outputDesc    = rayData0.w;
+	vec3 rayThroughput = vec3( 1.0, 1.0, 1.0 );
+
+	RayHit hit;
+	float  hitDistance = INFINITY;
+
+	HINT_BRANCH
+	if( outputDesc & RT_RAYFLAG_MEDIUMSCATTER )
+	{
+		uint4 pathState = RT_BUFFER1(bPathState,id);
+
+		vec3  mediumExtinction, mediumScatter;
+		unpackVec2x3f( pathState.xyz, mediumExtinction, mediumScatter );
+		vec3  mediumAlbedo     = mediumScatter * rcpSafe( mediumExtinction );
+		float mediumAnisotropy = asfloat( pathState.w );
+
+		RNG rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+		ray.direction = asfloat( rayData1.xyz );
+		Traceable traceable = ObjectTraceable( rayData1.w );
+
+		HINT_LOOP
+		for( int i=0; i<32; ++i )
+		{
+			vec4 r = rngNextVec4( rng );
+
+			//importance sample extinction channel
+			//see "Practical and Controllable Subsurface Scattering for Production Path Tracing", M. Chiang, P. Kutz, B. Burley.
+			vec3 chweight = rayThroughput * mediumAlbedo;
+			vec3 chpdf = chweight * rcp( chweight.r + chweight.g + chweight.b );
+
+			//select extinction value based on channel PDF
+			float extinction = r.x < chpdf.r ? mediumExtinction.r : ( r.x < ( chpdf.r+chpdf.g ) ? mediumExtinction.g : mediumExtinction.b );
+
+			//sample scattering distance from transmittance exponential distribution
+			float t = -log( 1.0 - r.y ) / extinction;
+
+			//assume medium scatter event unless we hit something
+			bool isMediumSample = true;
+
+			//prepare ray payload
+			RayPayload payload;
+			#if defined(TraceSubsurfaceDiffusion)
+				payload.hitIndices = ~uint(0);
+			#endif
+			#if defined(TraceTransparencyDither)
+				payload.rng = rng;
+			#endif
+			
+			//cast ray through medium
+			ray.maxT = t;
+			if( traceRay( traceable, RT_RAYTYPE_SECONDARY, ray, payload, hit ) )
+			{
+				//we have a hit! switch to surface scatter event mode
+				t = hitDistance = hit.distance;
+				isMediumSample = false;
+			}
+			#if defined(TraceTransparencyDither)
+				rng = payload.rng;
+			#endif
+
+			//compute transmittance up to the sampled point
+			vec3 transmittance = exp( -mediumExtinction * t );
+
+			//PDF of sampling the point at t
+			vec3 tpdf = isMediumSample ? ( mediumExtinction * transmittance ) : transmittance;
+
+			//MIS: final sampling PDF is the weighted average of both PDFs (note that chpdf is normalized)
+			float pdf = dot( chpdf, tpdf );
+
+			//compute final scattering weight and update throughput
+			vec3 weight = transmittance / pdf;
+			rayThroughput *= isMediumSample ? weight * mediumScatter : weight;
+
+			//surface hit or throughput reached almost zero; stop scattering
+			if( !isMediumSample || maxcomp(rayThroughput) < 0.01 )
+			{ break; }
+
+			//advance ray up to the scattering point
+			ray.origin += t * ray.direction;
+
+			//sample incident direction from medium phase function
+			vec3 V   = ray.direction;
+			vec3 L_t = samplePhaseHG_t( r.zw, mediumAnisotropy );
+
+			//create an ad-hoc tangent basis around outgoing view direction
+			TangentBasis basis = createTangentBasis( V );
+
+			//get scattered ray direction
+			ray.direction = transformVecFrom( basis, L_t );
+
+#if 0
+			//apply russian roulette to have a chance to terminate early
+			r.x = rngNextFloat( rng );
+			float terminateProb = maxcomp( rayThroughput );
+			if( r.x >= terminateProb )
+			{ break; }
+
+			rayThroughput *= rcp( terminateProb );
+#endif
+		}
+	}
+#if defined(TraceSubsurfaceDiffusion)
+	else if( outputDesc & RT_RAYFLAG_SUBSURFACE )
+	{
+		RNG rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+
+		ray.direction = unpackVec3f( rayData1.xy );
+		ray.maxT = asfloat( rayData1.z );
+		Traceable traceable = ObjectTraceable( rayData1.w );
+
+		//trace 1st probe ray to count intersections
+		//TODO: use reservoir sampling to select random intersection during first traversal and thus avoid casting second probe ray ~ms
+		RayPayload payload;
+		payload.hitIndices  = 0xFFFF0000;
+		#if defined(TraceTransparencyDither)
+			payload.rng = rng;
+		#endif
+		traceRay( traceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+		#if defined(TraceTransparencyDither)
+			rng = payload.rng;
+		#endif
+
+		//there could be more than 1 intersection within the probe, and in this case we keep a hit count
+		//and we randomly sample from the hit list, and make sure we trace a ray with intersection that is
+		//matched with the hit index we have sampled below with the hit count
+		uint hitCount = payload.hitIndices & 0xFFFF;
+		if( hitCount > 0 )
+		{
+			//choose random intersection
+			uint hitSelected = min( uint(rngNextFloat( rng ) * hitCount), hitCount-1 );
+			//trace 2nd probe ray to record selected intersection
+			payload.hitIndices = hitSelected << 16;
+			#if defined(TraceTransparencyDither)
+				payload.rng = rng;
+			#endif
+			traceRay( traceable, RT_RAYTYPE_SECONDARY, ray, payload, hit );
+			//store intersection count in hit distance
+			hitDistance = hitCount;
+		}
+	}
+#endif
+	else
+	{
+		vec3 rayRadiance;
+		unpackVec2x3f( rayData1.xyz, ray.direction, rayRadiance );
+
+		RayPayload payload;
+		#if defined(TraceSubsurfaceDiffusion)
+			payload.hitIndices = ~uint(0);
+		#endif
+		#if defined(TraceTransparencyDither)
+			payload.rng = rngInit( outputDesc & RT_OUTPUTCOORD_MASK, uNoiseSeed );
+		#endif
+		if( traceRay( SceneTraceable, RT_RAYTYPE_SECONDARY, ray, payload, hit ) )
+		{
+			hitDistance = hit.distance;
+		}
+
+		bool isShadowCatcher = outputDesc & RT_RAYFLAG_SHADOWCATCHER;
+		if( isShadowCatcher )
+		{
+			//shadow catcher: modulate by shadow opacity if occluded
+			if( hitDistance < INFINITY )
+			{
+				//indirect shadow is always fully opaque
+				radianceStore( outputDesc, half4(0.0, 0.0, 0.0, 1.0) );
+			}
+		}
+		else
+		{
+			float misLightDistance = asfloat(rayData1.w);
+			if( misLightDistance <= hitDistance )
+			{
+				radianceAdd( outputDesc, half3(rayRadiance) );
+			}
+		}
+	}
+
+	if( hitDistance < INFINITY && any(rayThroughput) )
+	{
+		uint index;
+		interlockedAdd( bCounters, RT_COUNTER_INDIRECTHITS, 1, index );
+		bObjectIndices[index] = hit.objectIndex;
+		bHitIndices[index] = index;
+		RT_BUFFER0(bIndirectHits,index) = uint4(
+			outputDesc,
+			id, //pathIndex
+			hit.triangleIndex,
+			packUnitVec2f( hit.triangleCoords ) );
+		RT_BUFFER1(bIndirectHits,index) = uint4(
+			packVec2x3f( ray.direction, rayThroughput ),
+			asuint( hitDistance ) );
+	}
+}

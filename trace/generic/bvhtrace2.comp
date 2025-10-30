@@ -1,0 +1,475 @@
+#include "../../common/const.sh"
+#include "../../common/util.sh"
+#include "../../common/rng.comp"
+
+struct BVHNode
+{
+	vec4	boundsX;
+	vec4	boundsY;
+	vec4	boundsZ;
+	uint2	submeshIndex;
+	uint2	nodeRefIndex;
+};
+
+struct BVHMesh
+{
+	mat3x4	inverseTransform;
+	uint	nodeOffset;
+	uint	vertexOffset;
+	uint	indexOffset;
+	uint	flags;
+};
+#define BVHMESH_FLAG_OPAQUE			0x01
+#define BVHMESH_FLAG_CAMERA_VISIBLE	0x02
+#define BVHMESH_FLAG_SHADOW_CASTER	0x08
+#define BVHMESH_FLAG_CULL_BACKFACES 0x10
+
+struct BVHSubmesh
+{
+	uint	meshIndex;
+	uint	submeshOffset;
+};
+
+struct BVHVertex
+{
+	vec3	position;
+	uint	texcoord;
+};
+
+struct BVHTriangle
+{
+	vec3	v0, v1, v2;
+	uint	t0, t1, t2;
+};
+
+USE_STRUCTUREDBUFFER(BVHNode,RT_TopLevelBVH);
+USE_STRUCTUREDBUFFER(BVHNode,RT_BVHNodes);
+USE_STRUCTUREDBUFFER(BVHSubmesh,RT_BVHSubmeshRefs);
+#ifdef CPR_METAL
+	USE_BUFFER(vec4,RT_BVHMeshRefs);
+	USE_BUFFER(vec4,RT_Vertices);
+#else
+	USE_STRUCTUREDBUFFER(BVHMesh,RT_BVHMeshRefs);
+	USE_STRUCTUREDBUFFER(BVHVertex,RT_Vertices);
+#endif
+USE_RAWBUFFER(RT_Indices);
+#if defined(TraceObject)
+	USE_TYPEDBUFFER(CPR_UINT8,bScatterMask);
+#endif
+
+#if defined(TraceTransparency)
+	#include "../traceTransparency.comp"
+	USE_BUFFER(uint,RT_TransparencyIndices);
+#endif
+
+struct BVHRay
+{
+	vec3 origin;
+	vec3 direction;
+	vec3 invDirection;
+};
+
+struct BVHRayHit
+{
+	vec2  coords;
+	float tmin, tmax;
+	uint  triangleIndex;
+	uint  objectIndex;
+	uint  flags;
+#if defined(TraceObject)
+	bool  objectFilter;
+#endif
+#if defined(TraceSubsurfaceDiffusion)
+	uint  hitIndices;
+#endif
+#if defined(TraceTransparencyDither)
+	RNG rng;
+#endif
+};
+
+BVHRay buildRayBVH( vec3 origin, vec3 unitDir )
+{
+	BVHRay r;
+	r.origin = origin;
+	r.direction = unitDir;
+	r.invDirection = rcpSafeInf( unitDir );
+	return r;
+}
+
+void transformRayBVH( mat3x4 m, inout BVHRay r )
+{
+	vec3 o = mul( m, vec4(r.origin, 1.0) ).xyz;
+	vec3 d = mul( m, vec4(r.direction, 0.0) ).xyz;
+	r = buildRayBVH( o, d );
+}
+
+BVHMesh		loadMeshBVH( uint index )
+{
+#ifdef CPR_METAL
+	//Metal aligns and pads mat3x4 type as 16 scalars,
+	//which means BVHMesh needs to be manually constructed. -jdr
+	index = index * 4;
+	BVHMesh mesh;
+	
+	vec4 r0 = RT_BVHMeshRefs[index], r1 = RT_BVHMeshRefs[index+1], r2 = RT_BVHMeshRefs[index+2];
+	mesh.inverseTransform = mat3x4(
+		vec3( r0.x, r0.y, r0.z ),
+		vec3( r0.w, r1.x, r1.y ),
+		vec3( r1.z, r1.w, r2.x ),
+		vec3( r2.y, r2.z, r2.w )
+	);
+	
+	uint4 r3 = asuint( RT_BVHMeshRefs[index+3] );
+	mesh.nodeOffset = r3.x;
+	mesh.vertexOffset = r3.y;
+	mesh.indexOffset = r3.z;
+	mesh.flags = r3.w;
+
+	return mesh;
+#else
+	return RT_BVHMeshRefs[index];
+#endif
+}
+
+BVHVertex	loadVertexBVH( uint index )
+{
+#ifdef CPR_METAL
+	//Metal aligns and pads vec3 types as vec4,
+	//which means BVHVertex doesnt match the given layout in memory. -jdr
+	vec4 r = RT_Vertices[index];
+	BVHVertex v;
+	v.position = r.xyz;
+	v.texcoord = asuint( r.w );
+	return v;
+#else
+	return RT_Vertices[index];
+#endif
+}
+
+BVHTriangle loadTriangleBVH( uint index, BVHMesh mesh )
+{
+	uint3 indices = rawLoad3( RT_Indices, mad( 3, index, mesh.indexOffset ) );
+
+	BVHTriangle t;
+	BVHVertex v;
+
+	v = loadVertexBVH(mesh.vertexOffset + indices.x);
+	t.v0 = v.position;
+	t.t0 = v.texcoord;
+
+	v = loadVertexBVH(mesh.vertexOffset + indices.y);
+	t.v1 = v.position;
+	t.t1 = v.texcoord;
+
+	v = loadVertexBVH(mesh.vertexOffset + indices.z);
+	t.v2 = v.position;
+	t.t2 = v.texcoord;
+
+	return t;
+}
+
+bool intersectTriangleBVH( BVHRay ray, BVHTriangle tri, inout BVHRayHit hit )
+{
+	vec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;
+	vec3 q = cross( ray.direction, e2 );
+
+	float a = dot( e1, q );
+	float invA = rcp(a);
+	vec3 s = (ray.origin - tri.v0);
+	vec3 r = cross( s, e1 );
+
+	float u = dot( s, q )*invA;
+	float v = dot( r, ray.direction )*invA;
+	float w = 1.0-u-v;
+
+	HINT_FLATTEN
+	if( a != 0.0 && u >= 0.0 && v >= 0.0 && w >= 0.0 )
+	{
+		float t = dot( e2, r )*invA;
+		HINT_FLATTEN
+		if( t > hit.tmin && t < hit.tmax )
+		{
+			hit.tmax = t;
+			hit.coords = vec2( u, v );
+			return true;
+		}
+	}
+	return false;
+}
+
+#ifdef TraceTransparency
+bool testTransparencyBVH( BVHRay r, BVHTriangle tri, inout BVHRayHit hit, uint transparencyIndex )
+{
+	if( transparencyIndex > 0xFFFF )
+	{
+		uint  subroutineID   = (transparencyIndex >> 16) & 0xF;
+		uint3 sampleCoord    = uint3( tri.t0, tri.t1, tri.t2 );
+		bool  flagSampleDesc = transparencyIndex & TRANSPARENCY_FLAG_SAMPLEDESC;
+		bool  flagTriplanar  = transparencyIndex & TRANSPARENCY_FLAG_TRIPLANAR;
+		transparencyIndex	&= 0xFFFF;
+
+		vec2 alpha;
+	#ifdef TraceTransparencyTriplanar
+		if( flagTriplanar )
+		{
+			vec3 Pobj = r.origin + r.direction * hit.tmax;
+			alpha = sampleTransparencyTriplanar( hit.coords, hit.triangleIndex, Pobj, transparencyIndex, hit.objectIndex, sampleCoord, flagSampleDesc );
+		}
+		else
+	#endif
+		{
+			alpha = sampleTransparencyUV( hit.coords, hit.triangleIndex, transparencyIndex, hit.objectIndex, sampleCoord, flagSampleDesc );
+		}
+
+	#ifdef TraceTransparencyCutout
+		if( subroutineID == TRANSPARENCY_SUBROUTINE_CUTOUT )
+		{
+			return alpha.x >= alpha.y;
+		}
+	#endif
+	#ifdef TraceTransparencyDither
+		if( subroutineID == TRANSPARENCY_SUBROUTINE_DITHER )
+		{
+			float noise = rngNextFloat( hit.rng );
+			return alpha.x >= noise;
+		}
+	#endif
+	}
+	return true;
+}
+#endif
+
+BVH_RESULT intersectLeafBVH( BVHRay r, inout BVHRayHit hit, BVHMesh mesh, uint objectIndex, uint triangleIndex )
+{
+#ifdef TraceObject
+	if( hit.objectFilter && hit.objectIndex != objectIndex )
+	{
+		uint scatterMask = bScatterMask[hit.objectIndex / 8];
+		uint scatterBit  = 1u << (hit.objectIndex % 8);
+		if( !(scatterMask & scatterBit) )
+		{
+			BVH_RETURN_MISS;
+		}
+	}
+#endif
+	
+	BVHTriangle tri = loadTriangleBVH( triangleIndex, mesh );
+
+#ifdef TraceTransparency
+	uint transparencyIndex = 0;
+	if( !(mesh.flags & BVHMESH_FLAG_OPAQUE) )
+	{
+		transparencyIndex = RT_TransparencyIndices[objectIndex];
+	}
+#endif
+
+	BVHRayHit h = hit;
+	h.triangleIndex = triangleIndex;
+	h.objectIndex   = objectIndex;
+	if( intersectTriangleBVH( r, tri, h ) )
+	{
+		bool isHit = true;
+	#if defined(TraceCullBackFaces)
+		if( mesh.flags & BVHMESH_FLAG_CULL_BACKFACES )
+		{
+			vec3 N = cross( tri.v1 - tri.v0, tri.v2 - tri.v0 );
+			isHit = dot( N, r.direction ) <= 0.0;
+		}
+	#endif
+	#if defined(TraceTransparency)
+		if( isHit )
+		{
+			isHit = testTransparencyBVH( r, tri, h, transparencyIndex );
+		}
+	#endif
+	#if defined(TraceSubsurfaceDiffusion)
+		if( isHit && h.hitIndices != uint(~0) )
+		{
+			uint currentHitIndex  = h.hitIndices & 0xFFFF;
+			uint selectedHitIndex = h.hitIndices >> 16;
+			isHit = ( currentHitIndex == selectedHitIndex );
+			currentHitIndex++;
+			h.hitIndices = (selectedHitIndex<<16) | currentHitIndex;
+		}
+	#endif
+
+		if( isHit )
+		{
+			hit = h;
+			#if defined(TraceAcceptFirstHit)
+				BVH_RETURN_HIT;
+			#endif
+		}
+	#if defined(TraceTransparencyDither) || defined(TraceSubsurfaceDiffusion)
+		else
+		{
+			#if defined(TraceTransparencyDither)
+				//update RNG on miss so that subsequent alpha tests get new values
+				hit.rng = h.rng;
+			#endif
+			#if defined(TraceSubsurfaceDiffusion)
+				//update hit indices on miss so that current hit index keeps increasing
+				hit.hitIndices = h.hitIndices;
+			#endif
+		}
+	#endif
+	}
+	BVH_RETURN_MISS;
+}
+
+vec2 intersectNodeBVH( BVHRay r, float tmin, BVHNode node )
+{
+	vec4 boundsX = ( r.invDirection.x < 0.0 ) ? node.boundsX.yxwz : node.boundsX.xyzw;
+	vec4 boundsY = ( r.invDirection.y < 0.0 ) ? node.boundsY.yxwz : node.boundsY.xyzw;
+	vec4 boundsZ = ( r.invDirection.z < 0.0 ) ? node.boundsZ.yxwz : node.boundsZ.xyzw;
+
+	vec3 ro = -r.origin * r.invDirection;
+
+	vec2  t;
+	vec3  slo, shi;
+	float tmn, tmx;
+
+	slo = mad( vec3( boundsX.x, boundsY.x, boundsZ.x ), r.invDirection, ro );
+	shi = mad( vec3( boundsX.y, boundsY.y, boundsZ.y ), r.invDirection, ro );
+	tmn = max( max( slo.x, slo.y ), slo.z );
+	tmx = min( min( shi.x, shi.y ), shi.z );
+	t.x = ( tmn <= tmx && tmx > tmin ) ? tmn : INFINITY;
+
+	slo = mad( vec3( boundsX.z, boundsY.z, boundsZ.z ), r.invDirection, ro );
+	shi = mad( vec3( boundsX.w, boundsY.w, boundsZ.w ), r.invDirection, ro );
+	tmn = max( max( slo.x, slo.y ), slo.z );
+	tmx = min( min( shi.x, shi.y ), shi.z );
+	t.y = ( tmn <= tmx && tmx > tmin ) ? tmn : INFINITY;
+
+	return t;
+}
+
+BVH_RESULT traverseBottomLevelBVH( BVHRay r, inout BVHRayHit hit, uint meshIndex, uint submeshOffset )
+{
+	uint nodeIndex = 0;
+	uint sp = 0;
+	uint stack[64];
+
+	BVHMesh mesh = loadMeshBVH(meshIndex);
+	if( !(mesh.flags & hit.flags) )
+	{
+		BVH_RETURN_MISS;
+	}
+
+	transformRayBVH( mesh.inverseTransform, r );
+
+	while( nodeIndex != ~uint(0) )
+	{
+		BVHNode node = RT_BVHNodes[mesh.nodeOffset + nodeIndex];
+		nodeIndex = ~uint(0);
+		
+		vec2 tmin = intersectNodeBVH( r, hit.tmin, node );
+
+		HINT_FLATTEN
+		if( tmin.y < tmin.x )
+		{
+			tmin.xy = tmin.yx;
+			node.submeshIndex.xy = node.submeshIndex.yx;
+			node.nodeRefIndex.xy = node.nodeRefIndex.yx;
+		}
+
+		if( tmin.x < hit.tmax )
+		{
+			if( node.submeshIndex.x != ~uint(0) )
+			{
+				uint objectIndex   = submeshOffset + node.submeshIndex.x;
+				uint triangleIndex = node.nodeRefIndex.x;
+				BVH_TCALL( intersectLeafBVH( r, hit, mesh, objectIndex, triangleIndex ) );
+			}
+			else
+			{
+				nodeIndex = node.nodeRefIndex.x;
+			}
+		}
+		if( tmin.y < hit.tmax )
+		{
+			if( node.submeshIndex.y != ~uint(0) )
+			{
+				uint objectIndex   = submeshOffset + node.submeshIndex.y;
+				uint triangleIndex = node.nodeRefIndex.y;
+				BVH_TCALL( intersectLeafBVH( r, hit, mesh, objectIndex, triangleIndex ) );
+			}
+			else
+			{
+				if( nodeIndex == ~uint(0) )
+				{
+					nodeIndex = node.nodeRefIndex.y;
+				}
+				else
+				{
+					stack[sp++] = node.nodeRefIndex.y;
+				}
+			}
+		}
+		
+		if( nodeIndex == ~uint(0) && sp > 0 )
+		{
+			nodeIndex = stack[--sp];
+		}
+	}
+	BVH_RETURN_MISS;
+}
+
+BVH_RESULT traverseTopLevelBVH( BVHRay r, inout BVHRayHit hit )
+{
+	uint nodeIndex = 0;
+	uint sp = 0;
+	uint stack[64];
+
+	while( nodeIndex != ~uint(0) )
+	{
+		BVHNode node = RT_TopLevelBVH[nodeIndex];
+		nodeIndex = ~uint(0);
+		
+		vec2 tmin = intersectNodeBVH( r, hit.tmin, node );
+
+		HINT_FLATTEN
+		if( tmin.y < tmin.x )
+		{
+			tmin.xy = tmin.yx;
+			node.submeshIndex.xy = node.submeshIndex.yx;
+			node.nodeRefIndex.xy = node.nodeRefIndex.yx;
+		}
+
+		if( tmin.x < hit.tmax )
+		{
+			if( node.submeshIndex.x != ~uint(0) )
+			{
+				BVH_TCALL( traverseBottomLevelBVH( r, hit, node.nodeRefIndex.x, node.submeshIndex.x ) );
+			}
+			else
+			{
+				nodeIndex = node.nodeRefIndex.x;
+			}
+		}
+		if( tmin.y < hit.tmax )
+		{
+			if( node.submeshIndex.y != ~uint(0) )
+			{
+				BVH_TCALL( traverseBottomLevelBVH( r, hit, node.nodeRefIndex.y, node.submeshIndex.y ) );
+			}
+			else
+			{
+				if( nodeIndex == ~uint(0) )
+				{
+					nodeIndex = node.nodeRefIndex.y;
+				}
+				else
+				{
+					stack[sp++] = node.nodeRefIndex.y;
+				}
+			}
+		}
+		
+		if( nodeIndex == ~uint(0) && sp > 0 )
+		{
+			nodeIndex = stack[--sp];
+		}
+	}
+	BVH_RETURN_MISS;
+}

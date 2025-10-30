@@ -1,0 +1,134 @@
+#include "data/shader/common/meshBuffer.comp"
+#include "common.comp"
+
+USE_RAWBUFFER(bMeshVertices);
+USE_RAWBUFFER(bMeshIndices);
+USE_RAWBUFFER(bMeshSecondaryUVs);
+uniform uint uMeshIndices16bit;
+uniform uint uMeshSecondaryUVs;
+uniform vec2 uMeshTexCoord0Offsets;
+uniform vec2 uMeshTexCoord1Offsets;
+
+uniform uint uTriangleCount;
+uniform uint uTriangleOffset;
+uniform uint uOutputOffset;
+uniform uint uDispatchSizeX;
+
+USE_LOADSTORE_BUFFER(uint4,bOutput,0);
+
+uint3	loadTriangle( uint index )
+{
+	index += index + index;
+	if( uMeshIndices16bit )
+	{
+		//16-bit load
+		uint r = index & 1;
+		index >>= 1;
+		uint2 words = rawLoad2( bMeshIndices, index );
+		return	r > 0 ?
+				uint3( words.x >> 16, words.y & 0xFFFF, words.y >> 16 ) :
+				uint3( words.x & 0xFFFF, words.x >> 16, words.y & 0xFFFF );
+	}
+	else
+	{
+		//32-bit load
+		return rawLoad3( bMeshIndices, index );
+	}
+}
+
+vec2	loadTexcoord0( uint index )
+{
+	uint meshBufferOffset = vertexIndexToMeshBufferOffset( index, uMeshTexCoord0Offsets );
+	uint meshBufferUVOffset = applyUVOffsetToMeshBufferOffset( meshBufferOffset );
+	if( areUVsPacked( uMeshTexCoord0Offsets ) )
+	{
+		uint data = rawLoad( bMeshVertices, meshBufferUVOffset );
+		return decodeUVsRaw( data, uMeshTexCoord0Offsets );
+	}
+	else
+	{
+		uint2 data = rawLoad2( bMeshVertices, meshBufferUVOffset );
+		return asfloat( data );
+	}
+}
+
+vec2	loadTexcoord1( uint index )
+{
+    if( !uMeshSecondaryUVs )
+    {
+        return loadTexcoord0( index );
+    }
+	
+	if( areUVsPacked( uMeshTexCoord1Offsets ) )
+	{
+        uint data = rawLoad( bMeshSecondaryUVs, index );
+		return decodeUVsRaw( data, uMeshTexCoord1Offsets );
+	}
+	else
+	{
+        uint2 data = rawLoad2( bMeshSecondaryUVs, index * 2 );
+		return asfloat( data );
+	}
+}
+
+uint	loadNormal( uint index )
+{
+	uint meshBufferOffset = vertexIndexToMeshBufferOffset( index, uMeshTexCoord0Offsets );
+	return rawLoad( bMeshVertices, meshBufferOffset+4 );
+}
+
+uint4	packTriangleUV0( uint3 tri )
+{
+	vec2 uv0 = loadTexcoord0( tri.x );
+	vec2 uv1 = loadTexcoord0( tri.y );
+	vec2 uv2 = loadTexcoord0( tri.z );
+
+	return uint4(
+		f32tof16(uv0.x) | (f32tof16(uv0.y)<<16),
+		f32tof16(uv1.x) | (f32tof16(uv1.y)<<16),
+		f32tof16(uv2.x) | (f32tof16(uv2.y)<<16),
+		0
+	);
+}
+
+uint4	packTriangleUV1( uint3 tri )
+{
+	vec2 uv0 = loadTexcoord1( tri.x );
+	vec2 uv1 = loadTexcoord1( tri.y );
+	vec2 uv2 = loadTexcoord1( tri.z );
+
+	return uint4(
+		f32tof16(uv0.x) | (f32tof16(uv0.y)<<16),
+		f32tof16(uv1.x) | (f32tof16(uv1.y)<<16),
+		f32tof16(uv2.x) | (f32tof16(uv2.y)<<16),
+		0
+	);
+}
+
+uint4	packTriangleNormals( uint3 tri )
+{
+	uint n0 = loadNormal( tri.x );
+	uint n1 = loadNormal( tri.y );
+	uint n2 = loadNormal( tri.z );
+	
+	return uint4( n0, n1, n2, 0 );
+}
+
+COMPUTE(64,1,1)
+{
+	uint id = 64 * uDispatchSizeX * DISPATCH_THREAD_ID.y + DISPATCH_THREAD_ID.x;
+	if( id >= uTriangleCount )
+	{ return; }
+
+	uint triangleIndex = uTriangleOffset + id;
+	uint outputIndex = uOutputOffset + id;
+	uint3 tri = loadTriangle( triangleIndex );
+
+#if defined(OUTPUT_NORMALS)
+	bOutput[outputIndex] = packTriangleNormals( tri );
+#elif defined(OUTPUT_UV1)
+	bOutput[outputIndex] = packTriangleUV1( tri );
+#else //OUTPUT_UV0
+	bOutput[outputIndex] = packTriangleUV0( tri );
+#endif
+}

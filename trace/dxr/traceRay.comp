@@ -1,0 +1,238 @@
+#include "common.comp"
+#include "../../common/rng.comp"
+#include "../../common/util.sh"
+
+#define RT_RAYTYPE_PRIMARY			0x02 //matches camera visible
+#define RT_RAYTYPE_PRIMARY_CURVES	0x04 //matches camera visible curves
+#define RT_RAYTYPE_SECONDARY		0x08 //matches shadow casters
+#define RT_RAYTYPE_BAKE				0xFF //matches all
+#define RT_RAYTYPE_ANY				0xFF //matches all
+
+typedef uint2 Traceable;
+#define       SceneTraceable (Traceable(~uint(0), ~uint(0)))
+
+USE_ACCELERATION_STRUCTURE(tRootTLAS);
+USE_STRUCTUREDBUFFER(DXRInstanceData,bDXRInstanceData);
+
+#if defined(TraceObject)
+    USE_GLOBAL_ACCELERATION_STRUCTURE(tTraversables,10);
+    USE_BUFFER(uint,bDXRTraversableIndices);
+	USE_TYPEDBUFFER(CPR_UINT8,bDXRScatterMask);
+	Traceable ObjectTraceable( uint objectIndex )
+	{
+		if( objectIndex == ~uint(0) )
+		{
+			return SceneTraceable;
+		}
+		else
+		{
+        	uint traversableIndex = bDXRTraversableIndices[objectIndex];
+			return Traceable( objectIndex, traversableIndex );
+		}
+	}
+	bool      isObjectTraceable( Traceable traceable )
+	{
+		return traceable.x != ~uint(0);
+	}
+#endif
+
+#if defined(TraceTransparency)
+	#include "../traceTransparency.comp"
+	uniform uint uSampleCoordBuffersBaseIndex;
+	USE_GLOBAL_BUFFER(uint4,bDXRSampleCoordBuffers,11);
+#endif
+
+struct Ray
+{
+    vec3  origin;
+    vec3  direction;
+    float minT, maxT;
+};
+
+struct RayHit
+{
+    uint  objectIndex;
+    uint  triangleIndex;
+    vec2  triangleCoords;
+    float distance;
+};
+
+struct RayPayload
+{
+#if defined(TraceTransparencyDither)
+	RNG rng;
+#endif
+#if defined(TraceSubsurfaceDiffusion)
+	uint hitIndices;
+#endif
+};
+
+typedef RayQuery <
+#if defined(TraceAcceptFirstHit)
+	RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+#endif
+#if defined(TraceCullBackFaces)
+	RAY_FLAG_CULL_BACK_FACING_TRIANGLES |
+#endif
+#if !defined(TraceTransparency) && !defined(TraceObject)
+	RAY_FLAG_CULL_NON_OPAQUE |
+#endif
+	RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES > 
+	RayQueryType;
+
+bool traceRay( Traceable traceable, uint rayType, Ray ray,
+               inout RayPayload payload, out RayHit hit )
+{
+	uint objectIndex      = traceable.x;
+	uint traversableIndex = traceable.y;
+
+    RayDesc rd;
+    rd.Origin    = ray.origin;
+    rd.Direction = ray.direction;
+    rd.TMin      = ray.minT;
+    rd.TMax      = ray.maxT;    
+
+    RayQueryType q;
+    if( objectIndex == ~uint(0) )
+    {
+        q.TraceRayInline( tRootTLAS, 0, rayType, rd );
+    }
+#if defined(TraceObject)
+    else
+#ifdef CPR_VENDOR_AMD
+	//this check is redundant but without it AMD seems to speculatively fetch the traversable, even when 'else' branch is not taken, causing a page fault
+	if( traversableIndex != ~uint(0) )
+#endif
+    {
+		uint rayFlags = RAY_FLAG_FORCE_NON_OPAQUE; //force anyhit evaluation for opaque geometries so that object filtering works
+        q.TraceRayInline( resourceByIndex( tTraversables, traversableIndex ), rayFlags, rayType, rd );
+    }
+#endif
+
+#ifdef CPR_VENDOR_AMD
+	//AMD bug workaround
+	for( uint i=0; i<0xFFFFFFFF; ++i )
+	{
+		if( !q.Proceed() )
+		{
+			break;
+		}
+#else
+	while( q.Proceed() )
+	{
+#endif
+		uint candidateObjectIndex = q.CandidateInstanceID() + q.CandidateGeometryIndex();
+	#if defined(TraceObject)
+		if( objectIndex != ~uint(0) && objectIndex != candidateObjectIndex )
+		{
+			uint traversableScatterMask = bDXRScatterMask[candidateObjectIndex / 8];
+			uint candidateScatterBit    = 1u << (candidateObjectIndex % 8);
+			if( !(traversableScatterMask & candidateScatterBit) )
+			{
+				continue;
+			}
+		}
+	#endif
+	#if defined(TraceTransparency)
+		DXRInstanceData instance = bDXRInstanceData[candidateObjectIndex];
+		if( instance.transparency_sampleCoordBuffer > 0x3FFFFFFF )
+		{
+			uint subroutineIndex   =  instance.transparency_sampleCoordBuffer >> 30;
+			uint transparencyIndex = (instance.transparency_sampleCoordBuffer >> 15) & 0x7FFF;
+			uint sampleCoordIndex  =  instance.transparency_sampleCoordBuffer & 0x7FFF;
+			uint triangleOffset    =  instance.sampleDesc_triangleOffset & 0x3FFFFFFF;
+			bool flagSampleDesc    =  instance.sampleDesc_triangleOffset & TRANSPARENCY_FLAG_SAMPLEDESC;
+			bool flagTriplanar     =  instance.sampleDesc_triangleOffset & TRANSPARENCY_FLAG_TRIPLANAR;
+
+			uint  triangleIndex = q.CandidatePrimitiveIndex() + triangleOffset;
+			vec2  triangleCoord = q.CandidateTriangleBarycentrics();
+			uint  sampleCoordBufferIndex = uSampleCoordBuffersBaseIndex + sampleCoordIndex;
+			uint3 sampleCoord = resourceByIndex(bDXRSampleCoordBuffers,sampleCoordBufferIndex)[triangleIndex].xyz;
+
+			vec2 alpha;
+		#if defined(TraceTransparencyTriplanar)
+			if( flagTriplanar )
+			{
+				vec3 Pobj = q.CandidateObjectRayOrigin() + q.CandidateObjectRayDirection() * q.CandidateTriangleRayT();
+				alpha = sampleTransparencyTriplanar( triangleCoord, triangleIndex, Pobj, transparencyIndex, candidateObjectIndex, sampleCoord, flagSampleDesc );
+			}
+			else
+		#endif
+			{
+				alpha = sampleTransparencyUV( triangleCoord, triangleIndex, transparencyIndex, candidateObjectIndex, sampleCoord, flagSampleDesc );
+			}
+
+		#if defined(TraceTransparencyCutout)
+			if( subroutineIndex == TRANSPARENCY_SUBROUTINE_CUTOUT )
+			{
+				if( alpha.x < alpha.y )
+				{
+					continue;
+				}
+			}
+		#endif
+		#if defined(TraceTransparencyDither)
+			if( subroutineIndex == TRANSPARENCY_SUBROUTINE_DITHER )
+			{
+				float noise = rngNextFloat( payload.rng );
+				if( alpha.x < noise )
+				{
+					continue;
+				}
+			}
+		#endif
+		}
+	#endif
+	#if defined(TraceSubsurfaceDiffusion)
+		if( payload.hitIndices != ~uint(0) )
+		{
+			uint currentHitIndex  = payload.hitIndices & 0xFFFF;
+			uint selectedHitIndex = payload.hitIndices >> 16;
+			if( currentHitIndex == selectedHitIndex )
+			{
+				q.Abort();
+			}
+			else
+			{
+				payload.hitIndices++; //increment currentHitIndex
+				continue;
+			}
+		}
+	#endif
+		q.CommitNonOpaqueTriangleHit();
+	}
+
+    hit.objectIndex    = q.CommittedInstanceID() + q.CommittedGeometryIndex();
+    hit.triangleIndex  = q.CommittedPrimitiveIndex();
+    hit.triangleCoords = q.CommittedTriangleBarycentrics();
+    hit.distance       = q.CommittedRayT();
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
+bool traceRay( Traceable traceable, uint rayType, Ray ray,
+			   inout RNG rng, out RayHit hit )
+{
+	RayPayload payload;
+	#if defined(TraceTransparencyDither)
+		payload.rng = rng;
+	#endif
+	bool occluded = traceRay( traceable, rayType, ray, payload, hit );
+	#if defined(TraceTransparencyDither)
+		rng = payload.rng;
+	#endif
+	return occluded;
+}
+
+bool traceRay( Traceable traceable, uint rayType, Ray ray,
+               inout RayPayload payload )
+{
+	RayHit hit;
+	return traceRay( traceable, rayType, ray, payload, hit );
+}
+
+bool traceRay( Traceable traceable, uint rayType, Ray ray,
+			   inout RNG rng )
+{
+	RayHit hit;
+	return traceRay( traceable, rayType, ray, rng, hit );
+}

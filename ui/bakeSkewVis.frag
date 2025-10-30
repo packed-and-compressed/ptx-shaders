@@ -1,0 +1,8 @@
+BEGIN_PARAMS
+	INPUT0(vec4,fColor)
+
+	OUTPUT_COLOR0(vec4)
+END_PARAMS
+{
+	OUT_COLOR0 = fColor;
+}
