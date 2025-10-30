@@ -1,0 +1,211 @@
+#include "../common/const.sh"
+#include "lenssystem.comp"
+
+uniform float4 uLensFlareOptions; // x: coating, y: size
+uniform float3 uLightParams; // xyz: direction
+
+USE_STRUCTUREDBUFFER(LensInterface,bLensInterfaces);
+USE_BUFFER(int,bBounces);
+USE_LOADSTORE_STRUCTUREDBUFFER(Vertex,bVertexBuffer,0);
+
+// Refer to paper's supplement
+Ray traceRay(Ray r, float lambda, int2 bounce)
+{
+	int LEN = bounce.x + (bounce.x - bounce.y) + (NUM_INTERFACES - bounce.y) - 1;
+	
+	// Initialization
+	int PHASE = 0; // ray-tracing phase
+	int DELTA = 1; // delta for for-loop
+	int T = 1; // index of target interface to test
+
+	int k;
+	for (k = 0; k < LEN; k++, T += DELTA)
+	{
+		LensInterface F = bLensInterfaces[T];
+
+		bool bReflect = (T == bounce[PHASE]) ? true : false;
+		if (bReflect)
+		{
+			DELTA = -DELTA;
+			PHASE++;
+		}
+
+		// intersection test
+		Intersection i;
+		if (F.flat)
+		{
+			i = intersectPlane(r, F);
+		}
+		else
+		{
+			i = intersectSphere(r, F);
+		}
+
+		if (!i.hit)
+		{
+			r.pos = 0;
+			r.intensity = 0;
+			break; // exit upon miss
+		}
+
+		// record texture coord . or max. rel . radius
+		if (!F.flat)
+			r.radius = max(r.radius, length(i.pos.xy) / F.sa);
+		else if (T == APERTURE_ID) // iris aperture plane
+			r.uv = i.pos.xy / bLensInterfaces[APERTURE_ID].radius;
+
+		// Update ray direction and position
+		r.dir = normalize(i.pos - r.pos);
+		if (i.inverted)
+		{
+			r.dir *= -1.f; // Correct an inverted ray
+		}
+		r.pos = i.pos;
+
+		// Skip reflection / refraction for flat surfaces
+		if (F.flat)
+		{
+			continue;
+		}
+
+		// Do reflection / refraction for spher. surfaces
+		float n0 = r.dir.z < 0.f ? F.nx : F.nz;
+		float n2 = r.dir.z < 0.f ? F.nz : F.nx;
+
+		if (!bReflect)
+		{
+			// Refraction
+			r.dir = refract(r.dir, i.norm, n0 / n2);
+
+			if (length(r.dir) == 0)
+			{
+				r.pos = 0;
+				r.intensity = 0;
+				break; // total reflection
+			}
+		}
+		else
+		{
+			// reflection with AR Coating
+			r.dir = reflect(r.dir, i.norm);
+
+			float n1 = max(sqrt(n0 * n2), 1.38f + uLensFlareOptions.x); // 1.38=lowest achievable
+			float R = fresnelAR(i.theta + 0.001f, lambda, F.d1, n0, n1, n2);
+			R = saturate(R); // avoid nans
+
+			r.intensity *= R; // update ray intensity
+		}
+	}
+
+	if (k < LEN)
+	{
+		r.pos = 0;
+		r.intensity = 0; // early-exit rays = invalid
+	}
+	
+	return r;
+}
+
+uint remapIndexClamp(int2 pos)
+{
+	int x = clamp(pos.x, 0, PATCH_TESSELATION - 1);
+	int y = clamp(pos.y, 0, PATCH_TESSELATION - 1);
+	return x + y * PATCH_TESSELATION;
+}
+
+float getArea(int2 pos, int offset)
+{
+	// a----b----c
+	// |  A |  B |
+	// d----e----f
+	// |  C |  D |
+	// g----h----i
+
+	float3 a = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(-1, 1)) + offset]);
+	float3 b = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(0, 1)) + offset]);
+	float3 c = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(1, 1)) + offset]);
+	float3 d = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(-1, 0)) + offset]);
+	float3 e = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(0, 0)) + offset]);
+	float3 f = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(1, 0)) + offset]);
+	float3 g = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(-1, -1)) + offset]);
+	float3 h = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(0, -1)) + offset]);
+	float3 i = getVertexPosition(bVertexBuffer[remapIndexClamp(pos + int2(1, -1)) + offset]);
+
+	float ab = length(a.xy - b.xy);
+	float bc = length(b.xy - c.xy);
+	float ad = length(a.xy - d.xy);
+	float be = length(b.xy - e.xy);
+	float cf = length(c.xy - f.xy);
+	float de = length(d.xy - e.xy);
+	float ef = length(e.xy - f.xy);
+	float dg = length(d.xy - g.xy);
+	float eh = length(e.xy - h.xy);
+	float fi = length(f.xy - i.xy);
+	float gh = length(g.xy - h.xy);
+	float hi = length(h.xy - i.xy);
+
+	bool leftEdge = (pos.x == 0);
+	bool rightEdge = (pos.x == (PATCH_TESSELATION - 1));
+	bool bottomEdge = (pos.y == 0);
+	bool topEdge = (pos.y == (PATCH_TESSELATION - 1));
+
+	float A = lerp(ab, de, 0.5f) * lerp(ad, be, 0.5f) * (!leftEdge && !topEdge);
+	float B = lerp(bc, ef, 0.5f) * lerp(be, cf, 0.5f) * (!rightEdge && !topEdge);
+	float C = lerp(de, gh, 0.5f) * lerp(dg, eh, 0.5f) * (!leftEdge && !bottomEdge);
+	float D = lerp(ef, hi, 0.5f) * lerp(eh, fi, 0.5f) * (!rightEdge && !bottomEdge);
+
+	bool isEdge = (leftEdge || rightEdge) || (bottomEdge || topEdge);
+	bool isCorner = (leftEdge || rightEdge) && (bottomEdge || topEdge);
+	float noAreaContributors = isCorner ? 1.f : isEdge ? 2.f : 4.f;
+
+	float unitPatchLength = (0.5f * uLensFlareOptions.y) / (float) PATCH_TESSELATION;
+	float Oa = unitPatchLength * unitPatchLength * noAreaContributors;
+	float Na = (A + B + C + D) / noAreaContributors;
+
+	float area = (Oa / (Na + 0.00001));
+
+	return isnan(area) ? 0.0f : area;
+}
+
+TraceResult getTraceResult(float2 ndc, float wavelength, int2 bounces)
+{
+	float3 p = float3(ndc * (0.5f * uLensFlareOptions.y), 0.f);
+
+	// Project all starting points in the entry lens
+	Ray c = { p, float3(0, 0, -1.f), float2(0, 0), 0, 0 };
+	Intersection i = intersectSphere(c, bLensInterfaces[0]);
+	p = i.pos - uLightParams;
+
+	Ray r = { p, uLightParams, float2(0, 0), 0, 1 };
+	r = traceRay(r, wavelength, bounces);
+
+	TraceResult result;
+	result.pos = r.pos;
+	result.uv = r.uv;
+	result.radius = r.radius;
+	result.intensity = r.intensity;
+	return result;
+}
+
+COMPUTE(NUM_THREADS,NUM_THREADS,1)
+{
+	int bid = GROUP_ID.x / NUM_GROUPS;
+	int dataOffset = bid * PATCH_TESSELATION * PATCH_TESSELATION;
+	
+	int2 pos = int2( GROUP_THREAD_ID.xy + (GROUP_ID.xy % NUM_GROUPS) * NUM_THREADS );
+	int2 bounce = unpackBounce(bBounces[bid]);
+	float2 uv = float2(pos) / float(PATCH_TESSELATION - 1);
+	float2 ndc = (uv - 0.5f) * 2.0f;
+
+	float3 STANDARD_WAVELENGTHS = float3( 650.0f, 510.0f, 475.0f );
+	float wavelength = STANDARD_WAVELENGTHS[GROUP_ID.z] * NANO_METER;
+
+	TraceResult result = getTraceResult(ndc, wavelength, bounce);
+	
+	uint offset = (pos.x + pos.y * PATCH_TESSELATION) + dataOffset;
+	bVertexBuffer[offset].position = float4(result.pos.xyz, result.radius);
+	bVertexBuffer[offset].reflectance[GROUP_ID.z] = result.intensity;
+	bVertexBuffer[offset].reflectance.w = getArea(pos, dataOffset);
+	bVertexBuffer[offset].uv = result.uv;
+	bVertexBuffer[offset].ndc = ndc;
+}

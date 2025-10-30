@@ -1,0 +1,68 @@
+#include "BC4.comp"
+
+USE_TEXTURE2D_NOSAMPLER(tSource);
+
+USE_LOADSTORE_BUFFER(uint,bOutput,0);
+
+#ifdef BC4_RECORD_METRICS
+USE_INTERLOCKED_BUFFER(bMetrics,1);
+#endif
+
+uniform uint2	uSrcOffset;
+uniform uint2	uSrcMax;
+uniform uint2	uBlockCounts;
+uniform uint	uRowSize;
+uniform uint	uSrcLod;
+
+
+COMPUTE(8,8,1)
+{
+	if( DISPATCH_THREAD_ID.x >= uBlockCounts.x ||
+		DISPATCH_THREAD_ID.y >= uBlockCounts.y )
+	{ return; }
+
+	//load 16 RG source values
+	RawBlock src[2], recon;
+	uint2 base = uSrcOffset + DISPATCH_THREAD_ID.xy * 4;
+	uint i;
+	
+	for( i=0; i<16; ++i )
+	{
+		uint2 coord = min( base + uint2( i & 3, (i >> 2) ), uSrcMax );
+		vec2 tex = saturate( imageLoadLod( tSource, coord, uSrcLod ).xy );
+		src[0].b[i] = tex.x;
+		src[1].b[i] = tex.y;
+	}
+
+	Block bestBlock;
+#ifdef BC4_FAST
+	bool fast = true;
+#else
+	bool fast = false;
+#endif
+
+	for(int k = 0; k < 2; k++)
+	{
+		BC4Metrics m1 = BC4Compress(src[k], recon, bestBlock, fast);
+		
+		//store the block
+		uint blockIndex = DISPATCH_THREAD_ID.x + DISPATCH_THREAD_ID.y * uRowSize;
+		bOutput[blockIndex*4 + 0 + 2 * k] = bestBlock.lower;
+		bOutput[blockIndex*4 + 1 + 2 * k] = bestBlock.upper;
+	
+		//record metrics
+		#ifdef BC4_RECORD_METRICS
+			uint errori = m1.blockError;
+			uint prev;
+			interlockedAdd( bMetrics, 0, 1, prev ); //block count
+			interlockedAdd( bMetrics, 1, errori, prev ); //sum of squares of errors
+			interlockedMax( bMetrics, 2, errori, prev ); //worst block
+			if( m1.mode == 0 )
+			{ interlockedAdd( bMetrics, 3, 1, prev ); } //number of "mode 0" blocks
+			else if( m1.mode == 1 )
+			{ interlockedAdd( bMetrics, 4, 1, prev ); } //number of "mode 1" blocks
+			else if( m1.mode == 2 )
+			{ interlockedAdd( bMetrics, 5, 1, prev ); } //number of "mode 2" blocks
+		#endif
+	}
+}

@@ -1,0 +1,137 @@
+#ifndef GRADIENT_SAMPLE_HELPER_COMP
+#define GRADIENT_SAMPLE_HELPER_COMP
+
+#include "data/shader/scene/raytracing/buffers.comp"
+
+USE_TEXTURE2D( tDepth );
+USE_TEXTURE2D( tNormal );
+USE_TEXTURE2D( tPrevDepth );
+USE_TEXTURE2D( tPrevNormal );
+USE_TEXTURE2D( tMotionVector );
+
+uniform uint2 uScreenSize;
+uniform vec2  uInvScreenSize;
+
+#define COLOR_WEIGHT 4.0f
+#define POSITION_WEIGHT 1.0f
+#define NORMAL_POWER 64.0f
+
+#define TILE_OFFSET_SHIFT 3u
+#define TILE_OFFSET_MASK uint( ( 1u << TILE_OFFSET_SHIFT ) - 1 )
+
+bool isInsideScreen( const int2 coord )
+{
+	if( ( coord.x >= 0 ) &&
+		( coord.x < int( uScreenSize.x ) ) &&
+		( coord.y >= 0 ) &&
+		( coord.y < int( uScreenSize.y ) ) )
+	{
+		return true;
+	}
+	return false;
+}
+
+float loadDepth(
+	const uint2 coord )
+{
+	float depth = imageLoad( tDepth, coord ).x;
+	depth = abs( depth ) ;
+	return depth;
+}
+
+vec3 loadNormal(
+	const uint2 coord )
+{
+	return imageLoad( tNormal, coord ).xyz;
+}
+
+#ifdef USE_GRADIENT
+
+float loadPrevDepth(
+	const uint2 coord )
+{
+	float depth = imageLoad( tPrevDepth, coord ).x;
+	depth = abs( depth );
+	return depth;
+}
+
+vec3 loadPrevNormal(
+	const uint2 coord )
+{
+	return imageLoad( tPrevNormal, coord ).xyz;
+}
+
+#endif
+
+bool isDepthSimilar(
+	const float currentDepth,
+	const float previousDepth )
+{
+	return ( ( abs( previousDepth - currentDepth ) ) < ( max( previousDepth, currentDepth ) * 0.1f ) );
+}
+
+bool isDepthSimilar(
+	const float currentDepth,
+	const float previousDepth,
+	const float fWidthDepth)
+{
+	return ( ( abs( previousDepth - currentDepth ) ) < ( 2.0f * ( fWidthDepth + 1e-3f ) ) );
+}
+
+const float pixelDist(
+	const vec4 src,
+	const vec4 neighbor )
+{
+	return abs( luminance( src.xyz ) - luminance( neighbor.xyz ) );
+}
+
+const float pixelDist(
+	const vec3 src,
+	const vec3 neighbor )
+{
+	return abs( luminance( src ) - luminance( neighbor ) );
+}
+
+const float pixelDist(
+	const float src,
+	const float neighbor )
+{
+	return abs( src - neighbor );
+}
+
+template <typename Pixel>
+const float computeColorWeight(
+	const Pixel currentSrc,
+	const Pixel neighborSrc,
+	const float currentVariance )
+{
+	const float t = pixelDist( currentSrc, neighborSrc );
+	return t / ( COLOR_WEIGHT * ( sqrt( max( currentVariance + 1e-4f, 0.0f ) ) ) );
+}
+
+const float computeDepthWeight(
+	const float currentDepth,
+	const float neighborDepth,
+	const float depthGradient,
+	const vec2	offset )
+{
+	const float phiDepth = ( POSITION_WEIGHT * abs( depthGradient * length( offset ) ) + 1e-8f);
+	return phiDepth == 0.0f ? 0 : abs( currentDepth - neighborDepth ) / phiDepth;
+}
+
+int2 getGradientTilePos( uint idx, int gradientDownsample )
+{
+	// gradient sample not stored in the previous frame, this creates a new sample in the center of the tile
+	if( idx < ( 1u << 31 ) )
+	{
+		return gradientDownsample / 2;
+	}
+	return int2( ( idx & TILE_OFFSET_MASK ), ( idx >> TILE_OFFSET_SHIFT ) & TILE_OFFSET_MASK );
+}
+
+uint getGradientIdxFromTilePos( uint2 tilePos )
+{
+	return ( 1u << 31u ) | ( tilePos.x ) | ( tilePos.y << TILE_OFFSET_SHIFT );
+}
+
+#endif

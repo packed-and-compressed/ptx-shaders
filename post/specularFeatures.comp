@@ -1,0 +1,28 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+
+uniform uint2 uScreenSize;
+uniform vec2 uInvScreenSize;
+USE_TEXTURE2DARRAY( tReSTIRSpecularSample );
+
+USE_LOADSTORE_TEXTURE2D( float, tSpecularFeatures, 0 );
+
+COMPUTE( 8, 8, 1 )
+{
+	uint2 dispatchCoord = DISPATCH_THREAD_ID_8x8;
+	if( dispatchCoord.x >= uScreenSize.x || dispatchCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	// calculate screen space UV
+	const vec2 screenCoord = ( vec2( dispatchCoord.xy ) + vec2( 0.5f, 0.5f ) ) * vec2( uInvScreenSize );
+	const vec3 visiblePos = texture2DArrayLod( tReSTIRSpecularSample, vec3( screenCoord, 0.0f ), 0.0f ).rgb;
+	const vec3 samplePos = texture2DArrayLod( tReSTIRSpecularSample, vec3( screenCoord, 1.0f ), 0.0f ).rgb;
+
+	const float rayDist = length( visiblePos - samplePos );
+	const vec3 rayDir = normalize( samplePos - visiblePos );
+	imageStore( tSpecularFeatures, dispatchCoord, vec4( rayDist, asfloat( packUnitVectorOct24bit( rayDir ) ), 0, 0 ) );
+}

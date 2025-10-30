@@ -1,0 +1,21 @@
+#include "../common/util.sh"
+#include "../common/udimsample.sh"
+
+USE_INTERLOCKED_BUFFER(rawBuffer, 0);
+uniform vec2	uTexCoord;
+
+COMPUTE(1,1,1)
+{
+	if( DISPATCH_THREAD_ID.x == 0 )
+	{
+		uint mapIndex;
+		int channelCount;
+		vec2 mapSize;
+		resolveUDIMValues( uTexCoord, mapIndex, channelCount, mapSize );
+
+		vec4 result = textureWithSamplerLod( resourceByIndex( tGlobalTextures, mapIndex ), sUDIMSampler, uTexCoord, 0.0 );
+
+		interlockedStore4( rawBuffer, 0, asuint(result) );
+	}
+}
+

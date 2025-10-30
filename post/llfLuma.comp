@@ -1,0 +1,29 @@
+USE_LOADSTORE_TEXTURE2D( float, uOutput0, 0 );
+USE_LOADSTORE_TEXTURE2D( float, uOutput1, 1 );
+
+USE_TEXTURE2D_NOSAMPLER( tInput );
+
+float luminace( float3 rgb )
+{
+    return dot( rgb, float3( 0.212671f, 0.715160f, 0.072169f ) );
+}
+
+float LinearTosRGB(float x)
+{
+	// Approximately pow(x, 1.0 / 2.2)
+	return x < 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+float3 LinearTosRGB(float3 x)
+{
+	return float3(LinearTosRGB(x.x), LinearTosRGB(x.y), LinearTosRGB(x.z));
+}
+
+COMPUTE( 16,16,1 )
+{
+    float3 c = imageLoad( tInput, DISPATCH_THREAD_ID.xy ).rgb;
+	c = LinearTosRGB( c );
+    float luma = luminace( c );
+	imageStore( uOutput0, DISPATCH_THREAD_ID.xy, vec4( luma, luma, luma, 0.0f ) );
+	imageStore( uOutput1, DISPATCH_THREAD_ID.xy, vec4( max( c / luma, 0.0f ) , 0.0f ) );
+}

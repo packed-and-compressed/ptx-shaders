@@ -1,0 +1,15 @@
+USE_TEXTURE2D_NOSAMPLER(tSource);
+
+USE_LOADSTORE_TEXTURE2D(float, uResult, 0);
+uniform int uWidth;
+uniform uint2	uSrcOffset;
+uniform uint2	uDstOffset;
+uniform float 	uCorrectionRange;
+uniform float 	uCorrectionBias;
+COMPUTE(8,8,1)
+{
+	vec2 s12 = saturate( imageLoadLod( tSource, DISPATCH_THREAD_ID.xy + uSrcOffset, 0 ).xy );
+	float s = s12.x + (s12.y-uCorrectionBias) * uCorrectionRange / 255.0;
+	
+	imageStore(uResult, DISPATCH_THREAD_ID.xy + uDstOffset, vec4(s, s, s, s));
+}

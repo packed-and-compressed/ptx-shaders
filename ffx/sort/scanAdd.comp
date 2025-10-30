@@ -1,0 +1,18 @@
+#include "params.sh"
+#include "scanPrefix.comp"
+
+COMPUTE(FFX_PARALLELSORT_THREADGROUP_SIZE,1,1)
+{
+	const FFX_ParallelSortCB params = FFX_GetParams();
+	
+	// When doing adds, we need to access data differently because reduce 
+	// has a more specialized access pattern to match optimized count
+	// Access needs to be done similarly to reduce
+	// Figure out what bin data we are reducing
+	uint BinID = GROUP_ID.x / params.NumReduceThreadgroupPerBin;
+	uint BinOffset = BinID * params.NumThreadGroups;
+
+	// Get the base index for this thread group
+	uint BaseIndex = (GROUP_ID.x % params.NumReduceThreadgroupPerBin) * FFX_PARALLELSORT_ELEMENTS_PER_THREAD * FFX_PARALLELSORT_THREADGROUP_SIZE;
+	FFX_ParallelSort_ScanPrefix( params.NumThreadGroups, GROUP_THREAD_ID.x, GROUP_ID.x, WAVE_LANEINDEX, WAVE_LANECOUNT, BinOffset, BaseIndex, true, params );
+}

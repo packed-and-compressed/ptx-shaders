@@ -1,0 +1,133 @@
+#include "data/shader/common/rng.comp"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/rng.comp"
+
+uniform uint2 uScreenSize;
+uniform uint2 uTargetSize;
+uniform int	  uPrepassScaleFactor;
+uniform uint  uInputChannel;
+uniform uint  uOutputChannel;
+uniform int	  uInputIsTargetSize;
+uniform int	  uRandomSeed;
+
+USE_TEXTURE2D( tDepth );
+USE_TEXTURE2D( tNormal );
+USE_TYPEDTEXTURE2D( uint, tObjectID );
+USE_TEXTURE2DARRAY( tInput );
+#ifdef SPECULAR_UPSAMPLE
+USE_TEXTURE2DARRAY( tAlbedo );
+#endif
+
+USE_LOADSTORE_TEXTURE2DARRAY( float, tUpsampled, 0 );
+
+float loadDepth(
+	const vec2 uv )
+{
+	float depth = texture2DLod( tDepth, uv, 0.0f ).x;
+	return abs( depth );
+}
+
+vec3 loadNormal(
+	const vec2 uv )
+{
+	return texture2DLod( tNormal,  uv, 0.0f ).xyz;
+}
+
+
+#ifdef SPECULAR_UPSAMPLE
+float loadRoughness(
+	const vec2 uv )
+{
+	return max( 0.0f, 1.0f - texture2DArrayLod( tAlbedo, vec3( uv, float( HybridAlbedoChannel::HYBRID_ALBEDO_SPECULAR_GLOSSINESS ) ), 0.0f ).w );
+}
+#endif
+
+COMPUTE( 8, 8, 1 )
+{
+	// full resolution coords
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uTargetSize.x || outputCoord.y >= uTargetSize.y )
+	{
+		return;
+	}
+	RNG			rng = rngInit( ushort2( outputCoord ), uRandomSeed );
+	vec2		currentUV = ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) + ( vec2( rngNextFloat( rng ), rngNextFloat( rng ) ) * 2.0f - 1.0f ) ) / vec2( uTargetSize );
+	
+	const float depthHiRes = loadDepth( currentUV );
+	const vec3	normalHiRes = loadNormal( currentUV );
+	const uint	objectIDHires = imageLoad( tObjectID, uint2( currentUV * vec2( uTargetSize ) ) ).x;
+#ifdef SPECULAR_UPSAMPLE
+	const float roughnessHiRes = loadRoughness( currentUV );
+#endif
+
+	// calculate neighbor coords in full resolution
+	const vec2 offset[4] = { vec2( 0, 1 ), vec2( 1, 0 ), vec2( -1, 0 ), vec2( 0, -1 ) };
+	vec2	   neighborFullResCoord[4];
+	for (int i = 0; i < 4; ++i)
+	{
+		neighborFullResCoord[i] = ( vec2( outputCoord ) ) + offset[i];
+	}
+	// half res coord
+	float depthWeights[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	float normalWeights[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#ifdef SPECULAR_UPSAMPLE
+	float roughnessWeights[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#endif
+
+	for( int i = 0; i < 4; ++i )
+	{
+		vec2 neighborScaledResCoord = floor( neighborFullResCoord[i] * ( 1.0f / uPrepassScaleFactor ) );
+		if( neighborScaledResCoord.x >= 0.0f &&
+			neighborScaledResCoord.y >= 0.0f &&
+			neighborScaledResCoord.x < uScreenSize.x &&
+			neighborScaledResCoord.y < uScreenSize.y )
+		{
+			const vec2	neighborUV = ( neighborFullResCoord[i] + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize );
+			const uint	neighborObjectID = imageLoad( tObjectID, uint2( neighborUV * vec2( uTargetSize ) ) ).x;
+			if (neighborObjectID == objectIDHires)
+			{
+				const float depth = loadDepth( neighborUV );
+				depthWeights[i] = 1.0f / ( 1e-4f + abs( depth - depthHiRes ) );
+				const vec3 normal = loadNormal( neighborUV );
+				normalWeights[i] = pow( abs( dot( normal, normalHiRes ) ), 64.0f );
+#ifdef SPECULAR_UPSAMPLE
+				const float roughness = loadRoughness( neighborUV );
+				roughnessWeights[i] = 1.0f / ( 1e-4f + abs( roughness - roughnessHiRes ) );
+#endif
+			}
+		}
+	}
+
+	vec3 color = vec3( 0, 0, 0 );
+	float weightSum = 0.0f;
+	for (int i = 0; i < 4; ++i)
+	{
+		float weight = 1.0f;
+		weight *= depthWeights[i];
+		weight *= normalWeights[i];
+#ifdef SPECULAR_UPSAMPLE
+		weight *= roughnessWeights[i];
+#endif
+		weight = max( weight, 0.0f );
+		
+		if (weight > 0.0f)
+		{
+			const vec2 neighborScaledResCoord = ( neighborFullResCoord[i] ) * ( uInputIsTargetSize ? 1.0f : ( 1.0f / uPrepassScaleFactor ) );
+
+			// get radiance
+			const vec2 neighborScaledResUV = ( ( neighborScaledResCoord + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize ) );
+			const vec3 radiance = texture2DArrayLod( tInput, vec3( neighborScaledResUV, float( uInputChannel ) ), 0.0f ).xyz;
+
+			// accumulate
+			color += radiance * weight;
+			weightSum += weight;
+		}
+	}
+	color *= rcpSafe( weightSum );
+	// ensure accumulated radiance is non-negative and at most largest half-float normal number
+	// filters out any NaNs and +Infs that might have crept in
+	color = clamp( color, vec3( 0, 0, 0 ), vec3( 65504, 65504, 65504 ) );
+	// store
+	imageStoreArray( tUpsampled, outputCoord, uOutputChannel, vec4( color.xyz, 1.0f ) );
+}

@@ -1,0 +1,157 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+#include "data/shader/common/unproject.sh"
+
+USE_TEXTURE2D( tInput );
+USE_TEXTURE2D( tAverageDist );
+USE_TEXTURE2D_NOSAMPLER( tDepth );
+USE_TEXTURE2D_NOSAMPLER( tNormal );
+USE_SAMPLER( sPrepassSampler );
+
+USE_LOADSTORE_TEXTURE2D( float, tFilteredAO, 0 );
+
+uniform uint2 uScreenSize;
+uniform vec2 uInvScreenSize;
+uniform mat4 uProjection;
+uniform int	uSpiralTurnsCount;
+
+#define MIN_RADIUS 4.0f
+#define MAX_RADIUS 16.0f
+#define AO_SIGMA 2.0f
+#define DEPTH_SIGMA 0.1f
+#define SPARSE_SAMPLE_COUNT 50
+
+struct PixelData
+{
+	// AO contribution for current pixel
+	float mAO;
+	// Depth value (NDC coordinate normalized to [0, 1])
+	float mDepth;
+	// View space position (we do world space for AO trace, but for filtering it does not matter)
+	vec3  mPos;
+	// View space normal  (we do world space for AO trace, but for filtering it does not matter)
+	vec3  mNormal;
+};
+
+PixelData samplePixel( const vec2 coord)
+{
+	// fetch multiple data for the pixel we are interested in
+	PixelData p;
+	const float depth = textureWithSamplerLod( tDepth, sPrepassSampler, coord, 0.0 ).x;
+	p.mPos = unprojectViewDepthToViewPos( coord, depth );
+	vec4 clipSpacePos = mulVec( uProjection, p.mPos ).z;
+	p.mDepth = (clipSpacePos.z / clipSpacePos.w) * 0.5f + 1.0f;
+	p.mNormal = textureWithSamplerLod( tNormal, sPrepassSampler, coord, 0.0 ).xyz;
+	p.mAO = texture2DLod( tInput, coord, 0.0 ).x;
+	return p;
+}
+
+// This is sparsely sampled bilateral filter, unlike traditional bilateral
+// filter where a cross filter is usually implemented, we are doing sparse
+// sampled bilateral filter in a spiral with rotation and increasing radius
+// around the center pixel. This is inspired by Mara et al with their GI filter.
+vec2 neighborOffset( 
+	const int sampleNumber, 
+	const int totalSampleCount,
+	const float spinAngle,
+	out float ssR )
+{
+	// screenspace radius
+	ssR = float( sampleNumber + 0.5f ) * ( 1.0f / totalSampleCount );
+	const float angle = ssR * ( uSpiralTurnsCount * 6.28f ) + spinAngle;
+	return vec2( cos( angle ), sin( angle ) );
+}
+
+// Bilateral weight taking into account ao intensity, depth, normal, and plane weight
+// which we then sum over multiple samples and normalize at the end. This implementation
+// is inspired by A Trous filter, which has similar concept as bilateral filter
+float bilateralWeight( 
+	const PixelData center, 
+	const PixelData neighbor )
+{
+	// edge stopping functions (input: ao weight, depth weight, normal weight)
+	// the higher similarity yields higher pixel contribution weight, thus higher contribution to
+	// the weighting inside the filter
+	float aoWeight = 1.0f;
+	{
+		const float t = neighbor.mAO - center.mAO;
+		const float distance2 = t * t;
+		aoWeight = min( 1.0f, exp( -distance2 / AO_SIGMA ) );
+	}
+	float depthWeight = 1.0f;
+	{
+		const float t = neighbor.mDepth - center.mDepth;
+		const float distance2 = t * t;
+		depthWeight = min( 1.0f, exp( -distance2 / DEPTH_SIGMA ) );
+	}
+	float normalWeight = 1.0f;
+	{
+		normalWeight = max(0.0, dot( center.mNormal, neighbor.mNormal ) );
+		normalWeight = pow( normalWeight, 128.0f );
+	}
+	float planeWeight = 1.0f;
+	{
+		const float lowDistanceThreshold2 = 0.001f;
+		// difference in position in viewspace
+		const vec3	t = center.mPos - neighbor.mPos;
+		// distance of the point from the original sample in view space (unbounded)
+		const float distance2 = dot( t, t );
+		// distance of the expected plane (on the perpendicular) with this point (unbounded)
+		const float planeError = max( abs( dot( t, neighbor.mNormal ) ), abs( dot( t, center.mNormal ) ) );
+		// calculate final plane weight
+		planeWeight = ( distance2 < lowDistanceThreshold2 ) ? 1.0f : pow( max( 0.0f, 1.0f - 2.0f * planeError / sqrt( distance2 ) ), 2.0f );
+	}
+	return aoWeight * depthWeight * normalWeight * planeWeight;
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	uint2 dispatchCoord = DISPATCH_THREAD_ID_8x8;
+	if( dispatchCoord.x >= uScreenSize.x || dispatchCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+	// calculate screen space UV
+	const vec2		screenCoord = ( vec2( dispatchCoord.xy ) + vec2( 0.5f, 0.5f ) ) * vec2( uInvScreenSize );
+
+	// sample data for the current pixel
+	const PixelData center = samplePixel( screenCoord );
+
+	float ao = 1.0f;
+	if( center.mPos.z <= 0.0f && center.mPos.z > -1.0e11f )
+	{
+		// filter ao using bilateral filter with neighborhood with weighting depending on the closeness of normal, position, and depth
+		// of the reference pixel and the neighboring pixels
+		ao = 0.0f;
+		float totalWeight = 0.0f;
+
+		// calculate adaptive blur radius based on the average traced AO distance
+		float blurRadius = texture2DLod( tAverageDist, screenCoord, 0.0 ).x;
+		blurRadius = lerp( MIN_RADIUS, MAX_RADIUS, clamp( pow( blurRadius, 4 ), 0.0f, 1.0f ) );
+
+		// hash function
+		const float randomPatternRotationAngle = ( ( ( 3 * dispatchCoord.x ) ^ ( dispatchCoord.y + dispatchCoord.x * dispatchCoord.y ) ) ) * 10.0f;
+		for( int i = 0; i < SPARSE_SAMPLE_COUNT; ++i )
+		{
+			// offset on the unit disk around the current center pixel
+			float			screenspaceRadius;
+			const vec2		unitOffset = neighborOffset( i, SPARSE_SAMPLE_COUNT, randomPatternRotationAngle, screenspaceRadius );
+			const vec2		neighborScreenspaceOffset = vec2( screenspaceRadius * blurRadius * unitOffset );
+			// convert to uv (sparsely sampled neighborhood)
+			const vec2 uv = ( vec2(dispatchCoord) + neighborScreenspaceOffset ) * uInvScreenSize;
+			// now fetch the data for this current neighbor
+			const PixelData neighbor = samplePixel( uv );
+			// calculate weighting, if we are not using filter then we do only a single sample and so just the center pixel itself
+			const float		weighting = bilateralWeight( center, neighbor );
+			// accumulate AO and total weight
+			ao += neighbor.mAO * weighting;
+			totalWeight += weighting;
+		}
+		// calculate final contribution (1/sumOfWeights * ao)
+		ao *= rcpSafe( totalWeight );
+	}
+	// store results
+	imageStore( tFilteredAO, dispatchCoord.xy, vec4( ao, ao, ao, 1.0f ) );
+}

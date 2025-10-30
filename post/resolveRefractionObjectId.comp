@@ -1,0 +1,29 @@
+#include "data/shader/common/rng.comp"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+
+uniform uint2 uInputSize;
+uniform uint2 uTargetSize;
+
+USE_TYPEDTEXTURE2D( uint, tRefractionFeatures );
+
+USE_LOADSTORE_TEXTURE2D( uint, tObjectId, 0 );
+
+
+COMPUTE( 8, 8, 1 )
+{
+	// full resolution coords
+	const uint2 outputCoord = uint2( DISPATCH_THREAD_ID.xy );
+	if( outputCoord.x >= uTargetSize.x || outputCoord.y >= uTargetSize.y )
+	{
+		return;
+	}
+
+	uint4 objectId = imageLoadRW( tObjectId, outputCoord );
+
+	// load refraction
+	const uint2 inputCoord = uint2( ( vec2( outputCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uTargetSize ) * vec2( uInputSize ) );
+	objectId.y = imageLoad( tRefractionFeatures, inputCoord ).z;
+	imageStore( tObjectId, outputCoord, objectId );
+
+}

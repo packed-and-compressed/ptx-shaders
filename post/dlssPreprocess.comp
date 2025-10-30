@@ -1,0 +1,11 @@
+USE_LOADSTORE_TEXTURE2D(float, tOutput, 0);
+
+COMPUTE(8,8,1)
+{
+    //10x smallest representable normal value in R11G11B10F pixel format
+    //for some reason DLSS still produces artifacts for non-zero values less than that :(
+    const float smol = 6.10351562e-4;
+    float4 color = imageLoadRW( tOutput, DISPATCH_THREAD_ID.xy );
+    color.rgb = max( vec3(smol, smol, smol), color.rgb );
+	imageStore( tOutput, DISPATCH_THREAD_ID.xy, color );
+}

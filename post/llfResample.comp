@@ -1,0 +1,51 @@
+#include "data/shader/common/dispatchSwizzle.comp"
+
+USE_TEXTURE2D_NOSAMPLER(tInput);
+USE_LOADSTORE_TEXTURE2D(float, tOutput, 0);
+
+#ifdef LLF_LAPLACIAN
+USE_TEXTURE2D_NOSAMPLER(tInputHigh);
+#endif
+
+uniform uint4 uResolution; //{input, output}
+uniform vec4  uTexelSize; //{input, output}
+
+float sampleInput( vec2 uv, int2 offset )
+{
+	uv = saturate( uv + vec2(offset) * uTexelSize.xy );
+	uint2 coord = min( uint2( uv * vec2(uResolution.xy) ), uint2( uResolution.x-1, uResolution.y-1 ) );
+	return imageLoad( tInput, coord ).r;
+}
+
+COMPUTE(8,8,1)
+{
+	const uint2 outputCoord = DISPATCH_THREAD_ID_8x8.xy;
+	const vec2  uv = (vec2(outputCoord) + vec2(0.5,0.5)) * uTexelSize.zw;
+
+	const float filter[3] = { 0.375, 0.25, 0.0625 };
+    
+    float value = 0.0;
+	for( int y=-2; y<=2; ++y )
+	{
+	    for( int x=-2; x<=2; ++x )
+		{
+			float weight = filter[abs(x)] * filter[abs(y)];
+			value += weight * sampleInput( uv, int2(x, y) );
+		}
+	}
+
+    #if defined(LLF_LAPLACIAN)
+    {
+        float high = imageLoad( tInputHigh, outputCoord ).r;
+        value = high - value;
+    }
+    #endif
+    #if defined(LLF_RECONSTRUCT)
+    {
+        float high = imageLoadRW( tOutput, outputCoord ).r;
+        value = high + value;
+    }
+    #endif
+
+    imageStore( tOutput, outputCoord, vec4( value, 0.0, 0.0, 0.0 ) );
+}

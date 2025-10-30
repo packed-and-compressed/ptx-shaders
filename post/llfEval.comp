@@ -1,0 +1,19 @@
+USE_LOADSTORE_TEXTURE2D( float, uOutput, 0 );
+
+USE_TEXTURE2D_NOSAMPLER( tG );
+USE_TEXTURE2D_NOSAMPLER( tLremap );
+
+uniform float2 Params;
+
+COMPUTE( 16,16,1 )
+{
+    const float g = Params[0];
+    const float gStep = Params[1];
+
+    float4 L = imageLoadRW( uOutput, DISPATCH_THREAD_ID.xy );
+    float4 G = imageLoad( tG, DISPATCH_THREAD_ID.xy );
+    float4 Lremap = imageLoad( tLremap, DISPATCH_THREAD_ID.xy );
+    float4 a = abs( G - g );
+    L = L + float4(( a < gStep )) * Lremap * ( 1.0f - a / gStep );
+	imageStore( uOutput, DISPATCH_THREAD_ID.xy, L );
+}

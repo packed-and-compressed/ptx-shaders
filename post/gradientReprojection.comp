@@ -1,0 +1,150 @@
+#define USE_GRADIENT
+
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/mat/state.comp"
+#include "data/shader/post/gradientSampleHelper.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+USE_TYPEDTEXTURE2D( uint, tPrevPrepassObjectID );
+USE_TEXTURE2D( tPrevPrepassGeometry );
+USE_INTERLOCKED_BUFFER( bGradientSamples, 0 );
+
+// overwrite the values of these for forward projected
+USE_LOADSTORE_TEXTURE2D( uint, tPrepassObjectID, 1 );
+USE_LOADSTORE_TEXTURE2D( float, tPrepassGeometry, 2 );
+USE_LOADSTORE_TEXTURE2D( uint, tRNGHistory, 3 );
+#define RT_RADIANCE_ATTACHMENT 4
+#include "data/shader/scene/raytracing/output.comp"
+#ifdef HYBRID_DEBUG
+USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 5 );
+#endif
+
+uniform vec4   uUnproject;	  // { -2/proj[0][0], -2/proj[1][1], (1-proj[2][0])/proj[0][0], (1-proj[2][1])/proj[1][1] }
+uniform vec4   uPrevUnproject;// { -2/proj[0][0], -2/proj[1][1], (1-proj[2][0])/proj[0][0], (1-proj[2][1])/proj[1][1] }
+
+uniform mat4   uInvViewMatrix;
+uniform mat4   uPrevInvViewMatrix;
+
+// note: should really be model view projection
+uniform mat4   uViewProjMatrix;
+
+uniform uint2  uGradientSize;
+uniform uint   uFrameNumber;
+uniform int	   uGradientDownSample;
+
+vec3 loadPosition( bool isCurrent, vec2 uv )
+{
+	vec3 p;
+	if( isCurrent )
+	{
+		p.z = texture2DLod( tDepth, uv, 0.0 ).x;
+		p.xy = p.z * ( uv * uUnproject.xy + uUnproject.zw );
+		p = mulPoint( uInvViewMatrix, p ).xyz;
+	}
+	else
+	{
+		p.z = texture2DLod( tPrevDepth, uv, 0.0 ).x;
+		p.xy = p.z * ( uv * uPrevUnproject.xy + uPrevUnproject.zw );
+		p = mulPoint( uPrevInvViewMatrix, p ).xyz;
+	}
+	return p;
+}
+
+
+void encryptTea( inout uint2 arg )
+{
+	const uint key[] = 
+	{
+		0xa341316c, 0xc8013ea4, 0xad90777d, 0x7e95761e
+	};
+	uint v0 = arg.x, v1 = arg.y;
+	uint sum = 0;
+	uint delta = 0x9e3779b9;
+
+	for( int i = 0; i < 16; i++ )
+	{
+		sum += delta;
+		v0 += ( ( v1 << 4 ) + key[0] ) ^ ( v1 + sum ) ^ ( ( v1 >> 5 ) + key[1] );
+		v1 += ( ( v0 << 4 ) + key[2] ) ^ ( v0 + sum ) ^ ( ( v0 >> 5 ) + key[3] );
+	}
+	arg.x = v0;
+	arg.y = v1;
+}
+
+
+COMPUTE( 8, 8, 1 )
+{
+	uint2 prevIdx = DISPATCH_THREAD_ID.xy * uint( uGradientDownSample );
+	{
+		uint2 arg = uint2( prevIdx.x + prevIdx.y * uScreenSize.x, uFrameNumber );
+		encryptTea( arg );
+		prevIdx += arg % uint( uGradientDownSample );
+	}
+	// load previous position and forward project with view projection matrix
+	const vec3 prevPos = loadPosition( false, ( vec2( prevIdx ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) );
+	const vec4 clipSpacePosCurrent = mulPoint( uViewProjMatrix, prevPos ).xyzw;
+	vec3 ndcSpacePosCurrent = clipSpacePosCurrent.xyz / clipSpacePosCurrent.w;
+	// check whether gradient sample projects outside the screen
+	if( ndcSpacePosCurrent.x < -1.0f || ndcSpacePosCurrent.y < -1.0f || ndcSpacePosCurrent.z < -1.0f ||
+		ndcSpacePosCurrent.x > 1.0f || ndcSpacePosCurrent.y > 1.0f || ndcSpacePosCurrent.z > 1.0f )
+	{
+		return;
+	}
+	// flip y coordinate here
+	ndcSpacePosCurrent.y *= -1.0f;
+	const vec3 screenSpacePosCurrent = ndcSpacePosCurrent * 0.5f + 0.5f;
+	const uint2 currentIdx = uint2( screenSpacePosCurrent.xy * vec2( uScreenSize.xy ) );
+
+	const float currentDepth = loadDepth( currentIdx );
+	const float prevDepth = loadPrevDepth( prevIdx );
+
+#ifdef HYBRID_DEBUG
+	vec4 debug = vec4( 0, 0, 0, 0 );
+	imageStoreArray( tDebug, currentIdx, 0, debug );
+#endif
+
+	// test depth
+	bool accept = true;
+	accept = accept && isDepthSimilar( currentDepth, prevDepth );
+
+	// test normal
+	const vec3 currentNormal = loadNormal( currentIdx ).xyz;
+	const vec3 prevNormal = loadPrevNormal( prevIdx ).xyz;
+	accept = accept && ( dot( currentNormal, prevNormal ) > 0.9 );
+	if (!accept)
+	{
+		return;
+	}
+
+	uint2 currentTilePos = currentIdx / uGradientDownSample;
+	uint currentGradientIdx = getGradientIdxFromTilePos( currentIdx % uint( uGradientDownSample ) );
+
+	// encode position in previous frame
+	currentGradientIdx |= ( prevIdx.x + prevIdx.y * uScreenSize.x ) << ( 2 * TILE_OFFSET_SHIFT );
+
+	// interlock exchange
+	uint res;
+	interlockedCompareExchange( bGradientSamples, currentTilePos.x + currentTilePos.y * uGradientSize.x, 0u, currentGradientIdx, res );
+	if (res == 0)
+	{
+		uint2	   p = uint2( prevIdx );
+		const uint prevObjectID = imageLoad( tPrevPrepassObjectID, p ).x;
+		imageStore( tPrepassObjectID, currentIdx, uint4( prevObjectID, 0, 0, 0 ) );
+		
+		const vec2 prevGeometry = imageLoad( tPrevPrepassGeometry, p ).xy;
+		imageStore( tPrepassGeometry, currentIdx, vec4( prevGeometry, 0, 0 ) );
+
+		//set RNG history bit
+		imageStore( tRNGHistory, currentIdx, uint4( 1, 0, 0, 0 ) );
+
+#ifdef HYBRID_DEBUG
+		debug = vec4( 1, 1, 1, 1 );
+#endif
+	}
+#ifdef HYBRID_DEBUG
+	imageStoreArray( tDebug, DISPATCH_THREAD_ID.xy, 0, debug );
+#endif
+}

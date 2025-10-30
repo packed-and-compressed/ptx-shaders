@@ -1,0 +1,137 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+#include "data/shader/post/gradientSampleHelper.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+USE_TEXTURE2DARRAY( tInput );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tFiltered, 0 );
+#ifndef USE_TEXARRAY
+	#error Gradient does not support non array input
+#endif
+
+uniform int    uStepSize;
+uniform int	   uOutputChannel;
+uniform uint2  uGradientSize;
+uniform int	   uGradientDownSample;
+
+#ifdef GRAYSCALE
+	#error Gradient does not support grayscale input
+#else
+	#define BLACK vec4( 0.0f, 0.0f, 0.0f, 0.0f )
+	#define INPUT_TYPE vec4
+	#ifdef USE_TEXARRAY
+		#define LOAD_INPUT( tInput, coord ) imageLoadArray( tInput, coord, uint( uOutputChannel ) ).xyzw
+		#define STORE_FILTERED_OUTPT( tFiltered, coord, c ) imageStoreArray( tFiltered, coord, uint( uOutputChannel ), vec4( c ) );
+	#else
+		#define LOAD_INPUT( tInput, coord ) imageLoad( tInput, coord ).xyzw
+		#define STORE_FILTERED_OUTPT( tFiltered, coord, c ) imageStore( tFiltered, coord, vec4( c ) );
+	#endif
+	
+#endif
+
+float computePixelVariance(
+	const uint2 dispatchCoord )
+{
+#ifdef USE_VARIANCE
+	float		pixelVariance = 0.0f;
+	const float gaussianKernel[3] = { 1.0f / 4.0f, 1.0f / 8.f, 1.0f / 16.0f };
+	for( int row = -1; row <= 1; ++row )
+	{
+		for( int column = -1; column <= 1; ++column )
+		{
+			const int2 p = int2( dispatchCoord ) + int2( column, row );
+			if( p.x < 0 || p.y < 0 || p.x >= int( uGradientSize.x ) || p.y >= int( uGradientSize.y ) )
+			{
+				continue;
+			}
+
+			const float k = gaussianKernel[abs( column ) + abs( row )];
+			const vec4	gradientData1 = imageLoadArray( tInput, uint2( p ), 1 );
+			const float luminanceVariance = gradientData1.y;
+			pixelVariance += luminanceVariance * k;
+		}
+	}
+	return max( 0.0f, pixelVariance );
+#else
+	return 1.0f;
+#endif
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	uint2 dispatchCoord = DISPATCH_THREAD_ID_8x8.xy;
+	if( dispatchCoord.x >= uGradientSize.x || dispatchCoord.y >= uGradientSize.y )
+	{
+		return;
+	}
+
+	const vec2	gradientData0 = imageLoadArray( tInput, dispatchCoord, 0 ).xy;
+	const vec4	gradientData1 = imageLoadArray( tInput, dispatchCoord, 1 );
+
+	vec2		colorSum = gradientData0;
+	float		luminanceSum = gradientData1.x;
+	float		varianceSum = gradientData1.y;
+	float		weightSum = 1.0f;
+
+	float		luminanceCenter = gradientData0.x;
+	vec2		depthCenter = gradientData1.zw;
+
+#if( FILTER_RADIUS == 1 )
+	const float filterKernel[2] = { 1.0f / 2.0f, 1.0f / 4.0f };
+#else
+	const float filterKernel[3] = { 1.0f / 4.0f, 2.0f / 3.0f, 1.0f / 6.0f };
+#endif
+
+	const float filteredVariance = computePixelVariance( uint2( dispatchCoord ) );
+	for( int y = -FILTER_RADIUS; y <= FILTER_RADIUS; y++ )
+	{
+		for( int x = -FILTER_RADIUS; x <= FILTER_RADIUS; x++ )
+		{
+			if( x == 0 && y == 0 )
+			{
+				continue;
+			}
+
+			const vec2 offset = vec2( x, y ) * uStepSize;
+			const int2 neighborCoord = int2( float2( dispatchCoord ) + offset );
+			if( neighborCoord.x < 0 ||
+				neighborCoord.y < 0 ||
+				( neighborCoord.x * uGradientDownSample ) >= int( uScreenSize.x ) ||
+				( neighborCoord.y * uGradientDownSample ) >= int( uScreenSize.y ) )
+			{
+				continue;
+			}
+
+			const vec2 neighborColor = imageLoadArray( tInput, uint2( neighborCoord ), 0 ).xy;
+			const vec4 gradientData1 = imageLoadArray( tInput, uint2( neighborCoord ), 1 );
+
+			const float neighborDepth = gradientData1.z;
+			const float neighborVariance = gradientData1.y;
+			const float neighborLuminance = gradientData1.x;
+
+			const float luminanceWeight = abs( neighborLuminance - luminanceCenter ) / ( 3 * ( sqrt( filteredVariance ) + 1e-10f ) );
+			const float depthWeight = abs( neighborDepth - depthCenter.x ) / ( depthCenter.y * length( vec2( offset * uGradientDownSample ) ) + 1e-2f );
+			const float w = exp( -luminanceWeight * luminanceWeight - depthWeight );
+
+			// scale by the filtering kernel
+			const float h = filterKernel[abs( x )] * filterKernel[abs( y )];
+
+			// h is 1.0 in atrous filter for gradient
+			colorSum += neighborColor * w * h;
+			luminanceSum += neighborLuminance * w * h;
+			varianceSum += ( w * w * h * h * neighborVariance );
+			weightSum += w * h;
+		}
+	}
+
+	const float weightSum2 = weightSum * weightSum;
+	const float pixelVariance = weightSum2 > 0.0f ? varianceSum / weightSum2 : 0.0f;
+	const vec2	pixelColor = weightSum > 0.0f ? colorSum / weightSum : 0.0f;
+	const float pixelLuminance = weightSum > 0.0f ? luminanceSum / weightSum : 0.0f;
+
+	imageStoreArray( tFiltered, dispatchCoord, 0, vec4( pixelColor, 0, 0 ) );
+	imageStoreArray( tFiltered, dispatchCoord, 1, vec4( pixelLuminance, pixelVariance, depthCenter ) );
+}

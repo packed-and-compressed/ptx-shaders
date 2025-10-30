@@ -1,0 +1,94 @@
+#define FFX_PARALLELSORT_NOPARAMSBUFFER
+#include "params.sh"
+
+USE_LOADSTORE_STRUCTUREDBUFFER(FFX_ParallelSortCB,bParams,0);
+USE_LOADSTORE_BUFFER(uint,bArguments,1);
+
+#define CBuffer				bParams
+#define CountScatterArgs	bArguments
+#define ReduceScanArgs		bArguments
+
+void FFX_ParallelSort_SetupIndirectParams(uint NumKeys, uint MaxThreadGroups)
+{
+	CBuffer[0].NumKeys = NumKeys;
+
+	uint BlockSize = FFX_PARALLELSORT_ELEMENTS_PER_THREAD * FFX_PARALLELSORT_THREADGROUP_SIZE;
+	uint NumBlocks = (NumKeys + BlockSize - 1) / BlockSize;
+
+	// Figure out data distribution
+	uint NumThreadGroupsToRun = MaxThreadGroups;
+	uint BlocksPerThreadGroup = (NumBlocks / NumThreadGroupsToRun);
+	CBuffer[0].NumThreadGroupsWithAdditionalBlocks = NumBlocks % NumThreadGroupsToRun;
+
+	if (NumBlocks < NumThreadGroupsToRun)
+	{
+		BlocksPerThreadGroup = 1;
+		NumThreadGroupsToRun = NumBlocks;
+		CBuffer[0].NumThreadGroupsWithAdditionalBlocks = 0;
+	}
+
+	CBuffer[0].NumThreadGroups = NumThreadGroupsToRun;
+	CBuffer[0].NumBlocksPerThreadGroup = BlocksPerThreadGroup;
+
+	// Calculate the number of thread groups to run for reduction (each thread group can process BlockSize number of entries)
+	uint NumReducedThreadGroupsToRun = FFX_PARALLELSORT_SORT_BIN_COUNT * ((BlockSize > NumThreadGroupsToRun) ? 1 : (NumThreadGroupsToRun + BlockSize - 1) / BlockSize);
+	CBuffer[0].NumReduceThreadgroupPerBin = NumReducedThreadGroupsToRun / FFX_PARALLELSORT_SORT_BIN_COUNT;
+	CBuffer[0].NumScanValues = NumReducedThreadGroupsToRun;	// The number of reduce thread groups becomes our scan count (as each thread group writes out 1 value that needs scan prefix)
+
+	// Setup dispatch arguments
+	CountScatterArgs[0] = NumThreadGroupsToRun;
+	CountScatterArgs[1] = 1;
+	CountScatterArgs[2] = 1;
+
+	ReduceScanArgs[3] = NumReducedThreadGroupsToRun;
+	ReduceScanArgs[4] = 1;
+	ReduceScanArgs[5] = 1;
+}
+
+uniform uint3 uSetupIndirectParams;
+USE_RAWBUFFER(bNumKeys);
+
+COMPUTE(1,1,1)
+{
+	const uint numKeysOffset = uSetupIndirectParams.x;
+	const uint maxThreadGroups = uSetupIndirectParams.y;
+	const uint minNumKeys = uSetupIndirectParams.z;
+
+	uint numKeys = rawLoad( bNumKeys, numKeysOffset );
+	if( numKeys >= minNumKeys )
+	{
+		//min count threshold reached
+		//calculate params & arguments of sort dispatches
+		FFX_ParallelSort_SetupIndirectParams( numKeys, maxThreadGroups );
+
+		//scan dispatch enabled
+		bArguments[6]  = 1;
+		bArguments[7]  = 1;
+		bArguments[8]  = 1;
+
+		//copy dispatch disabled (no-op)
+		bArguments[9]  = 0;
+		bArguments[10] = 0;
+		bArguments[11] = 0;
+	}
+	else
+	{
+		//min count threshold not reached
+		//write out NumKeys param only
+		bParams[0].NumKeys = numKeys;
+		
+		//sort, scan dispatches disabled (no-op)
+		for( int i=0; i<9; i++ )
+		{
+			bArguments[i] = 0;
+		}
+
+		//calculate arguments of copy dispatch		
+		uint BlockSize = FFX_PARALLELSORT_ELEMENTS_PER_THREAD * FFX_PARALLELSORT_THREADGROUP_SIZE;
+		uint NumThreadGroupsToRun  = numKeys / BlockSize;
+		     NumThreadGroupsToRun += (NumThreadGroupsToRun * BlockSize) < numKeys ? 1 : 0;
+		bArguments[9]  = NumThreadGroupsToRun;
+		bArguments[10] = 1;
+		bArguments[11] = 1;
+	}
+}

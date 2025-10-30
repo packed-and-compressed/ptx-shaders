@@ -1,0 +1,149 @@
+#ifndef MSET_LENS_SYSTEM_COMP
+#define MSET_LENS_SYSTEM_COMP
+
+// Lens system
+// based on "Physically-Based Real-Time Lens Flare Rendering", https://resources.mpi-inf.mpg.de/lensflareRendering/
+// Supplement: https://resources.mpi-inf.mpg.de/lensflareRendering/pdf/flare-supplement.pdf
+// References:
+// - http://bitsquid.blogspot.com/2017/07/physically-based-lens-flare.html
+
+#define NUM_THREADS 16
+#define NUM_GROUPS 1
+#define PATCH_TESSELATION 16
+#define NANO_METER 0.0000001f
+
+#define APERTURE_ID 14
+#define NUM_INTERFACES 29
+
+struct Vertex
+{
+	float4 position; // xyz: position, w: radius
+	float4 reflectance;// rgb: reflectance, a:area
+	float2 uv;
+	float2 ndc;
+};
+
+float3 getVertexPosition(Vertex v)
+{
+	return v.position.xyz;
+}
+
+struct TraceResult
+{
+	float3 pos;
+	float2 uv;
+	float  radius;
+	float  intensity;
+};
+
+struct LensInterface
+{
+	float cx, cy, cz;// center of sphere/plane on z-axis
+	float nx, nz;	 // refractive indices (n0, n2)
+	float radius;	 // radius of sphere/plane
+	float sa;		 // nominal radius (from opt. axis)
+	float d1;		 // coating thickness=lambdaAR/4/n1
+	int	  flat;		 // is this interface a plane?
+};
+
+float3 getLensCenter(LensInterface F)
+{
+	return float3(F.cx, F.cy, F.cz);
+}
+
+struct Ray
+{
+	float3 pos; 		// ray position
+	float3 dir; 		// ray direction
+	float2 uv; 			// aperture tex coord
+	float radius; 		// relative radius
+	float intensity;	// accumulated intensity
+};
+
+struct Intersection
+{
+	float3 pos;
+	float3 norm;
+	float theta;	// incident angle
+	bool hit;		// intersection found?
+	bool inverted;	// inverted intersection?
+};
+
+Intersection intersectPlane(Ray r, LensInterface F)
+{
+	float3 center = getLensCenter(F);
+
+	Intersection i;
+	i.pos = r.pos + r.dir * ((center.z - r.pos.z) / r.dir.z);
+	i.norm = r.dir.z > 0 ? vec3(0, 0, -1) : vec3(0, 0, 1);
+	i.theta = 0; // meaningless
+	i.hit = true;
+	i.inverted = false;
+	return i;
+}
+
+Intersection intersectSphere(Ray r, LensInterface F)
+{
+	float3 center = getLensCenter(F);
+
+	Intersection i;
+	vec3 D = r.pos - center.xyz;
+	float B = dot(D, r.dir);
+	float C = dot(D, D) - F.radius * F.radius;
+	float B2_C = B * B - C;
+	// No intersection
+	if (B2_C < 0.0f)
+	{
+		i.hit = false;
+		return i;
+	}
+
+	float sgn = (F.radius * r.dir.z) > 0.0f ? 1.0f : -1.0f;
+	float t = sqrt(B2_C) * sgn - B;
+	i.pos = r.dir * t + r.pos;
+	i.norm = normalize(i.pos - center.xyz);
+	if (dot(i.norm, r.dir) > 0)
+	{
+		i.norm = -i.norm;
+	}
+	i.theta = acos(dot(-r.dir, i.norm));
+	i.hit = true;
+	i.inverted = t < 0;
+	return i;
+}
+
+float fresnelAR(float theta0, float lambda, float d1, float n0, float n1, float n2)
+{
+	float sinTheta0 = sin(theta0);
+	float theta1 = asin(sinTheta0 * n0 / n1);
+	float theta2 = asin(sinTheta0 * n0 / n2);
+
+	float rs01 = -sin(theta0 - theta1) / sin(theta0 + theta1);
+	float rp01 = tan(theta0 - theta1) / tan(theta0 + theta1);
+	float ts01 = 2.0f * sin(theta1) * cos(theta0) / sin(theta0 + theta1);
+	float tp01 = ts01 * cos(theta0 - theta1);
+
+	float rs12 = -sin(theta1 - theta2) / sin(theta1 + theta2);
+	float rp12 = +tan(theta1 - theta2) / tan(theta1 + theta2);
+
+	float ris = ts01 * ts01 * rs12;
+	float rip = tp01 * tp01 * rp12;
+
+	float dy = d1 * n1;
+	float dx = tan(theta1) * dy;
+	float delay = sqrt(dx * dx + dy * dy);
+	float relPhase = 4.0f * PI / lambda * (delay - dx * sinTheta0);
+
+	float cosRelPhase = cos(relPhase);
+	float out_s2 = rs01 * rs01 + ris * ris + 2.0f * rs01 * ris * cosRelPhase;
+	float out_p2 = rp01 * rp01 + rip * rip + 2.0f * rp01 * rip * cosRelPhase;
+
+	return (out_s2 + out_p2) / 2.0f;
+}
+
+int2 unpackBounce(int pack)
+{
+	return int2(( pack & 0xffff0000 ) >> 16, ( pack & 0x0000ffff ));
+}
+
+#endif

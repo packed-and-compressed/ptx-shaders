@@ -1,0 +1,28 @@
+#include "params.sh"
+#include "buffers.sh"
+
+USE_KEYBUFFER(bSrcBuffer);
+USE_LOADSTORE_KEYBUFFER(bDstBuffer,0);
+#ifdef kRS_ValueCopy
+	USE_VALUEBUFFER(bSrcPayload);
+	USE_LOADSTORE_VALUEBUFFER(bDstPayload,1);
+#endif
+
+COMPUTE(FFX_PARALLELSORT_THREADGROUP_SIZE,1,1)
+{
+	const FFX_ParallelSortCB params = FFX_GetParams();
+	const uint baseIndex = DISPATCH_THREAD_ID.x * FFX_PARALLELSORT_ELEMENTS_PER_THREAD;
+	
+	HINT_UNROLL
+	for( uint i=0; i<FFX_PARALLELSORT_ELEMENTS_PER_THREAD; i++ )
+	{
+		uint index = baseIndex + i;
+		if( index < params.NumKeys )
+		{
+			bDstBuffer[index]  = bSrcBuffer[index];
+		#ifdef kRS_ValueCopy
+			bDstPayload[index] = bSrcPayload[index];
+		#endif
+		}
+	}
+}

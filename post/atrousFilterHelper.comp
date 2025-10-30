@@ -1,0 +1,363 @@
+#ifndef FILTER_COMP
+#define FILTER_COMP
+
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+USE_TEXTURE2D( tMotionVector );
+USE_TYPEDTEXTURE2D( uint, tObjectID );
+USE_TEXTURE2D( tSVGFGBuffer );
+
+#ifdef HIGH_RESOLUTION_NORMAL_GBUFFER
+USE_TEXTURE2D( tNormal );
+#endif
+
+#if defined( SPECULAR_RADIANCE )
+	USE_TEXTURE2D( tSVGFSpecularGBuffer );
+	USE_TEXTURE2D( tSecondaryDifferential );
+	#if defined( HAIR_STRANDS )
+		USE_TYPEDTEXTURE2D( uint, tHairStrandID );
+	#endif
+#else
+	USE_TEXTURE2D( tSVGFSpecularGBuffer );
+	uniform uint2 uRefractionGBufferSize;
+#endif
+
+#ifdef USE_VARIANCE
+	// SVGF results (keeping track of moments and spp)
+	USE_TEXTURE2DARRAY( tSVGFMoments );	
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tSVGFNewMoments, 1 );
+#endif
+
+uniform uint2 uGBufferSize;
+uniform uint2 uScreenSize;
+uniform vec2  uInvScreenSize;
+uniform uint  uGBufferMipLevel;
+uniform vec2  uCameraJitter;
+uniform uint  uPass;
+uniform float uFilterAlphaStrength;
+
+#define COLOR_WEIGHT 4.0f
+#define POSITION_WEIGHT 1.0f
+#define GLOSSY_THRESHOLD 0.1f
+
+// normal
+#ifdef DIRECT_RADIANCE
+	#define NORMAL_POWER 128.0f
+	#define NORMAL_VARIANCE_FACTOR 1.0f
+#elif defined( INDIRECT_RADIANCE )
+	#define NORMAL_POWER 64.0f
+	#define NORMAL_VARIANCE_FACTOR 4.0f
+#elif defined( SPECULAR_RADIANCE )
+	#define NORMAL_POWER 64.0f
+	#define NORMAL_VARIANCE_FACTOR 4.0f
+#endif
+
+#define TILE_OFFSET_SHIFT 3u
+#define TILE_OFFSET_MASK ( ( 1u << TILE_OFFSET_SHIFT ) - 1u )
+
+bool isInsideScreen( const int2 coord )
+{
+	if( ( coord.x >= 0 ) &&
+		( coord.x < int( uScreenSize.x ) ) &&
+		( coord.y >= 0 ) &&
+		( coord.y < int( uScreenSize.y ) ) )
+	{
+		return true;
+	}
+	return false;
+}
+
+vec4 loadSVGFFeatures(
+	const vec2 uv )
+{
+#ifdef JITTERING
+	// downsampled buffer, so we have to jitter by 2 times multiplier for a 2x smaller gbuffer
+	vec4 result = texture2DLod( tSVGFGBuffer, uv + uCameraJitter * 2, 0 );
+#else
+	vec4 result = texture2DLod( tSVGFGBuffer, uv, 0 );
+#endif
+	result.x = abs( result.x );
+	return result;
+}
+
+#ifdef HIGH_RESOLUTION_NORMAL_GBUFFER
+vec3 loadNormal(
+	const vec2 uv )
+{
+	return texture2DLod( tNormal, uv, 0 ).xyz;
+}
+#endif
+
+#ifdef HAS_REFRACTION
+uint2 loadObjID(
+	const uint2 coord )
+{
+	return imageLoadLod( tObjectID, coord, 0 ).xy - 1;
+}
+#else
+uint loadObjID(
+	const uint2 coord )
+{
+	return imageLoadLod( tObjectID, coord, 0 ).x - 1;
+}
+#endif
+
+#ifdef HAIR_STRANDS
+uint loadHairStrandsID(
+	const uint2 coord )
+{
+	return imageLoad( tHairStrandID, coord ).x;
+}
+#endif
+
+vec4 loadSpecularFeatures(
+	const vec2 uv )
+{
+#ifdef JITTERING
+	// downsampled buffer, so we have to jitter by 2 times multiplier for a 2x smaller gbuffer
+	return texture2DLod( tSVGFSpecularGBuffer, uv + uCameraJitter * 2, 0 );
+#else
+	return texture2DLod( tSVGFSpecularGBuffer, uv, 0 );
+#endif
+}
+
+bool isDepthSimilar(
+	const float currentDepth,
+	const float previousDepth )
+{
+	return ( ( abs( previousDepth - currentDepth ) ) < ( max( previousDepth, currentDepth ) * 0.1f ) );
+}
+
+const float pixelDist(
+	const vec4 src,
+	const vec4 neighbor )
+{
+	return abs( luminance( src.xyz ) - luminance( neighbor.xyz ) );
+}
+
+const float pixelDist(
+	const vec3 src,
+	const vec3 neighbor )
+{
+	return abs( luminance( src ) - luminance( neighbor ) );
+}
+
+const float pixelDist(
+	const float src,
+	const float neighbor )
+{
+	return abs( src - neighbor );
+}
+
+const float transparencyDist(
+	const vec4 src,
+	const vec4 neighbor )
+{
+	return abs( src.w - neighbor.w );
+}
+
+const float transparencyDist(
+	const vec3 src,
+	const vec3 neighbor )
+{
+	return 0.0f;
+}
+
+const float transparencyDist(
+	const float src,
+	const float neighbor )
+{
+	return 0.0f;
+}
+
+template <typename Pixel>
+const float computeColorWeight(
+	const Pixel currentSrc,
+	const Pixel neighborSrc,
+	const float currentVariance )
+{
+	const float t = pixelDist( currentSrc, neighborSrc );
+	return t / ( COLOR_WEIGHT * ( sqrt( max( currentVariance + 1e-4f, 0.0f ) ) ) );
+}
+
+template <typename Pixel>
+const float computeTransparencyWeight(
+	const Pixel currentSrc,
+	const Pixel neighborSrc,
+	const float currentVariance )
+{
+	const float t = transparencyDist( currentSrc, neighborSrc );
+	return t / ( lerp( 1.0f, 8.0f, uFilterAlphaStrength ) * 0.1f );
+}
+
+const float computeDepthWeight(
+	const float currentDepth,
+	const float neighborDepth,
+	const float depthGradient,
+	const vec2	offset )
+{
+	const float phiDepth = ( POSITION_WEIGHT * abs( depthGradient * length( offset ) ) + 1e-8f );
+	return phiDepth == 0.0f ? 0 : abs( currentDepth - neighborDepth ) / phiDepth;
+}
+
+const float computeRoughnessWeight(
+	const float currentRoughness,
+	const float neighborRoughness,
+	const float roughnessGradient )
+{
+	const float t = abs( currentRoughness - neighborRoughness );
+	const float phiRoughness = ( 4 * abs( roughnessGradient ) + 1e-8f );
+	return t / phiRoughness;
+}
+
+const float computeReflectionWeight(
+	const float currentRoughness,
+	const float neighborRoughness,
+	const float currentRoughnessVariance,
+	const float currentSpecularVariance,
+	const vec3	currentReflectDir,
+	const vec3	neighborReflectDir )
+{
+	const float shininessVariance = currentRoughnessVariance;
+	const float directionVariance = clamp(currentSpecularVariance, 0.001f, 0.5f);
+	// from: Specular Lobe-Aware Filtering and Upsampling for Interactive Indirect Illumination
+	const float currentShininess = clamp( 2.0f / max( currentRoughness * currentRoughness, 1e-5f ) - 2.0f, 2.0f, 200.0f );
+	const float neighborShininess = clamp( 2.0f / max( neighborRoughness * neighborRoughness, 1e-5f ) - 2.0f, 2.0f, 200.0f );
+	const float cosTheta = dot( currentReflectDir, neighborReflectDir );
+	const float w = exp( -abs(currentShininess - neighborShininess) / ( 2.0f * shininessVariance )  - ( 1.0f - cosTheta ) / ( 2.0f * directionVariance ) );
+	return w;
+}
+
+template <typename Pixel>
+float atrousWeight(
+	const Pixel currentSrc,
+	const float currentDepth,
+	const vec3	currentNormal,
+	const float currentVariance,
+	const Pixel neighborSrc,
+	const float neighborDepth,
+	const vec3	neighborNormal,
+	const float depthGradient,
+	const float normalGradient,
+	const vec2	offset )
+{
+	// edge stopping functions (input: ao weight, depth weight, normal weight)
+	// the higher similarity yields higher pixel contribution weight, thus higher contribution to
+	// the weighting inside the filter
+	const float colorWeight = computeColorWeight( currentSrc, neighborSrc, currentVariance );
+	const float transparencyWeight = computeTransparencyWeight( currentSrc, neighborSrc, currentVariance );
+	const float depthWeight = computeDepthWeight( currentDepth, neighborDepth, depthGradient, offset );
+	const float normalWeight = pow( max( 0.0f, dot( currentNormal, neighborNormal ) ), NORMAL_POWER / ( 1.0f + NORMAL_VARIANCE_FACTOR * normalGradient ) );
+	return exp( -max( colorWeight, 0.0f ) - max( transparencyWeight, 0.0f ) - max( depthWeight, 0.0f ) ) * normalWeight;
+}
+
+template <typename Pixel>
+float atrousSpecularWeight(
+	const Pixel currentSrc,
+	const float currentMetallic,
+	const float currentDepth,
+	const vec3	currentNormal,
+	const float currentVariance,
+	const Pixel neighborSrc,
+	const float neighborDepth,
+	const vec3	neighborNormal,
+	const float depthGradient,
+	const vec2	offset )
+{
+	vec2		weights;
+
+	// edge stopping functions (input: ao weight, depth weight, normal weight)
+	// the higher similarity yields higher pixel contribution weight, thus higher contribution to
+	// the weighting inside the filter
+	const float colorWeight = computeColorWeight( currentSrc, neighborSrc, currentVariance );
+	const float colorExponent = exp( -max( 0.0f, colorWeight ) );
+	const float depthWeight = computeDepthWeight( currentDepth, neighborDepth, depthGradient, offset );
+	const float depthExponent = exp( -max( 0.0f, depthWeight ) );
+	const float normalWeight = pow( max( 0.0f, dot( currentNormal, neighborNormal ) ), NORMAL_POWER );
+	return colorExponent * depthExponent * normalWeight;
+}
+
+vec4 getMoments( 
+	const uint2 p,
+	const uint channel )
+{
+#ifdef USE_VARIANCE
+	return imageLoadArray( tSVGFMoments, p, channel );
+#else
+	return vec4( 1, 1, 1, 1 );
+#endif
+}
+
+
+float getVariance(
+	const uint2 p,
+	const uint  channel )
+{
+#ifdef USE_VARIANCE
+	return imageLoadArray( tSVGFMoments, p, channel ).w;
+#else
+	return 1.0f;
+#endif
+}
+
+float getSampleCount(
+	const uint2 p,
+	const uint  channel )
+{
+#ifdef USE_VARIANCE
+	return imageLoadArray( tSVGFMoments, p, channel ).x;
+#else
+	return 1.0f;
+#endif
+}
+
+
+void setVariance(
+	const uint2	p,
+	const uint	channel,
+	const float variance )
+{
+#ifdef USE_VARIANCE
+	// moments okay to clamp ( for 16 bit ), because atrous weighting is supposed to be (0 to inf)
+	const vec4 moments = imageLoadArray( tSVGFMoments, p, channel );
+	imageStoreArray( tSVGFNewMoments, p, channel, vec4( moments.xyz, variance ) );
+#endif
+}
+
+float computePixelVariance(
+	const float currentVariance,
+	const uint2 dispatchCoord,
+	const int outputChannel )
+{
+#ifdef USE_VARIANCE
+	const float gaussianKernel[3][3] = {
+		{ 1.0 / 16.0, 1.0 / 8.0, 1.0 / 16.0 },
+		{ 1.0 / 8.0, 1.0 / 4.0, 1.0 / 8.0 },
+		{ 1.0 / 16.0, 1.0 / 8.0, 1.0 / 16.0 }
+	};
+
+	float pixelVariance = currentVariance * gaussianKernel[1][1];
+	for( int row = -1; row <= 1; ++row )
+	{
+		for( int column = -1; column <= 1; ++column )
+		{
+			const int2 p = int2( dispatchCoord ) + int2( column, row );
+			if( p.x < 0 || p.y < 0 || p.x >= int( uScreenSize.x ) || p.y >= int( uScreenSize.y ) || ( row == 0 && column == 0 ) )
+			{
+				continue;
+			}
+			const float k = gaussianKernel[column + 1][row + 1];
+			const float neighborVariance = getVariance( uint2( p ), outputChannel );
+			pixelVariance += neighborVariance * k;
+		}
+	}
+	return pixelVariance;
+#else
+	// non variance driven
+	return 1.0f;
+#endif
+}
+
+#endif

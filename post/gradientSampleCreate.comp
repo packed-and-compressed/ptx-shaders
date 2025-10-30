@@ -1,0 +1,135 @@
+#define USE_GRADIENT
+
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+#include "data/shader/post/gradientSampleHelper.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+#ifdef USE_CUSTOM_TEXTURE
+	USE_TEXTURE2D( tRadiance );
+	USE_TEXTURE2D( tPrevRadiance );
+#else
+	#ifdef RT_RADIANCE_TEXTURE
+		USE_TEXTURE2DARRAY( tRadiance );
+		USE_TEXTURE2DARRAY( tPrevRadiance );
+	#else
+		USE_BUFFER( uint2, bRadiance );
+		USE_BUFFER( uint2, bPrevRadiance );
+		uniform uint2 uRadianceStride;
+	#endif
+	uniform int	   uOutputChannel;
+#endif
+	
+USE_BUFFER( uint, bGradientSamples );
+USE_TYPEDTEXTURE2D_NOSAMPLER( uint, tObjectID );
+
+USE_LOADSTORE_TEXTURE2DARRAY( float, tResult, 0 );
+
+uniform uint2  uGradientSize;
+uniform uint   uFrameNumber;
+uniform int	   uGradientDownSample;
+
+COMPUTE( 8, 8, 1 )
+{
+	const uint2 gradPos = DISPATCH_THREAD_ID.xy;
+    if(gradPos.x >= uGradientSize.x || gradPos.y >= uGradientSize.y)
+    {
+        return;
+    }
+ 
+	const uint	u = bGradientSamples[gradPos.x + gradPos.y * uGradientSize.x];
+	const uint2 tilePos = uint2( ( u & TILE_OFFSET_MASK ), ( u >> TILE_OFFSET_SHIFT ) & TILE_OFFSET_MASK );
+	const uint2 coord = gradPos * uGradientDownSample + tilePos;
+
+	// test against screen resolution
+	if( !isInsideScreen( int2( coord ) ) )
+	{
+		return;
+	}
+
+	const uint2 scaledCoord = coord;
+#ifdef USE_CUSTOM_TEXTURE
+	half4 radiance = half4( imageLoad( tRadiance, uint2( scaledCoord ) ) );
+#else
+	#ifdef RT_RADIANCE_TEXTURE
+		half4 radiance = half4( imageLoadArray( tRadiance, uint2( scaledCoord ), uOutputChannel ) );
+	#else
+		uint  offset = uOutputChannel * uRadianceStride.x + uint( scaledCoord.y ) * uRadianceStride.y + uint( scaledCoord.x );
+		half4 radiance = unpackVec4h( bRadiance[offset] );
+	#endif
+#endif
+
+	const float currentRadiance = luminance( vec3( radiance.xyz ) ) * radiance.w;
+	if( u >= ( 1u << 31u ) )
+	{
+		const uint	prevIdx = ( u >> ( 2u * TILE_OFFSET_SHIFT ) ) & ( ( 1u << ( 31u - 2u * TILE_OFFSET_SHIFT ) ) - 1u );
+		const uint2 prevCoord = uint2( prevIdx % uScreenSize.x, prevIdx / uScreenSize.x );
+		const uint2 scaledPrevCoord = prevCoord;
+
+	#ifdef USE_CUSTOM_TEXTURE
+		half4 radiance = half4( imageLoad( tPrevRadiance, uint2( scaledPrevCoord ) ) );
+	#else
+		#ifdef RT_RADIANCE_TEXTURE
+				half4 radiance = half4( imageLoadArray( tPrevRadiance, uint2( scaledPrevCoord ), uOutputChannel ) );
+		#else
+				uint  offset = uOutputChannel * uRadianceStride.x + uint( scaledPrevCoord.y ) * uRadianceStride.y + uint( scaledPrevCoord.x );
+				half4 radiance = unpackVec4h( bPrevRadiance[offset] );
+		#endif
+	#endif
+		const float prevRadiance = luminance( vec3( radiance.xyz ) ) * radiance.w;
+		// still gradient resolution
+		imageStoreArray( tResult, DISPATCH_THREAD_ID.xy, 0, vec4( max( currentRadiance, prevRadiance ), currentRadiance - prevRadiance, 0, 0 ) );
+	}
+	else
+	{
+		imageStoreArray( tResult, DISPATCH_THREAD_ID.xy, 0, vec4( 0, 0, 0, 0 ) );
+	}
+
+	// calculate moments
+	float	   totalWeight = 1.0f;
+	vec2	   moments = vec2( currentRadiance, currentRadiance * currentRadiance );
+	const uint objectIndex = imageLoad( tObjectID, coord ).x - 1;
+	if (objectIndex != ~uint(0))
+	{
+		for( int y = 0; y < uGradientDownSample; y++ )
+		{
+			for( int x = 0; x < uGradientDownSample; x++ )
+			{
+				const int2 p = int2( DISPATCH_THREAD_ID.xy ) * uGradientDownSample + int2( x, y );
+				if( coord.x == p.x && coord.y == p.y )
+				{
+					continue;
+				}
+				if( !isInsideScreen( p ) )
+				{
+					continue;
+				}
+				const uint objectIndexP = imageLoad( tObjectID, uint2( p ) ).x - 1;
+				if( objectIndex != objectIndexP )
+				{
+					continue;
+				}
+
+#ifdef USE_CUSTOM_TEXTURE
+				half4 radiance = half4( imageLoad( tRadiance, uint2( p ) ) );
+#else
+	#ifdef RT_RADIANCE_TEXTURE
+				half4 radiance = half4( imageLoadArray( tRadiance, uint2( p ), uOutputChannel ) );
+	#else
+				uint  offset = uOutputChannel * uRadianceStride.x + uint( p.y ) * uRadianceStride.y + uint( p.x );
+				half4 radiance = unpackVec4h( bRadiance[offset] );
+	#endif
+#endif
+				const float reprojectedRadiance = luminance( vec3( radiance.xyz ) ) * radiance.w;
+				moments += vec2( reprojectedRadiance, reprojectedRadiance * reprojectedRadiance );
+				totalWeight++;
+			}
+		}
+	}
+	moments /= totalWeight;
+	const vec4 results = vec4(moments.x, max(0.0f, moments.y - moments.x * moments.x), 0, 0 );
+	imageStoreArray( tResult, DISPATCH_THREAD_ID.xy, 1, results );
+}

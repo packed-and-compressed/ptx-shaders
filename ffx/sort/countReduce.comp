@@ -1,0 +1,64 @@
+#include "params.sh"
+
+USE_BUFFER(uint,bSumTable);
+USE_LOADSTORE_BUFFER(uint,bReduceTable,0);
+
+#define SumTable	bSumTable
+#define ReduceTable	bReduceTable
+
+groupshared uint gs_FFX_PARALLELSORT_LDSSums[FFX_PARALLELSORT_THREADGROUP_SIZE];
+uint FFX_ParallelSort_ThreadgroupReduce(uint localSum, uint localID, uint waveLaneCount)
+{
+	// Do wave local reduce
+	uint waveReduced = waveSum(localSum);
+
+	// First lane in a wave writes out wave reduction to LDS (this accounts for num waves per group greater than HW wave size)
+	// Note that some hardware with very small HW wave sizes (i.e. <= 8) may exhibit issues with this algorithm, and have not been tested.
+	uint waveID = localID / waveLaneCount;
+	if (waveIsFirstLane())
+		gs_FFX_PARALLELSORT_LDSSums[waveID] = waveReduced;
+
+	// Wait for everyone to catch up
+	groupMemoryBarrierWithGroupSync();
+
+	// First wave worth of threads sum up wave reductions
+	if (!waveID)
+		waveReduced = waveSum( (localID < FFX_PARALLELSORT_THREADGROUP_SIZE / waveLaneCount) ? gs_FFX_PARALLELSORT_LDSSums[localID] : 0);
+
+	// Returned the reduced sum
+	return waveReduced;
+}
+
+void FFX_ParallelSort_ReduceCount(uint localID, uint groupID, uint waveLaneCount, FFX_ParallelSortCB CBuffer)
+{
+	// Figure out what bin data we are reducing
+	uint BinID = groupID / CBuffer.NumReduceThreadgroupPerBin;
+	uint BinOffset = BinID * CBuffer.NumThreadGroups;
+
+	// Get the base index for this thread group
+	uint BaseIndex = (groupID % CBuffer.NumReduceThreadgroupPerBin) * FFX_PARALLELSORT_ELEMENTS_PER_THREAD * FFX_PARALLELSORT_THREADGROUP_SIZE;
+
+	// Calculate partial sums for entries this thread reads in
+	uint threadgroupSum = 0;
+	for (uint i = 0; i < FFX_PARALLELSORT_ELEMENTS_PER_THREAD; ++i)
+	{
+		uint DataIndex = BaseIndex + (i * FFX_PARALLELSORT_THREADGROUP_SIZE) + localID;
+		threadgroupSum += (DataIndex < CBuffer.NumThreadGroups) ? SumTable[BinOffset + DataIndex] : 0;
+	}
+
+	// Reduce across the entirety of the thread group
+	threadgroupSum = FFX_ParallelSort_ThreadgroupReduce(threadgroupSum, localID, waveLaneCount);
+
+	// First thread of the group writes out the reduced sum for the bin
+	if (!localID)
+		ReduceTable[groupID] = threadgroupSum;
+
+	// What this will look like in the reduced table is:
+	//	[ [bin0 ... bin0] [bin1 ... bin1] ... ]
+}
+
+COMPUTE(FFX_PARALLELSORT_THREADGROUP_SIZE,1,1)
+{
+	const FFX_ParallelSortCB params = FFX_GetParams();
+	FFX_ParallelSort_ReduceCount( GROUP_THREAD_ID.x, GROUP_ID.x, WAVE_LANECOUNT, params );
+}

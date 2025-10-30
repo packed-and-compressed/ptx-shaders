@@ -1,0 +1,9 @@
+#include "params.sh"
+#include "scanPrefix.comp"
+
+COMPUTE(FFX_PARALLELSORT_THREADGROUP_SIZE,1,1)
+{
+	const FFX_ParallelSortCB params = FFX_GetParams();
+	uint BaseIndex = FFX_PARALLELSORT_ELEMENTS_PER_THREAD * FFX_PARALLELSORT_THREADGROUP_SIZE * GROUP_ID.x;
+	FFX_ParallelSort_ScanPrefix( params.NumScanValues, GROUP_THREAD_ID.x, GROUP_ID.x, WAVE_LANEINDEX, WAVE_LANECOUNT, 0, BaseIndex, false, params );
+}

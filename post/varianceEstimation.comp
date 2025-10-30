@@ -1,0 +1,311 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+// inputs
+USE_TEXTURE2DARRAY( tInput );
+USE_TEXTURE2D( tSVGFGBuffer );
+USE_TEXTURE2D_NOSAMPLER( tMotionVector );
+USE_TEXTURE2DARRAY( tSVGFMoments );
+#ifdef HAIR_STRANDS
+	USE_TYPEDTEXTURE2D( uint, tHairStrandID );
+#endif
+
+// SVGF results (keeping track of moments and spp)
+USE_LOADSTORE_TEXTURE2DARRAY( float, tFiltered, 0 );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tSVGFNewMoments, 1 );
+#ifdef HYBRID_DEBUG
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tDebug, 3 );
+#endif
+
+uniform uint2 uGBufferSize;
+uniform uint2 uScreenSize;
+uniform vec2  uInvScreenSize;
+uniform uint  uSVGFMomentsIdx;
+uniform int	  uOutputChannel;
+uniform uint  uGBufferMipLevel;
+
+groupshared uint gCacheRadiance0[16][16];
+groupshared uint gCacheRadiance1[16][16];
+groupshared ushort gCacheObjectHash[16][16];
+#ifdef HAIR_STRANDS
+	groupshared uint gCacheHairStrandId[16][16];	
+#endif
+groupshared uint  gCacheNormal[16][16];
+groupshared float gCacheDepth[16][16];
+groupshared float gCacheSpp[16][16];
+groupshared float gCacheMoment[16][16];
+groupshared float gCacheMoment2[16][16];
+
+#define COLOR_WEIGHT 4.0f
+#define POSITION_WEIGHT 1.0f
+
+// normal
+#ifdef DIRECT_RADIANCE
+	#define NORMAL_POWER 128.0f
+	#define NORMAL_VARIANCE_FACTOR 2.0f
+#elif defined( INDIRECT_RADIANCE )
+	#define NORMAL_POWER 64.0f
+	#define NORMAL_VARIANCE_FACTOR 4.0f
+#elif defined( SPECULAR_RADIANCE )
+	#define NORMAL_POWER 64.0f
+	#define NORMAL_VARIANCE_FACTOR 4.0f
+#endif
+
+bool isInsideScreen( const int2 coord)
+{
+	if( ( coord.x >= 0 ) &&
+		( coord.x < int( uScreenSize.x ) ) &&
+		( coord.y >= 0 ) &&
+		( coord.y < int( uScreenSize.y ) ) )
+	{
+		return true;
+	}
+	return false;
+}
+
+float atrousWeight(
+	const vec3	currentSrc,
+	const float currentDepth,
+	const vec3	currentNormal,
+	const vec3	neighborSrc,
+	const float neighborDepth,
+	const vec3	neighborNormal,
+	const float depthGradient,
+	const float normalGradient,
+	const vec2	offset )
+{
+	// edge stopping functions (input: ao weight, depth weight, normal weight)
+	// the higher similarity yields higher pixel contribution weight, thus higher contribution to
+	// the weighting inside the filter
+	const float colorWeight = abs( luminance( currentSrc ) - luminance( neighborSrc ) ) / ( COLOR_WEIGHT );
+	const float phiDepth = ( POSITION_WEIGHT * max( depthGradient, 1e-8f ) ) * length( offset );
+	const float depthWeight = phiDepth == 0.0f ? 0.0f : abs( currentDepth - neighborDepth ) / phiDepth;
+	const float normalWeight = pow( max( 0.0f, dot( currentNormal, neighborNormal ) ), NORMAL_POWER / ( 1.0f + NORMAL_VARIANCE_FACTOR * normalGradient ) );
+	return exp( -max( colorWeight, 0.0f ) - max( depthWeight, 0.0f ) ) * normalWeight;
+}
+
+vec4 getMoments(
+	const int2 p,
+	const uint channel )
+{
+	return imageLoadArray( tSVGFMoments, uint2( p ), channel );
+}
+
+void setMoments(
+	const int2	p,
+	const uint	channel,
+	const vec4  newMoments )
+{
+	imageStoreArray( tSVGFNewMoments, uint2( p ), channel, newMoments );
+}
+
+vec4 loadSVGFFeatures(
+	const vec2 uv )
+{
+	vec4 result = texture2DLod( tSVGFGBuffer, uv, 0 );
+	result.x = abs( result.x );
+	return result;
+}
+
+void initCache( int2 dispatchThreadId, int2 groupThreadId, int2 res )
+{
+	// load 16x16 region into shared memory using 4 8x8 blocks.
+	const int2  offset[4] = { int2( 0, 0 ), int2( 8, 0 ), int2( 0, 8 ), int2( 8, 8 ) };
+	
+	// start in the upper left corner of the 16x16 region.
+	dispatchThreadId -= 4;
+
+	for( int i = 0; i < 4; ++i )
+	{
+		half4 radiance = half4( 0.0, 0.0, 0.0, 0.0 );
+		vec3  moment = vec3( 0.0, 0.0, 0.0 );
+		float depth = 0.0;
+		uint  normal = 0;
+		ushort objHash = 0;
+	#ifdef HAIR_STRANDS
+		uint  hairStrandId = 0;
+	#endif
+
+		const int2 threadId = dispatchThreadId + offset[i];
+		const int2 cacheId = groupThreadId + offset[i];
+
+		if( threadId.x >= 0 && threadId.y >= 0 &&
+			threadId.x < res.x && threadId.y < res.y )
+		{
+			const vec2  gBufferUV = vec2( ( vec2( threadId ) + vec2( 0.5f, 0.5f ) ) / vec2( res ) );
+			const uint2 gBufferCoord = uint2( gBufferUV * vec2( uGBufferSize ) );
+
+			radiance = half4( imageLoadArray( tInput, uint2( threadId ), uOutputChannel ) );
+			moment = getMoments( int2( threadId ), uOutputChannel ).xyz;
+			const vec4 features = loadSVGFFeatures( gBufferUV );
+			depth  = features.x;
+			objHash = ushort( asuint( features.z ) & 0xFFFF );
+			normal = asuint( features.y ) & 0xFFFFFF;
+		#ifdef HAIR_STRANDS
+			hairStrandId = imageLoad( tHairStrandID, gBufferCoord ).x;
+		#endif
+		}
+		
+		// radiance
+		const uint2 radiancePacked = packVec4f( vec4( radiance ) );
+		gCacheRadiance0[cacheId.y][cacheId.x] = radiancePacked.x;
+		gCacheRadiance1[cacheId.y][cacheId.x] = radiancePacked.y;
+		gCacheSpp[cacheId.y][cacheId.x] = moment.x;
+		gCacheMoment[cacheId.y][cacheId.x] = moment.y;
+		gCacheMoment2[cacheId.y][cacheId.x] = moment.z;
+		// others
+		gCacheObjectHash[cacheId.y][cacheId.x] = objHash;
+	#ifdef HAIR_STRANDS
+		gCacheHairStrandId[cacheId.y][cacheId.x] = hairStrandId;
+	#endif
+		gCacheNormal[cacheId.y][cacheId.x] = normal;
+		gCacheDepth[cacheId.y][cacheId.x] = depth;
+	}
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	uint2 dispatchCoord = uint2( DISPATCH_THREAD_ID_8x8.xy );
+	// group thread id
+	uint2 groupCoord = GROUP_THREAD_ID_8x8.xy;
+	// only setup cache for specular because of neighborhood clamping
+	initCache( int2( dispatchCoord ), int2( groupCoord ), int2( uScreenSize ) );
+	// wait for all threads to finish.
+	groupMemoryBarrierWithGroupSync();
+	// recenter because (0,0) mapped to (-4,-4)
+	groupCoord += 4;
+
+	if( dispatchCoord.x < 0 || 
+		dispatchCoord.y < 0 ||
+		dispatchCoord.x >= ( uScreenSize.x ) || 
+		dispatchCoord.y >= ( uScreenSize.y ) )
+	{
+		return;
+	}
+
+	
+	const uint	 pixelIdx = dispatchCoord.y * uScreenSize.x + dispatchCoord.x;
+	const float	 spp = gCacheSpp[groupCoord.y][groupCoord.x];
+	const float	 moment = gCacheMoment[groupCoord.y][groupCoord.x];
+	const float	 moment2 = gCacheMoment2[groupCoord.y][groupCoord.x];
+	vec3 currentMoments = vec3( spp, moment, moment2 );
+
+	// 3x3 kernel from Atrous Wavelet filtering paper
+	const uint2	 packedRadiance = uint2(
+		 gCacheRadiance0[groupCoord.y][groupCoord.x],
+		 gCacheRadiance1[groupCoord.y][groupCoord.x] );
+	const vec4	 currentSrc = unpackVec4f( packedRadiance );
+
+	const float	 currentDepth = gCacheDepth[groupCoord.y][groupCoord.x];
+	const ushort currentObjHash = gCacheObjectHash[groupCoord.y][groupCoord.x];
+	#ifdef HAIR_STRANDS
+		const uint currentHairStrandId = gCacheHairStrandId[groupCoord.y][groupCoord.x];
+	#endif
+	const vec3	 currentNormal = unpackUnitVectorOct24bit(gCacheNormal[groupCoord.y][groupCoord.x]);
+
+	const uint2	 currentGBufferCoord = uint2( ( vec2( dispatchCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize ) * vec2( uGBufferSize ) );
+	const vec4   motionVectorData = imageLoad( tMotionVector, currentGBufferCoord );
+	const float	 fWidthDepth = motionVectorData.z;
+	const float  fWidthNormal = motionVectorData.w;
+
+	float		 variance = 0.0f;
+	vec4		 outputSrc = currentSrc;
+	if(spp < 4.0f )
+	{
+		bool	  filteringEnabled = false;
+	#ifdef VARIANCE_ESTIMATE_FILTER
+		vec3	  sumSrc = currentSrc.xyz;
+		filteringEnabled = true;
+		#ifdef HAIR_STRANDS
+			// make sure only do filtering on non-strands
+			filteringEnabled = currentHairStrandId == ~uint( 0 );
+		#endif
+	#endif
+		float	  sumWeights = 1.0f;
+		float	  sumMoment = moment;
+		float	  sumMoment2 = moment2;
+
+		for( int y = -VARIANCE_RADIUS; y <= VARIANCE_RADIUS; y++ )
+		{
+			for( int x = -VARIANCE_RADIUS; x <= VARIANCE_RADIUS; x++ )
+			{
+				if (x == 0 && y == 0)
+				{
+					continue;
+				}
+
+				const int2 neighborCoord = int2( dispatchCoord ) + int2( x, y );
+				if( isInsideScreen( neighborCoord ) )
+				{
+					const int2	neighborGroupCoord = int2( groupCoord ) + int2( x, y );
+				#ifdef HAIR_STRANDS
+					const uint  neighborHairStrandId = gCacheHairStrandId[neighborGroupCoord.y][neighborGroupCoord.x];
+					if( neighborHairStrandId != ~uint( 0 ) )
+					{
+						continue;
+					}
+				#endif
+					const uint2 packedNeighborRadiance = uint2(
+						gCacheRadiance0[neighborGroupCoord.y][neighborGroupCoord.x],
+						gCacheRadiance1[neighborGroupCoord.y][neighborGroupCoord.x] );
+					const vec3	neighborSrc = unpackVec4f( packedNeighborRadiance ).xyz;
+					const float neighborDepth = gCacheDepth[neighborGroupCoord.y][neighborGroupCoord.x];
+					const vec3	neighborNormal = unpackUnitVectorOct24bit( gCacheNormal[neighborGroupCoord.y][neighborGroupCoord.x] );
+					const ushort neighborObjHash = gCacheObjectHash[neighborGroupCoord.y][neighborGroupCoord.x];
+				#ifdef HAS_REFRACTION
+					const bool	matchPrimary = (neighborObjHash & 0xFF) > 0 && (neighborObjHash & 0xFF) == (currentObjHash & 0xFF);
+					const bool	matchRefraction = neighborObjHash > 0xFF && (neighborObjHash & 0xFF00) == (currentObjHash & 0xFF00);
+					const bool	matchObject = matchPrimary || matchRefraction;
+				#else
+					const bool	matchObject = neighborObjHash > 0 && ( neighborObjHash == currentObjHash );
+				#endif
+					if( matchObject )
+					{
+						// calculate weighting contributed from neighbor
+						const float w = atrousWeight( currentSrc.xyz, currentDepth, currentNormal, neighborSrc, neighborDepth, neighborNormal, fWidthDepth, fWidthNormal, vec2( x, y ) );
+
+						// sum things up for neighbors, we normalize them later
+						sumWeights += w;
+					#ifdef VARIANCE_ESTIMATE_FILTER
+						sumSrc += w * neighborSrc;
+					#endif
+						const float	 moment = gCacheMoment[neighborGroupCoord.y][neighborGroupCoord.x];
+						const float	 moment2 = gCacheMoment2[neighborGroupCoord.y][neighborGroupCoord.x];
+
+						sumMoment += w * moment;
+						sumMoment2 += w * moment2;
+					}
+				}
+			}
+		}
+		// normalize by division of weight, then we recalculate variance using 2nd order moment minus
+		// squared luminance of the accumulated pixel, pretty much just the definition of variance here
+		sumWeights = max( sumWeights, 1e-5f );
+		sumMoment = sumMoment / sumWeights;
+		sumMoment2 = sumMoment2 / sumWeights;
+		// Var = E(X^2) - E(X)^2
+		variance = max( sumMoment2 - sumMoment * sumMoment, 0.0f );
+		// multiply by 4 to increase variance for the first few frames (suggested by SVGF paper)
+		variance *= 4;
+		currentMoments = vec3( spp, sumMoment, sumMoment2 );
+		// write filtered pixel
+	#ifdef VARIANCE_ESTIMATE_FILTER
+		if(filteringEnabled)
+		{
+			sumSrc = sumSrc / sumWeights;
+			outputSrc = vec4( sumSrc, currentSrc.w );
+		}
+	#endif
+	}
+	else
+	{
+		variance = max( moment2 - moment * moment, 0.0f );
+	}
+	imageStoreArray( tFiltered, dispatchCoord, uOutputChannel, outputSrc );
+	// moments okay to clamp ( for 16 bit ), because atrous weighting is supposed to be (0 to inf)
+	setMoments( int2( dispatchCoord ), uOutputChannel, clamp( vec4( currentMoments, variance ), vec4( 0, 0, 0, 0), vec4( 65504.0f, 65504.0f, 65504.0f, 65504.0f ) ) );
+}

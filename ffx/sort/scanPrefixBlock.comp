@@ -1,0 +1,28 @@
+groupshared uint gs_FFX_PARALLELSORT_LDSSums[FFX_PARALLELSORT_THREADGROUP_SIZE];
+uint FFX_ParallelSort_BlockScanPrefix(uint localSum, uint localID, uint laneID, uint waveLaneCount)
+{
+	// Do wave local scan-prefix
+	uint wavePrefixed = wavePrefixSum(localSum);
+
+	// Since we are dealing with thread group sizes greater than HW wave size, we need to account for what wave we are in.
+	uint waveID = localID / waveLaneCount;
+
+	// Last element in a wave writes out partial sum to LDS
+	if (laneID == waveLaneCount - 1)
+		gs_FFX_PARALLELSORT_LDSSums[waveID] = wavePrefixed + localSum;
+
+	// Wait for everyone to catch up
+	groupMemoryBarrierWithGroupSync();
+
+	// First wave prefixes partial sums
+	if (!waveID)
+		gs_FFX_PARALLELSORT_LDSSums[localID] = wavePrefixSum(gs_FFX_PARALLELSORT_LDSSums[localID]);
+
+	// Wait for everyone to catch up
+	groupMemoryBarrierWithGroupSync();
+
+	// Add the partial sums back to each wave prefix
+	wavePrefixed += gs_FFX_PARALLELSORT_LDSSums[waveID];
+
+	return wavePrefixed;
+}

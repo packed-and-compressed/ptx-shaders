@@ -1,0 +1,181 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+#include "data/shader/post/atrousFilterHelper.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+USE_TEXTURE2D( tDepth );
+USE_TEXTURE2D( tNormal );
+
+#ifdef USE_TEXARRAY
+	USE_TEXTURE2DARRAY( tInput );
+	USE_LOADSTORE_TEXTURE2DARRAY( float, tFiltered, 0 );
+#else
+	USE_TEXTURE2D( tInput );
+	USE_LOADSTORE_TEXTURE2D( float, tFiltered, 0 );
+#endif
+
+uniform int    uStepSize;
+uniform int	   uOutputChannel;
+
+uniform vec4   uUnproject;// { -2/proj[0][0], -2/proj[1][1], (1-proj[2][0])/proj[0][0], (1-proj[2][1])/proj[1][1] }
+uniform mat4   uInvViewMatrix;
+
+#ifdef GRAYSCALE
+	#define BLACK 0.0f
+	#define INPUT_TYPE float
+	#ifdef USE_TEXARRAY
+		#define LOAD_INPUT( tInput, coord ) imageLoadArray( tInput, coord, uint( uOutputChannel ) ).x
+		#define STORE_FILTERED_OUTPT( tFiltered, coord, c ) imageStoreArray( tFiltered, coord, uint( uOutputChannel ), vec4( c, c, c, 1.0f ) );
+	#else
+		#define LOAD_INPUT( tInput, coord ) imageLoad( tInput, coord ).x
+		#define STORE_FILTERED_OUTPT( tFiltered, coord, c ) imageStore( tFiltered, coord, vec4( c, c, c, 1.0f ) );
+	#endif
+#else
+	#define BLACK vec4( 0.0f, 0.0f, 0.0f, 0.0f )
+	#define INPUT_TYPE vec4
+	#ifdef USE_TEXARRAY
+		#define LOAD_INPUT( tInput, coord ) imageLoadArray( tInput, coord, uint( uOutputChannel ) ).xyzw
+		#define STORE_FILTERED_OUTPT( tFiltered, coord, c ) imageStoreArray( tFiltered, coord, uint( uOutputChannel ), vec4( c ) );
+	#else
+		#define LOAD_INPUT( tInput, coord ) imageLoad( tInput, coord ).xyzw
+		#define STORE_FILTERED_OUTPT( tFiltered, coord, c ) imageStore( tFiltered, coord, vec4( c ) );
+	#endif
+	
+#endif
+
+float loadDepth(
+	const vec2 uv )
+{
+	float depth = texture2DLod( tDepth, uv, 0 ).x;
+	return abs( depth );
+}
+
+vec3 loadNormal(
+	const vec2 uv )
+{
+	return texture2DLod( tNormal, uv, 0 ).xyz;
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	uint2 dispatchCoord = DISPATCH_THREAD_ID_8x8;
+	if( dispatchCoord.x >= uScreenSize.x || dispatchCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+#if( FILTER_RADIUS == 1 )
+	const float filterKernel[] = {
+		0.0625f, 0.125f, 0.0625f,
+		0.125f, 0.25f, 0.125f,
+		0.0625f, 0.125f, 0.0625f
+	};
+#else
+	const float filterKernel[] = {
+		0.0039f, 0.0156f, 0.0234f, 0.0156f, 0.0039f,
+		0.0156f, 0.0625f, 0.0928f, 0.0625f, 0.0156f,
+		0.0234f, 0.0938f, 0.1406f, 0.0938f, 0.0234f,
+		0.0156f, 0.0625f, 0.0928f, 0.0625f, 0.0156f,
+		0.0039f, 0.0156f, 0.0234f, 0.0156f, 0.0039f
+	};
+#endif
+
+	const INPUT_TYPE currentSrc = LOAD_INPUT( tInput, dispatchCoord );
+
+	const vec2		 gBufferUV = ( vec2( dispatchCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize );
+	const float		 currentDepth = loadDepth( gBufferUV );
+	const vec3		 currentNormal = loadNormal( gBufferUV );
+	const uint		 currentObjID = loadObjID( dispatchCoord );
+#ifdef USE_VARIANCE
+	const float		 currentVariance = getVariance( uint2( dispatchCoord ), uOutputChannel );
+	const float		 filteredVariance = computePixelVariance( uint2( dispatchCoord ), uOutputChannel );
+#else
+	const float currentVariance = 1.0f;
+	const float filteredVariance = 1.0f;
+#endif
+	const float		 fWidthDepth = imageLoad( tMotionVector, dispatchCoord ).z;
+	
+    // total accumulation and weighted sum
+	INPUT_TYPE color = currentSrc;
+#ifdef USE_VARIANCE
+	vec2 weightSum = vec2( 1.0f, currentVariance );
+#else
+	float weightSum = 1.0f;
+#endif
+	for( int y = -FILTER_RADIUS; y <= FILTER_RADIUS; y++ )
+	{
+		for( int x = -FILTER_RADIUS; x <= FILTER_RADIUS; x++ )
+		{
+			if( x == 0 && y == 0 )
+			{
+				continue;
+			}
+
+			vec2 offset = vec2( x, y ) * uStepSize;
+			int2 neighborCoord = int2( float2( dispatchCoord ) + offset );
+
+			if( isInsideScreen( neighborCoord ) )
+			{
+				const vec2		 gBufferNeighborUV = ( vec2( neighborCoord ) + vec2( 0.5f, 0.5f ) ) / vec2( uScreenSize );
+				const INPUT_TYPE neighborSrc = LOAD_INPUT( tInput, uint2( neighborCoord ) );
+				const float		 neighborDepth = loadDepth( gBufferNeighborUV );
+				const vec3		 neighborNormal = loadNormal( gBufferNeighborUV );
+				const uint		 neighborObjectID = loadObjID( uint2( neighborCoord ) );
+				if( neighborObjectID == ~uint( 0 ) || neighborObjectID != currentObjID )
+				{
+					// if no mesh then early exit
+					continue;
+				}
+
+#ifdef USE_VARIANCE
+				const float neighborVariance = getVariance( neighborCoord, uOutputChannel );
+#endif
+
+				// calculate weighting contributed from neighbor
+				const float w = atrousWeight(
+					currentSrc,
+					currentDepth,
+					currentNormal,
+					filteredVariance, 
+					neighborSrc, 
+					neighborDepth,
+					neighborNormal, 
+					fWidthDepth, 
+					offset );
+
+#if( FILTER_RADIUS == 1 )
+				// scale by the filtering kernel
+				const float h = filterKernel[( x + 1 ) + ( y + 1 ) * 3];
+#else
+				// scale by the filtering kernel
+				const float h = filterKernel[( x + 2 ) + ( y + 2 ) * 5];
+#endif
+				color += neighborSrc * ( w * h );
+#ifdef USE_VARIANCE
+				// expected value: E(aX)=a * E(X), variance: var(aX)=a^2 * var(X)
+				weightSum += vec2( w * h, w * w * h * h * neighborVariance );
+#else 
+				// total weight
+				weightSum += ( w * h );
+#endif
+			}
+		}
+	}
+	// update variance
+#ifdef USE_VARIANCE
+	const float weightSum2 = weightSum.x * weightSum.x;
+	const float variance = weightSum2 > 0.0f ? abs( weightSum.y / weightSum2 ) : 0.0f;
+	setVariance( uint2( dispatchCoord ), uOutputChannel, variance );
+	// scale total irradiance by the sum of the weights
+	color = weightSum.x > 0.0f ? color / weightSum.x : color;
+#else
+	const float weightSum2 = weightSum * weightSum;
+	// scale total irradiance by the sum of the weights
+	color = weightSum > 0.0f ? color / weightSum : color;
+#endif
+
+	STORE_FILTERED_OUTPT( tFiltered, dispatchCoord, color );
+}

@@ -1,0 +1,389 @@
+#include "data/shader/common/const.sh"
+#include "data/shader/common/octpack.sh"
+#include "data/shader/common/packed.sh"
+#include "data/shader/common/sharedconstants.sh"
+#include "data/shader/common/util.sh"
+#include "data/shader/common/dispatchSwizzle.comp"
+#include "data/shader/post/atrousFilterHelper.comp"
+#include "data/shader/scene/raytracing/buffers.comp"
+
+USE_TEXTURE2DARRAY( tInput );
+USE_LOADSTORE_TEXTURE2DARRAY( float, tFiltered, 0 );
+
+uniform int    uStepSize;
+uniform int	   uInputChannel;
+uniform int    uOutputChannel;
+
+uniform uint   uFrameIndex;
+uniform float  uSampleThreshold;
+
+uniform vec4   uUnproject;// { -2/proj[0][0], -2/proj[1][1], (1-proj[2][0])/proj[0][0], (1-proj[2][1])/proj[1][1] }
+uniform mat4   uInvViewMatrix;
+
+#define BLACK vec4( 0.0f, 0.0f, 0.0f, 0.0f )
+#define INPUT_TYPE vec4
+#define LOAD_INPUT( tInput, coord, channel ) imageLoadArray( tInput, coord, channel ).xyzw
+#define STORE_FILTERED_OUTPT( tFiltered, coord, channel, c ) imageStoreArray( tFiltered, coord, channel, vec4( c ) );
+
+// these controls the sensitivity to roughness 
+#define MAX_ROUGHNESS_VARIANCE 1.0f
+#define MIN_ROUGHNESS_VARIANCE 0.05f
+#define MAX_SPECULAR_RAYDIR_VARIANCE 1.0f
+
+int getFilterRadius(
+	const uint sampleCount )
+{
+#ifdef RADIUS_REDUCTION
+	return uPass > 0 && sampleCount > 4 ? 1 : FILTER_RADIUS;
+#else
+	return FILTER_RADIUS;
+#endif
+}
+
+vec3 getNormal(const vec2 uv, const vec4 features)
+{
+#ifdef HIGH_RESOLUTION_NORMAL_GBUFFER
+	return loadNormal( uv );
+#else
+	return unpackUnitVectorOct24bit( ( asuint( features.y ) & 0xFFFFFF ) );
+#endif
+}
+
+void unpackRoughnessAndMetallic( const vec4 features, out float roughness, out float metallic )
+{
+	uint data = asuint( features.z ) >> 16;
+	roughness = saturate( float(data & 0xFF) / 255.0 );
+	metallic = saturate( float(data >> 8) / 255.0 );
+}
+
+bool checkEarlyExit(
+	const ushort   currentObjectHash,
+	const ushort   neighborObjectHash,
+	const bool	   isGlossy,
+	const vec4	   neighborFeatures,
+	inout float	   neighborDepth )
+{
+	bool earlyExit = false;
+#if defined( HAS_REFRACTION )
+	if (neighborObjectHash <= 0xFF || isGlossy)
+	{
+		// test lower 8 hit, which is the just the primary hit object id hash
+		earlyExit = neighborObjectHash == 0 || (neighborObjectHash & 0xFF) != (currentObjectHash & 0xFF);
+	}
+	else
+	{
+		// because refraction id is valid, so we need the refraction ray length as the neighbor depth
+		neighborDepth = neighborFeatures.w;
+		earlyExit = ( neighborObjectHash & 0xFF00 ) != ( currentObjectHash & 0xFF00 );
+	}
+#else
+	earlyExit = neighborObjectHash == 0 || neighborObjectHash != currentObjectHash;
+#endif
+	return earlyExit;
+}	
+
+groupshared uint gCacheVariance[16][16];
+
+void initCache( int2 dispatchThreadId, int2 groupThreadId, int2 res )
+{
+	// load 16x16 region into shared memory using 4 8x8 blocks.
+	const int2  offset[4] = { int2( 0, 0 ), int2( 8, 0 ), int2( 0, 8 ), int2( 8, 8 ) };
+
+	// start in the upper left corner of the 16x16 region.
+	dispatchThreadId -= 4;
+
+	// store all loads in registers
+	for( int i = 0; i < 4; ++i )
+	{
+		const int2 threadId = dispatchThreadId + offset[i];
+		const int2 cacheId = groupThreadId + offset[i];
+
+		float variance = 1.0;
+		if( threadId.x >= 0 && threadId.y >= 0 &&
+			threadId.x < res.x && threadId.y < res.y )
+		{
+			variance = getVariance( uint2( threadId ), uInputChannel );
+		}
+		gCacheVariance[cacheId.y][cacheId.x] = variance;
+	}
+}
+
+
+float computePixelVarianceSharedMem(
+	const float currentVariance,
+	const int2 groupCoord,
+	const int outputChannel )
+{
+#ifdef USE_VARIANCE
+	const float gaussianKernel[3][3] = {
+		{ 1.0 / 16.0, 1.0 / 8.0, 1.0 / 16.0 },
+		{ 1.0 / 8.0, 1.0 / 4.0, 1.0 / 8.0 },
+		{ 1.0 / 16.0, 1.0 / 8.0, 1.0 / 16.0 }
+	};
+
+	const int radius = 1;
+	float pixelVariance = currentVariance * gaussianKernel[1][1];
+	for( int row = -radius; row <= radius; ++row )
+	{
+		for( int column = -radius; column <= radius; ++column )
+		{
+			if(row == 0 && column == 0)
+			{
+				continue;
+			}
+
+			const int2 offset = int2( column, row );
+			const float variance = gCacheVariance[groupCoord.y + row][groupCoord.x + column];
+			const float k = gaussianKernel[column + 1][row + 1];
+			pixelVariance += variance * k;
+		}
+	}
+	return pixelVariance;
+#else
+	// non variance driven
+	return 1.0f;
+#endif
+}
+
+COMPUTE( 8, 8, 1 )
+{
+	uint2 dispatchCoord = DISPATCH_THREAD_ID_8x8.xy;
+	// group thread id
+	uint2 groupCoord = GROUP_THREAD_ID_8x8.xy;
+	// only setup cache for specular because of neighborhood clamping
+	initCache( int2( dispatchCoord ), int2( groupCoord ), int2( uScreenSize ) );
+	// wait for all threads to finish.
+	groupMemoryBarrierWithGroupSync();
+	// recenter because (0,0) mapped to (-4,-4)
+	groupCoord += 4;
+	if( dispatchCoord.x >= uScreenSize.x || dispatchCoord.y >= uScreenSize.y )
+	{
+		return;
+	}
+
+#if( FILTER_RADIUS == 1 )
+	const float filterKernel[2] = { 0.5f, 0.25f };
+#else
+	const float	filterKernel[3] = { 0.7385489459f, 0.6030226892f, 0.3015113446f };
+#endif
+
+	// radiance & radiance radiance
+	const int		 currentChannel = uInputChannel;
+	const INPUT_TYPE currentRadiance = LOAD_INPUT( tInput, dispatchCoord, currentChannel );
+	const vec4		 currentMomentsData = getMoments( uint2( dispatchCoord ), currentChannel );
+	const float		 currentVariance = currentMomentsData.w;
+	const float		 filteredVariance = computePixelVarianceSharedMem( currentVariance, int2( groupCoord ), currentChannel );
+	const float		 sampleCount = currentMomentsData.x;
+
+	const vec2       currentGBufferUV = vec2( ( vec2( dispatchCoord ) + vec2( 0.5f, 0.5f ) ) * uInvScreenSize );
+	const uint2      currentGBufferCoord = uint2( currentGBufferUV * vec2( uGBufferSize ) );
+	const vec4		 motionVectorData = imageLoad( tMotionVector, currentGBufferCoord );
+	float		     fWidthDepth = motionVectorData.z;
+	const float		 fWidthNormal = motionVectorData.w;
+
+	const vec4		 currentFeatures = loadSVGFFeatures( currentGBufferUV );
+	float			 currentSpecularVariance = ( float( ( asuint( currentFeatures.y ) >> 24 ) & 0xFF ) / 255.0f ) * 0.5f;
+
+	const ushort	 currentObjectHash = ushort( asuint( currentFeatures.z ) & 0xFFFF );
+	float			 currentRoughness, currentMetallic;
+	unpackRoughnessAndMetallic( currentFeatures, currentRoughness, currentMetallic );
+	const bool		 isGlossy = currentRoughness > GLOSSY_THRESHOLD;
+
+	float			 currentDepth = currentFeatures.x;
+
+#if defined( SPECULAR_RADIANCE )
+	const float		 glossyWeightFactor = 1.0f - exp(-4.0f * ( currentRoughness + 0.07f ) );
+	const vec3		 currentNormal = unpackUnitVectorOct24bit( ( asuint( currentFeatures.y ) & 0xFFFFFF ) );
+		
+	const vec4		 currentSpecularFeatures = loadSpecularFeatures( currentGBufferUV );
+	const vec3		 currentSpecularReflectDir = unpackUnitVectorOct24bit( asuint( currentSpecularFeatures.y ) & 0xFFFFFF );
+	const ushort	 currentSecondaryObjID = ushort( asuint( currentSpecularFeatures.y ) >> 24 );
+
+	if( length( currentNormal ) < 1e-5f && currentSpecularFeatures.x < 1e-8f )
+	{
+		setVariance( dispatchCoord, currentChannel, currentVariance );
+		STORE_FILTERED_OUTPT( tFiltered, dispatchCoord, uOutputChannel, currentRadiance );
+		return;
+	}
+	const float		 currentSpecularFeatureDifferential = imageLoad( tSecondaryDifferential, dispatchCoord ).x;
+#else
+	const vec3		 currentNormal = getNormal( currentGBufferUV, currentFeatures );
+
+	#if defined( COMBINE_DIRECT_SPECULAR )
+		const vec4		 currentSpecularFeatures = loadSpecularFeatures( currentGBufferUV );
+		const vec3		 currentSpecularReflectDir = unpackUnitVectorOct24bit( asuint( currentSpecularFeatures.y ) & 0xFFFFFF );
+	#endif
+	#if defined( HAS_REFRACTION )
+		const bool		 isReflecting = currentObjectHash <= 0xFF || isGlossy ;
+		if( !isReflecting )
+		{
+			currentDepth = currentFeatures.w;
+			// within 1% of current refraction ray distance
+			fWidthDepth = 0.1f * currentDepth;
+		}
+	#endif
+#endif
+
+	const bool isBackground = currentObjectHash == 0;
+	// total accumulation and weighted sum
+	bool	   hasTransparency = false;
+	INPUT_TYPE radiance = currentRadiance;
+	float	   varianceSum = currentVariance;
+	float	   weightSum = 1.0f;
+#if defined( SPECULAR_RADIANCE )
+	bool	   continueFilter = true;
+	const int  radius = currentMetallic > 0.333f ? getFilterRadius( sampleCount ) : 1;
+#else
+	bool	   continueFilter = true;
+	const int  radius = currentVariance > 1e-8f ? getFilterRadius( sampleCount ) : 1;
+#endif
+	if( !isBackground && continueFilter )
+	{
+		for( int y = -radius; y <= radius; y++ )
+		{
+			for( int x = -radius; x <= radius; x++ )
+			{
+				if( x == 0 && y == 0 )
+				{
+					continue;
+				}
+
+				const int2 offset = int2( x, y ) * uStepSize;
+				const int2 neighborCoord = int2( dispatchCoord ) + offset;
+
+				bool	   earlyExit = false;
+				if( isInsideScreen( neighborCoord ) )
+				{
+					const INPUT_TYPE neighborRadiance = LOAD_INPUT( tInput, uint2( neighborCoord ), currentChannel );
+
+					const vec2       neighborGBufferUV = vec2( ( vec2( neighborCoord ) + vec2( 0.5f, 0.5f ) ) * uInvScreenSize );
+					const uint2		 neighborGBufferCoord = uint2( neighborGBufferUV * vec2( uGBufferSize ) );
+					
+					const vec4		 neighborFeatures = loadSVGFFeatures( neighborGBufferUV );
+					const ushort	 neighborObjectHash = ushort( asuint( neighborFeatures.z ) & 0xFFFF );
+					const vec3		 neighborNormal = getNormal( neighborGBufferUV, neighborFeatures );
+					float			 neighborDepth = neighborFeatures.x;
+										
+					float specularFeatureWeight = 1.0f;
+				#if defined( SPECULAR_RADIANCE )
+					const vec4	  neighborSpecularFeatures = loadSpecularFeatures( neighborGBufferUV );
+					const ushort  neighborSecondaryObjID = ushort( asuint( neighborSpecularFeatures.y ) >> 24 );
+
+					if (neighborSecondaryObjID != currentSecondaryObjID)
+					{
+						// tolerance for different reflected object grows as roughness grows
+						specularFeatureWeight = glossyWeightFactor;
+					}
+					else if (!isGlossy && neighborSecondaryObjID == 0)
+					{
+						// reflected to environment map
+						specularFeatureWeight = lerp( 0.0f, 0.1f, currentRoughness );
+					}
+
+					if(specularFeatureWeight > 0.0f )
+					{
+						// specular roughness prepass same dimension as specular radiance
+						float neighborRoughness, neighborMetallic;
+						unpackRoughnessAndMetallic( neighborFeatures, neighborRoughness, neighborMetallic );
+						const vec3	neighborSpecularReflectDir = unpackUnitVectorOct24bit( asuint( neighborSpecularFeatures.y ) & 0xFFFFFF );
+
+						const float currentRoughnessVariance = lerp( MAX_ROUGHNESS_VARIANCE, MIN_ROUGHNESS_VARIANCE, currentMetallic );
+						currentSpecularVariance = 0.05f;
+						specularFeatureWeight *= computeReflectionWeight( currentRoughness, neighborRoughness, currentRoughnessVariance, currentSpecularVariance, currentSpecularReflectDir, neighborSpecularReflectDir );
+					#if defined( ADVAMCED_FILTER_BLENDING )
+						// matching temporal reprojection
+						const float b = uSampleThreshold;
+						const float reflectanceTolerance = 0.01f;
+						if( uFrameIndex >= ( b / 2 ) )
+						{
+							specularFeatureWeight *= exp( -abs( currentMetallic - neighborMetallic ) / reflectanceTolerance );
+						}
+					#endif
+					}
+				#else
+					#if defined( COMBINE_DIRECT_SPECULAR )
+						if (currentMetallic > 0.0f)
+						{
+							// specular roughness prepass same dimension as specular radiance
+							float neighborRoughness, neighborMetallic;
+							unpackRoughnessAndMetallic( neighborFeatures, neighborRoughness, neighborMetallic );
+							const vec4	neighborSpecularFeatures = loadSpecularFeatures( neighborGBufferUV );
+							const vec3	neighborSpecularReflectDir = unpackUnitVectorOct24bit( asuint( neighborSpecularFeatures.y ) & 0xFFFFFF );
+							
+							const float currentRoughnessVariance = lerp( MAX_ROUGHNESS_VARIANCE, MIN_ROUGHNESS_VARIANCE, currentMetallic );
+							currentSpecularVariance = lerp( MAX_SPECULAR_RAYDIR_VARIANCE, currentSpecularVariance, currentMetallic );
+							specularFeatureWeight = computeReflectionWeight( currentRoughness, neighborRoughness, currentRoughnessVariance, currentSpecularVariance, currentSpecularReflectDir, neighborSpecularReflectDir );
+							
+						#if defined( ADVAMCED_FILTER_BLENDING )
+							// matching temporal reprojection
+							const float b = uSampleThreshold;
+							const float reflectanceTolerance = 0.01f;
+							if( uFrameIndex >= ( b / 2 ) )
+							{
+								specularFeatureWeight *= exp( -abs( currentMetallic - neighborMetallic ) / reflectanceTolerance );
+							}
+						#endif
+						}
+					#endif
+				#endif
+					earlyExit = checkEarlyExit( currentObjectHash, neighborObjectHash, isGlossy, neighborFeatures, neighborDepth );
+					earlyExit |= ( specularFeatureWeight == 0.0f );
+					if( earlyExit )
+					{
+						// if no mesh then early exit
+						continue;
+					}
+
+					const float neighborVariance = getVariance( uint2( neighborCoord ), currentChannel );
+				#if defined( SPECULAR_RADIANCE )
+					// calculate weighting contributed from neighbor
+					const float weights = specularFeatureWeight * atrousSpecularWeight(
+						currentRadiance,
+						currentMetallic,
+						currentDepth,
+						currentNormal,
+						filteredVariance,
+						neighborRadiance,
+						neighborDepth,
+						neighborNormal,
+						fWidthDepth,
+						vec2(offset) );
+				#else
+					// calculate weighting contributed from neighbor
+					const float weights = specularFeatureWeight * atrousWeight(
+						  currentRadiance,
+						  currentDepth,
+						  currentNormal,
+						  filteredVariance,
+						  neighborRadiance,
+						  neighborDepth,
+						  neighborNormal,
+						  fWidthDepth,
+						  fWidthNormal,
+						  vec2(offset) );
+				#endif
+
+					if ( weights > 0 )
+					{
+						hasTransparency = hasTransparency || ( neighborRadiance.w < 1.0f );
+					}
+
+					// scale by the filtering kernel
+					const float h = filterKernel[abs( x )] * filterKernel[abs( y )];
+					radiance += neighborRadiance * ( weights * h );
+					// expected value: E(aX)=a * E(X), variance: var(aX)=a^2 * var(X)
+					varianceSum += weights * weights * h * h * neighborVariance;
+					weightSum += weights * h;
+				}
+			}
+		}
+	}
+	// update variance
+	const float weightSum2 = weightSum * weightSum;
+	const float variance = weightSum2 > 0.0f ? abs( varianceSum / weightSum2 ) : 0.0f;
+	setVariance( dispatchCoord, currentChannel, variance );
+	// scale total irradiance by the sum of the weights
+	radiance = weightSum > 0.0f ? radiance / weightSum : radiance;
+	// we keep the alpha from original data
+	STORE_FILTERED_OUTPT( tFiltered, dispatchCoord, uOutputChannel, vec4( radiance.xyz, hasTransparency ? radiance.w : currentRadiance.w ) );
+}

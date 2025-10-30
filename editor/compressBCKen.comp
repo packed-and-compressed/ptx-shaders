@@ -1,0 +1,91 @@
+#include "BC4.comp"
+
+USE_TEXTURE2D_NOSAMPLER(tSource);
+
+USE_LOADSTORE_BUFFER(uint,bOutput,0);
+
+#ifdef BC4_RECORD_METRICS
+USE_INTERLOCKED_BUFFER(bMetrics,1);
+#endif
+
+uniform float uCorrectionRangeInv;
+uniform float uCorrectionBias;
+
+uniform uint2	uSrcOffset;
+uniform uint2	uSrcMax;
+uniform uint2	uBlockCounts;
+uniform uint	uRowSize;
+uniform uint	uSrcLod;
+
+
+COMPUTE(8,8,1)
+{
+	if( DISPATCH_THREAD_ID.x >= uBlockCounts.x ||
+		DISPATCH_THREAD_ID.y >= uBlockCounts.y )
+	{ return; }
+
+	//load 16 grayscale source values
+	RawBlock srcHigh, recon, srcLow;
+	uint2 base = uSrcOffset + DISPATCH_THREAD_ID.xy * 4;
+	uint i;
+	
+	for( i=0; i<16; ++i )
+	{
+		uint2 coord = min( base + uint2( i & 3, (i >> 2) ), uSrcMax );
+		srcHigh.b[i] = saturate( imageLoadLod( tSource, coord, uSrcLod ).x );
+	}
+
+	Block bestBlock, secondBestBlock;
+	BC4Metrics m1 = BC4Compress(srcHigh, recon, bestBlock, false);
+
+	//store the first block
+	uint blockIndex = DISPATCH_THREAD_ID.x + DISPATCH_THREAD_ID.y * uRowSize;
+	bOutput[blockIndex*4 + 0] = bestBlock.lower;
+	bOutput[blockIndex*4 + 1] = bestBlock.upper;
+
+	//the second block uses the reconstruction of the first block for error correction
+	for( i=0; i<16; ++i )
+	{             
+		srcLow.b[i] = saturate((srcHigh.b[i]-recon.b[i]) * 255.0 * uCorrectionRangeInv + uCorrectionBias);		//add a bias so we can store a signed value		
+	}
+		
+	BC4Metrics m2 = BC4Compress(srcLow, recon, secondBestBlock, true);
+
+	//store the second block
+	bOutput[blockIndex*4 + 2] = secondBestBlock.lower;
+	bOutput[blockIndex*4 + 3] = secondBestBlock.upper;
+	
+	//record metrics
+	#ifdef BC4_RECORD_METRICS
+		
+		//reconstruct the blocks to find total error
+		RawBlock rHigh, rLow;
+		decodeBlock(bestBlock, rHigh);
+		decodeBlock(secondBestBlock, rLow);
+		float totalError = 0.0;
+		for( i = 0; i < 16; i++)
+		{
+			float actual = srcHigh.b[i];
+			float reconstructed = rHigh.b[i] + (rLow.b[i] - uCorrectionBias) / 255.0 / uCorrectionRangeInv;
+			totalError += (actual-reconstructed) * (actual-reconstructed); 
+		}
+		uint errori = uint( round( (255.0*255.0) * totalError ) );
+		uint prev;
+		interlockedAdd( bMetrics, 0, 1, prev ); //block count
+		interlockedAdd( bMetrics, 1, errori, prev ); //sum of squares of errors
+		interlockedMax( bMetrics, 2, errori, prev ); //worst block
+		if( m1.mode == 0 )
+		{ interlockedAdd( bMetrics, 3, 1, prev ); } //number of "mode 0" blocks
+		else if( m1.mode == 1 )
+		{ interlockedAdd( bMetrics, 4, 1, prev ); } //number of "mode 1" blocks
+		else if( m1.mode == 2 )
+		{ interlockedAdd( bMetrics, 5, 1, prev ); } //number of "mode 2" blocks
+		
+		if( m2.mode == 0 )
+		{ interlockedAdd( bMetrics, 3, 1, prev ); } //number of "mode 0" blocks
+		else if( m2.mode == 1 )
+		{ interlockedAdd( bMetrics, 4, 1, prev ); } //number of "mode 1" blocks
+		else if( m2.mode == 2 )
+		{ interlockedAdd( bMetrics, 5, 1, prev ); } //number of "mode 2" blocks
+	#endif
+}

@@ -1,0 +1,298 @@
+
+struct	Block
+{
+	uint	upper;
+	uint	lower;
+};
+
+struct RawBlock
+{
+	float b[16];
+};
+
+struct BC4Metrics
+{
+	int blockError;
+	int mode;
+};
+
+void decodeBlock(Block b, inout RawBlock dst)
+{	
+	uint lower = b.lower;
+	uint upper = b.upper;
+	//64 bits, 48 for pixels, 16 for endpoints
+	uint ep0 = lower & 255;
+	uint ep1 = (lower>>8) & 255;
+	float c0 = float(ep0) / 255.0;
+	float c1 = float(ep1) / 255.0;
+	
+	for(int i = 0; i < 16; i++)
+	{
+		int pal = 0;
+		if(i < 5)
+		{ pal = (lower >> (16 + 3*i)) & 7; }	//three bits at a time, starting with bit 16
+		else if( i == 5)
+		{
+			//one bit of lower and two bits of upper
+			pal = ((upper << 1) + (lower >> 31)) & 7;
+		}   
+		else
+		{ pal = (upper >> (i*3 - 16)) & 7; }
+		
+		//both methods do the same thing for pal<2
+		if(pal < 2)
+		{ dst.b[i] = (pal == 0) ? c0 : c1; }
+		else if(ep0 > ep1)  //eight-step gradient method
+		{ dst.b[i] = mix(c0, c1, float(pal-1)/7.0 ); }
+		else		//six-step gradient + b+w
+		{
+			if(pal == 6)
+			{ dst.b[i] = 0.0; }
+			else if(pal == 7)
+			{ dst.b[i] = 1.0; }
+			else
+			{ dst.b[i] = mix(c0, c1, float(pal-1)/5.0 ); }
+		}
+	}
+}
+
+void	appendIndex( inout Block b, uint index, uint which )
+{
+	if( which == 10 )
+	{
+		//at this point we have 10 indices (30 bits) in lower word;
+		//shift it to upper and add in the top 2 bits of 11th index
+		b.upper = (b.lower << 2) | (index >> 1);
+	}
+		
+	//append 3 bit index to lower word
+	b.lower = (b.lower << 3) | index;
+}
+
+void	appendEndpoints( inout Block b, uint r0, uint r1 )
+{
+	//append 8 bit endpoints to lower word
+	b.lower = (b.lower << 8) | r1;
+	b.lower = (b.lower << 8) | r0;
+}
+
+BC4Metrics	BC4Compress(inout RawBlock src, inout RawBlock recon, inout Block bestBlock, bool fast)
+{
+	BC4Metrics metrics;
+	metrics.blockError = metrics.mode = 0;
+
+	bestBlock.upper = bestBlock.lower = 0;
+	float srcMin = 1.0, srcMax = 0.0;
+	float srcMinNot0 = 1.0, srcMaxNot1 = 0.0;
+	{
+		HINT_UNROLL
+		for(uint i = 0; i < 16; ++i)
+		{
+			float s = src.b[i];
+			srcMin = min( srcMin, s );
+			srcMax = max( srcMax, s );
+			if( s < 1.0 )
+			{ srcMaxNot1 = max( srcMaxNot1, s ); }
+			if( s > 0.0 )
+			{ srcMinNot0 = min( srcMinNot0, s ); }
+		}
+	}
+
+	float bestError = 1e20;
+	uint chosenMode = 0;
+
+	if( srcMax == srcMin )
+	{
+		// Mode 0
+		// A degenerate/simplified form (all pixels are the same)
+		// Use indices of 0 and r0 == r1
+		uint r = uint( floor( 255.0 * srcMax + 0.5 ) );
+		appendEndpoints( bestBlock, r, r );
+		for(uint j = 0; j < 16; j++)
+		{ recon.b[j] = float(r)/255.0; }
+		
+		bestError = 0.0;
+		chosenMode = 0;
+	}
+	else
+	{
+		if( srcMax > srcMin )
+		{
+			// Mode 1
+			// For chosen endpoints (r0, r1) such that (r0 > r1)
+			// BC4 compression table is as follows:
+			//
+			//  [0]  r0,
+			//  [1]  r1,
+			//  [2]  (6*r0 + 1*r1)/7,
+			//  [3]  (5*r0 + 2*r1)/7,
+			//  [4]  (4*r0 + 3*r1)/7,
+			//  [5]  (3*r0 + 4*r1)/7,
+			//  [6]  (2*r0 + 5*r1)/7,
+			//  [7]  (1*r0 + 6*r1)/7
+			//
+			// This mode does a longer search by varying the endpoints
+			// to find a minimum error value (unless we're in 'fast' mode).
+			uint r0 = uint( floor( 255.0 * srcMax + 0.5 ) );
+			uint r1 = uint( floor( 255.0 * srcMin + 0.5 ) );
+			if( r0 == r1 )
+			{
+				//endpoints can become equal after quantization
+				if( r0 == 0xff )
+				{ r1 = 0xff-1; }
+				else
+				{ r0 += 1; }
+			}
+
+			uint vary = (r0 - r1) >> 4;
+			uint r0min = r0 > vary ? r0-vary : 0;
+			uint r0max = r0 + vary; r0max = r0max > 0xff ? 0xff : r0max;
+			uint r1min = r1 > vary ? r1-vary : 0;
+			uint r1max = r1 + vary; r1max = r1max > 0xff ? 0xff : r1max;
+			if(fast)
+			{ r0min = r0max = r0; r1min = r1max = r1; }
+			for( r0 = r0min; r0 <= r0max; ++r0 )
+			{
+				for( r1 = r1min; r1 <= r1max && r1 < r0; ++r1 )
+				{
+					float r0f = float( r0 ) * (1.0/255.0);
+					float r1f = float( r1 ) * (1.0/255.0);
+	
+					Block block = { 0, 0 };
+					float error = 0.0;
+
+					HINT_UNROLL
+					for( uint i=0; i<16; ++i )
+					{
+						float s = src.b[15-i];
+						float t = round( (s - r0f) * (7.0/(r1f - r0f)) );
+						t = clamp( t, 0.0, 7.0 );
+						uint index = uint( t );
+						if( index >= 7 )
+						{ index = 1; }
+						else if( index > 0 )
+						{ index += 1; }
+
+						float reconstructed = ((r1f - r0f) * (1.0/7.0)) * t + r0f;
+						float e = s - reconstructed;
+						error += e * e;
+						appendIndex( block, index, i );
+					}
+					appendEndpoints( block, r0, r1 );
+
+					if( error < bestError )
+					{
+						bestBlock = block;
+						bestError = error;
+						chosenMode = 1;
+						for( uint j=0; j<16; ++j )
+						{
+							float s = src.b[15-j];
+							float t = round( (s - r0f) * (7.0/(r1f - r0f)) );
+							t = clamp( t, 0.0, 7.0 );
+							float reconstructed = ((r1f - r0f) * (1.0/7.0)) * t + r0f;
+							recon.b[15-j] = reconstructed;
+						}
+					}
+				}
+			}
+		}
+
+		if( srcMinNot0 <= srcMaxNot1 )
+		{
+			// Mode 2
+			// For chosen endpoints (r0, r1) such that (r0 <= r1)
+			// BC4 compression table is as follows:
+			//  [0]  r0,
+			//  [1]  r1,
+			//  [2]  (4*r0 + 1*r1)/5,
+			//  [3]  (3*r0 + 2*r1)/5,
+			//  [4]  (2*r0 + 3*r1)/5,
+			//  [5]  (1*r0 + 4*r1)/5,
+			//  [6]  0.0
+			//  [7]  1.0
+			//
+			// This mode is good for representing a smaller subset
+			// of values while still having 0.0 and 1.0 in the table.
+			// This is useful along black and white edges.
+			// An endpoint search is not conducted for this mode, as
+			// the benefit is very small after mode 1 is evaluated.
+			uint r0 = uint( floor( 255.0 * srcMinNot0 + 0.5 ) );
+			uint r1 = uint( floor( 255.0 * srcMaxNot1 + 0.5 ) );
+			float r0f = float( r0 ) * (1.0/255.0);
+			float r1f = float( r1 ) * (1.0/255.0);
+
+			Block block = { 0, 0 };
+			float error = 0.0;
+			HINT_UNROLL
+			for( uint i=0; i<16; ++i ) //255
+			{
+				float s = src.b[15-i];
+				uint index;
+				if( s >= 1.0 )
+				{ index = 7;  }
+				else if( s <= 0.0 )
+				{ index = 6;  }
+				else
+				{
+					float interpScale = (r0f == r1f) ? 0.0 : (5.0/(r1f - r0f));
+					float t = round( (s - r0f) * interpScale );
+					index = uint( t );
+					if( index >= 5 )
+					{ index = 1; }
+					else if( index > 0 )
+					{ index += 1; }
+
+					float reconstructed = ((r1f - r0f) * (1.0/5.0)) * t + r0f;
+					float e = s - reconstructed;
+					error += e * e;
+				}
+				appendIndex( block, index, i );
+			}
+			appendEndpoints( block, r0, r1 );
+
+			if( error < bestError )
+			{
+				bestBlock = block;
+				bestError = error;
+				chosenMode = 2;
+				
+				for( uint j=0; j<16; ++j )
+				{
+					float s = src.b[15-j];
+					uint index;
+					if( s >= 1.0 )
+					{ index = 7; recon.b[15-j] = 1.0; }
+					else if( s <= 0.0 )
+					{ index = 6; recon.b[15-j] = 0.0; }
+					else
+					{
+						float interpScale = (r0f == r1f) ? 0.0 : (5.0/(r1f - r0f));
+						float t = round( (s - r0f) * interpScale );
+
+						float reconstructed = ((r1f - r0f) * (1.0/5.0)) * t + r0f;
+						recon.b[15-j] = reconstructed;
+						index = uint( t );
+						if( index >= 5 )
+						{ index = 1; }
+						else if( index > 0 )
+						{ index += 1; }
+
+						if(index == 0)
+						{ recon.b[15-j] = r0f; }
+						if(index == 1)
+						{ recon.b[15-j] = r1f; }
+					}
+				}
+			}
+		}
+	}
+
+	//record metrics
+	uint errori = uint( round( (255.0*255.0) * bestError ) );
+	uint prev;
+	metrics.blockError = errori;
+	metrics.mode = chosenMode;
+	return metrics;
+}
+
